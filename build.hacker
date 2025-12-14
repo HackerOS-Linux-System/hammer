@@ -1,4 +1,4 @@
-// go
+// crystal
 
 > cd source-code
-> go build
+> crystal build src/main.cr --release
