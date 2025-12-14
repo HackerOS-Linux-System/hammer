@@ -1,243 +1,198 @@
-package main
+require "file_utils"
+require "time"
 
-import (
-	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
-	"strings"
-	"time"
-)
+MOUNT_POINT      = "/mnt/hroot"
+SNAPSHOT_PREFIX  = "-pre-update-"
+UPDATE_SNAPSHOT  = "@update"
+BTRFS_DEVICE     = "/dev/sda1" # TODO: Detect or configure the Btrfs device
+ROOT_SUBVOLUME   = "@"
 
-const (
-	mountPoint     = "/mnt/hroot"
-	snapshotPrefix = "-pre-update-" // teraz używamy tej stałej
-	updateSnapshot = "@update"
-	btrfsDevice    = "/dev/sda1" // TODO: Detect or configure the Btrfs device
-	rootSubvolume  = "@"
-)
-
-func main() {
-	if len(os.Args) < 2 {
-		usage()
-		os.Exit(1)
-	}
-
-	cmd := os.Args[1]
-	switch cmd {
-	case "snapshot":
-		snapshotCmd()
-	case "update":
-		updateCmd()
-	case "switch":
-		switchCmd()
-	case "rollback":
-		rollbackCmd(os.Args[2:])
-	case "install":
-		installCmd(os.Args[2:])
-	case "remove":
-		removeCmd(os.Args[2:])
-	case "clean":
-		cleanCmd()
-	case "status":
-		statusCmd()
-	default:
-		usage()
-		os.Exit(1)
-	}
-}
-
-func usage() {
-	fmt.Println(`HROOT - HackerOS Root
+def usage
+  puts <<-USAGE
+HROOT - HackerOS Root
 Usage: hroot <command> [args]
-
 Commands:
   snapshot Create a read-only snapshot of the current root
-  update   Create and update a new snapshot offline
-  switch   Switch to the updated snapshot (@update → default)
+  update Create and update a new snapshot offline
+  switch Switch to the updated snapshot (@update → default)
   rollback <name> Rollback to a specific snapshot (e.g. @pre-update-20251130-2013)
   install <pkg>... Install package(s) in the current root (non-atomic)
-  remove <pkg>...  Remove package(s) from the current root (non-atomic)
-  clean    Clean apt cache (snapshots must be deleted manually)
-  status   List available snapshots`)
-}
+  remove <pkg>... Remove package(s) from the current root (non-atomic)
+  clean Clean apt cache (snapshots must be deleted manually)
+  status List available snapshots
+USAGE
+end
 
-func runCommand(name string, args ...string) error {
-	cmd := exec.Command(name, args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
-}
+def run_command(cmd : String, args : Array(String))
+  status = Process.run(cmd, args, output: STDOUT, error: STDERR)
+  unless status.success?
+    exit(1)
+  end
+end
 
-func getSnapshotName() string {
-	return rootSubvolume + snapshotPrefix + time.Now().Format("20060102-1504")
-}
+def get_snapshot_name : String
+  "#{ROOT_SUBVOLUME}#{SNAPSHOT_PREFIX}#{Time.local.to_s("%Y%m%d-%H%M")}"
+end
 
-// Pobiera Subvolume ID dla podanej względnej ścieżki (np. @update, @pre-update-...)
-func getSubvolumeID(subvol string) (string, error) {
-	path := "/" + subvol // /@update, /@pre-update-20251130-2013 itd.
-	output, err := exec.Command("btrfs", "subvolume", "show", path).CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("btrfs subvolume show %s failed: %v\n%s", path, err, output)
-	}
+def get_subvolume_id(subvol : String) : String
+  path = "/#{subvol}"
+  stdout = IO::Memory.new
+  status = Process.run("btrfs", args: ["subvolume", "show", path], output: stdout, error: STDERR)
+  unless status.success?
+    STDERR.puts "btrfs subvolume show #{path} failed"
+    exit(1)
+  end
+  output = stdout.to_s
+  output.lines.each do |line|
+    line = line.strip
+    if line.starts_with?("Subvolume ID:")
+      parts = line.split
+      if parts.size >= 3
+        return parts[2]
+      end
+    end
+  end
+  STDERR.puts "Subvolume ID not found for #{path}"
+  exit(1)
+end
 
-	for _, line := range strings.Split(string(output), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "Subvolume ID:") {
-			parts := strings.Fields(line)
-			if len(parts) >= 3 {
-				return parts[2], nil
-			}
-		}
-	}
-	return "", fmt.Errorf("Subvolume ID not found for %s", path)
-}
+def snapshot_cmd
+  snapshot_name = get_snapshot_name
+  puts "Creating read-only snapshot: #{snapshot_name}"
+  run_command("btrfs", ["subvolume", "snapshot", "-r", "/", snapshot_name])
+  puts "Snapshot created successfully."
+end
 
-func snapshotCmd() {
-	snapshotName := getSnapshotName()
-	fmt.Printf("Creating read-only snapshot: %s\n", snapshotName)
-	if err := runCommand("btrfs", "subvolume", "snapshot", "-r", "/", snapshotName); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating snapshot: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("Snapshot created successfully.")
-}
+def update_cmd
+  # Krok 1: Tworzymy writable snapshot do aktualizacji
+  puts "Creating update snapshot: #{UPDATE_SNAPSHOT}"
+  run_command("btrfs", ["subvolume", "snapshot", "/", UPDATE_SNAPSHOT])
 
-func updateCmd() {
-	// Krok 1: Tworzymy writable snapshot do aktualizacji
-	fmt.Println("Creating update snapshot:", updateSnapshot)
-	if err := runCommand("btrfs", "subvolume", "snapshot", "/", updateSnapshot); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating update snapshot: %v\n", err)
-		os.Exit(1)
-	}
+  # Krok 2: Montujemy snapshot
+  FileUtils.mkdir_p(MOUNT_POINT, mode: 0o755)
+  run_command("mount", [BTRFS_DEVICE, MOUNT_POINT, "-o", "subvol=#{UPDATE_SNAPSHOT}"])
 
-	// Krok 2: Montujemy snapshot
-	os.MkdirAll(mountPoint, 0755)
-	if err := runCommand("mount", btrfsDevice, mountPoint, "-o", "subvol="+updateSnapshot); err != nil {
-		fmt.Fprintf(os.Stderr, "Error mounting update snapshot: %v\n", err)
-		os.Exit(1)
-	}
-	defer runCommand("umount", mountPoint)
+  umount_targets = [] of String
+  begin
+    # Bind mount niezbędnych systemów plików
+    bind_mounts = ["/proc", "/sys", "/dev", "/run"]
+    bind_mounts.each do |m|
+      target = File.join(MOUNT_POINT, m[1..])
+      FileUtils.mkdir_p(target, mode: 0o755)
+      run_command("mount", ["--bind", m, target])
+      umount_targets << target
+    end
 
-	// Bind mount niezbędnych systemów plików
-	bindMounts := []string{"/proc", "/sys", "/dev", "/run"}
-	for _, m := range bindMounts {
-		target := filepath.Join(mountPoint, m[1:])
-		os.MkdirAll(target, 0755)
-		if err := runCommand("mount", "--bind", m, target); err != nil {
-			fmt.Fprintf(os.Stderr, "Error bind mounting %s: %v\n", m, err)
-			os.Exit(1)
-		}
-		defer runCommand("umount", target)
-	}
+    # Krok 3: Chroot + aktualizacja
+    puts "Performing system update in chroot..."
+    run_command("chroot", [MOUNT_POINT, "apt", "update"])
+    run_command("chroot", [MOUNT_POINT, "apt", "upgrade", "-y"])
+    puts "Update completed successfully in snapshot: #{UPDATE_SNAPSHOT}"
+    puts "Run 'hroot switch' and reboot to apply."
+  ensure
+    umount_targets.reverse_each do |target|
+      run_command("umount", [target])
+    end
+    run_command("umount", [MOUNT_POINT])
+  end
+end
 
-	// Krok 3: Chroot + aktualizacja
-	fmt.Println("Performing system update in chroot...")
-	if err := runCommand("chroot", mountPoint, "apt", "update"); err != nil {
-		fmt.Fprintf(os.Stderr, "Error running apt update: %v\n", err)
-		os.Exit(1)
-	}
-	if err := runCommand("chroot", mountPoint, "apt", "upgrade", "-y"); err != nil {
-		fmt.Fprintf(os.Stderr, "Error running apt upgrade: %v\n", err)
-		os.Exit(1)
-	}
+def switch_cmd
+  id = get_subvolume_id(UPDATE_SNAPSHOT)
+  puts "Setting default subvolume to #{UPDATE_SNAPSHOT} (ID: #{id})"
+  run_command("btrfs", ["subvolume", "set-default", id, "/"])
+  puts "Default subvolume changed. Reboot required."
+end
 
-	fmt.Println("Update completed successfully in snapshot:", updateSnapshot)
-	fmt.Println("Run 'hroot switch' and reboot to apply.")
-}
+def rollback_cmd(args : Array(String))
+  if args.empty?
+    STDERR.puts "Usage: hroot rollback <snapshot-name>"
+    exit(1)
+  end
+  snapshot_name = args[0]
+  id = get_subvolume_id(snapshot_name)
+  puts "Rolling back to #{snapshot_name} (ID: #{id})"
+  run_command("btrfs", ["subvolume", "set-default", id, "/"])
+  puts "Rollback successful. Reboot required."
+end
 
-func switchCmd() {
-	id, err := getSubvolumeID(updateSnapshot)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Cannot get subvolume ID for %s: %v\n", updateSnapshot, err)
-		os.Exit(1)
-	}
+def install_cmd(pkgs : Array(String))
+  if pkgs.empty?
+    STDERR.puts "Usage: hroot install <package>..."
+    exit(1)
+  end
+  puts "Installing packages (live system): #{pkgs}"
+  args = ["install", "-y"] + pkgs
+  run_command("apt", args)
+end
 
-	fmt.Printf("Setting default subvolume to %s (ID: %s)\n", updateSnapshot, id)
-	if err := runCommand("btrfs", "subvolume", "set-default", id, "/"); err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting default subvolume: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("Default subvolume changed. Reboot required.")
-}
+def remove_cmd(pkgs : Array(String))
+  if pkgs.empty?
+    STDERR.puts "Usage: hroot remove <package>..."
+    exit(1)
+  end
+  puts "Removing packages (live system): #{pkgs}"
+  args = ["remove", "-y"] + pkgs
+  run_command("apt", args)
+end
 
-func rollbackCmd(args []string) {
-	if len(args) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: hroot rollback <snapshot-name>\n")
-		os.Exit(1)
-	}
+def clean_cmd
+  puts "Cleaning apt cache..."
+  run_command("apt", ["clean"])
+  puts "Done. Delete old snapshots manually with 'btrfs subvolume delete /<name>'"
+end
 
-	snapshotName := args[0]
-	id, err := getSubvolumeID(snapshotName)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Cannot get subvolume ID for %s: %v\n", snapshotName, err)
-		os.Exit(1)
-	}
+def status_cmd
+  stdout = IO::Memory.new
+  status = Process.run("btrfs", ["subvolume", "list", "-p", "/"], output: stdout, error: STDERR)
+  unless status.success?
+    STDERR.puts "Error listing subvolumes"
+    exit(1)
+  end
+  output = stdout.to_s
+  puts "Available snapshots:"
+  output.lines.each do |line|
+    if line.includes?(ROOT_SUBVOLUME) || line.includes?(UPDATE_SNAPSHOT)
+      fields = line.split
+      if fields.size >= 9
+        id = fields[1]
+        path = fields[-1]
+        puts " ID #{id.ljust(6)} → #{path}"
+      end
+    end
+  end
 
-	fmt.Printf("Rolling back to %s (ID: %s)\n", snapshotName, id)
-	if err := runCommand("btrfs", "subvolume", "set-default", id, "/"); err != nil {
-		fmt.Fprintf(os.Stderr, "Error setting default subvolume: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("Rollback successful. Reboot required.")
-}
+  stdout = IO::Memory.new
+  status = Process.run("btrfs", ["subvolume", "get-default", "/"], output: stdout, error: STDERR)
+  if status.success?
+    puts "\nCurrent default: #{stdout.to_s.strip}"
+  end
+end
 
-func installCmd(pkgs []string) {
-	if len(pkgs) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: hroot install <package>...\n")
-		os.Exit(1)
-	}
-	fmt.Printf("Installing packages (live system): %v\n", pkgs)
-	args := append([]string{"install", "-y"}, pkgs...)
-	if err := runCommand("apt", args...); err != nil {
-		fmt.Fprintf(os.Stderr, "Error installing packages: %v\n", err)
-		os.Exit(1)
-	}
-}
+if ARGV.empty?
+  usage
+  exit(1)
+end
 
-func removeCmd(pkgs []string) {
-	if len(pkgs) == 0 {
-		fmt.Fprintf(os.Stderr, "Usage: hroot remove <package>...\n")
-		os.Exit(1)
-	}
-	fmt.Printf("Removing packages (live system): %v\n", pkgs)
-	args := append([]string{"remove", "-y"}, pkgs...)
-	if err := runCommand("apt", args...); err != nil {
-		fmt.Fprintf(os.Stderr, "Error removing packages: %v\n", err)
-		os.Exit(1)
-	}
-}
-
-func cleanCmd() {
-	fmt.Println("Cleaning apt cache...")
-	if err := runCommand("apt", "clean"); err != nil {
-		fmt.Fprintf(os.Stderr, "Error cleaning apt cache: %v\n", err)
-	}
-	fmt.Println("Done. Delete old snapshots manually with 'btrfs subvolume delete /<name>'")
-}
-
-func statusCmd() {
-	output, err := exec.Command("btrfs", "subvolume", "list", "-p", "/").CombinedOutput()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error listing subvolumes: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("Available snapshots:")
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, rootSubvolume) || strings.Contains(line, updateSnapshot) {
-			fields := strings.Fields(line)
-			if len(fields) >= 9 {
-				id := fields[1]
-				path := fields[len(fields)-1]
-				fmt.Printf("  ID %-6s → %s\n", id, path)
-			}
-		}
-	}
-
-	defOutput, err := exec.Command("btrfs", "subvolume", "get-default", "/").CombinedOutput()
-	if err == nil {
-		fmt.Printf("\nCurrent default: %s", defOutput)
-	}
-}
+cmd = ARGV[0]
+case cmd
+when "snapshot"
+  snapshot_cmd
+when "update"
+  update_cmd
+when "switch"
+  switch_cmd
+when "rollback"
+  rollback_cmd(ARGV[1..])
+when "install"
+  install_cmd(ARGV[1..])
+when "remove"
+  remove_cmd(ARGV[1..])
+when "clean"
+  clean_cmd
+when "status"
+  status_cmd
+else
+  usage
+  exit(1)
+end
