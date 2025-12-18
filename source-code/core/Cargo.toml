@@ -1,1 +1,12 @@
+[package]
+name = "hammer-core"
+version = "0.1.0"
+edition = "2021"
+authors = ["HackerOS Team"]
+description = "Core operations for Hammer tool in HackerOS Atomic"
+license = "APACHE-2.0"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+chrono = "0.4"
 
