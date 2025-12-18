@@ -1,2 +1,4 @@
-# hroot
-HackerOS Root - Atomic system for HackerOS
+# hammer
+Atomic system for HackerOS
+
+# Tool inspired apx/rpm-ostree
