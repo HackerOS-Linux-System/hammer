@@ -12,5 +12,7 @@ Atomic system for HackerOS
 - hammer refresh - refresh packages
 - hammer clean - clean all tmp packages
 - hammer about - information about hammer
+- hammer build init - create project for live build - to build run hammer build
+- hammer build - build atomic HackerOS with live build
 
 ## How working 
