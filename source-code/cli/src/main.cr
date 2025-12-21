@@ -10,6 +10,7 @@ module Hammer
   COLOR_YELLOW = "\033[33m"
   COLOR_BLUE = "\033[34m"
   COLOR_BOLD = "\033[1m"
+
   def self.main
     return usage if ARGV.empty?
     command = ARGV.shift
@@ -36,11 +37,18 @@ module Hammer
       about_command(ARGV)
     when "tui"
       tui_command(ARGV)
+    when "status"
+      status_command(ARGV)
+    when "history"
+      history_command(ARGV)
+    when "rollback"
+      rollback_command(ARGV)
     else
       usage
       exit(1)
     end
   end
+
   private def self.install_command(args : Array(String))
     parser = OptionParser.new do |parser|
       parser.banner = "#{COLOR_BLUE}Usage: hammer install [options] <package>#{COLOR_RESET}"
@@ -62,6 +70,7 @@ module Hammer
     end
     run_core("install", atomic_flag + [package])
   end
+
   private def self.remove_command(args : Array(String))
     parser = OptionParser.new do |parser|
       parser.banner = "#{COLOR_BLUE}Usage: hammer remove [options] <package>#{COLOR_RESET}"
@@ -83,6 +92,7 @@ module Hammer
     end
     run_core("remove", atomic_flag + [package])
   end
+
   private def self.update_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer update#{COLOR_RESET}"
@@ -90,6 +100,7 @@ module Hammer
     end
     run_updater("update", args)
   end
+
   private def self.clean_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer clean#{COLOR_RESET}"
@@ -97,6 +108,7 @@ module Hammer
     end
     run_core("clean", args)
   end
+
   private def self.refresh_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer refresh#{COLOR_RESET}"
@@ -104,6 +116,7 @@ module Hammer
     end
     run_core("refresh", args)
   end
+
   private def self.build_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer build#{COLOR_RESET}"
@@ -111,6 +124,7 @@ module Hammer
     end
     run_builder("build", args)
   end
+
   private def self.switch_command(args : Array(String))
     parser = OptionParser.new do |parser|
       parser.banner = "#{COLOR_BLUE}Usage: hammer switch [deployment]#{COLOR_RESET}"
@@ -126,6 +140,7 @@ module Hammer
     run_args = deployment.empty? ? [] of String : [deployment]
     run_core("switch", run_args)
   end
+
   private def self.deploy_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer deploy#{COLOR_RESET}"
@@ -133,6 +148,7 @@ module Hammer
     end
     run_core("deploy", args)
   end
+
   private def self.build_init_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer build init#{COLOR_RESET}"
@@ -140,6 +156,7 @@ module Hammer
     end
     run_builder("init", args)
   end
+
   private def self.about_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer about#{COLOR_RESET}"
@@ -147,6 +164,7 @@ module Hammer
     end
     about
   end
+
   private def self.tui_command(args : Array(String))
     if args.size != 0
       puts "#{COLOR_RED}Usage: hammer tui#{COLOR_RESET}"
@@ -154,22 +172,58 @@ module Hammer
     end
     run_tui(args)
   end
+
+  private def self.status_command(args : Array(String))
+    if args.size != 0
+      puts "#{COLOR_RED}Usage: hammer status#{COLOR_RESET}"
+      exit(1)
+    end
+    run_core("status", args)
+  end
+
+  private def self.history_command(args : Array(String))
+    if args.size != 0
+      puts "#{COLOR_RED}Usage: hammer history#{COLOR_RESET}"
+      exit(1)
+    end
+    run_core("history", args)
+  end
+
+  private def self.rollback_command(args : Array(String))
+    parser = OptionParser.new do |parser|
+      parser.banner = "#{COLOR_BLUE}Usage: hammer rollback [n]#{COLOR_RESET}"
+      parser.unknown_args do |unknown_args|
+        if unknown_args.size > 1
+          puts parser
+          exit(1)
+        end
+      end
+    end
+    parser.parse(args.dup)
+    n = args[0]? ? args[0] : "1"
+    run_core("rollback", [n])
+  end
+
   private def self.run_core(subcommand : String, args : Array(String))
     binary = "#{HAMMER_PATH}/hammer-core"
     Process.run(binary, [subcommand] + args, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
   end
+
   private def self.run_updater(subcommand : String, args : Array(String))
     binary = "#{HAMMER_PATH}/hammer-updater"
     Process.run(binary, [subcommand] + args, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
   end
+
   private def self.run_builder(subcommand : String, args : Array(String))
     binary = "#{HAMMER_PATH}/hammer-builder"
     Process.run(binary, [subcommand] + args, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
   end
+
   private def self.run_tui(args : Array(String))
     binary = "#{HAMMER_PATH}/hammer-tui"
     Process.run(binary, args, output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
   end
+
   private def self.about
     puts "#{COLOR_BOLD}#{COLOR_BLUE}Hammer CLI Tool for HackerOS Atomic#{COLOR_RESET}"
     puts "#{COLOR_GREEN}Version:#{COLOR_RESET} #{VERSION}"
@@ -177,10 +231,11 @@ module Hammer
     puts "#{COLOR_GREEN}Components:#{COLOR_RESET}"
     puts "- #{COLOR_YELLOW}hammer-core:#{COLOR_RESET} Core operations in Crystal"
     puts "- #{COLOR_YELLOW}hammer-updater:#{COLOR_RESET} System updater in Crystal"
-    puts "- #{COLOR_YELLOW}hammer-builder:#{COLOR_RESET} ISO builder in Go"
+    puts "- #{COLOR_YELLOW}hammer-builder:#{COLOR_RESET} ISO builder in Crystal"
     puts "- #{COLOR_YELLOW}hammer-tui:#{COLOR_RESET} TUI interface in Go with Bubble Tea"
     puts "#{COLOR_GREEN}Location:#{COLOR_RESET} #{HAMMER_PATH}"
   end
+
   private def self.usage
     puts "#{COLOR_BOLD}#{COLOR_BLUE}Usage: hammer <command> [options]#{COLOR_RESET}"
     puts ""
@@ -196,6 +251,10 @@ module Hammer
     puts " #{COLOR_YELLOW}build init#{COLOR_RESET} Initialize build project"
     puts " #{COLOR_YELLOW}tui#{COLOR_RESET} Launch TUI interface"
     puts " #{COLOR_YELLOW}about#{COLOR_RESET} Show tool information"
+    puts " #{COLOR_YELLOW}status#{COLOR_RESET} Show current deployment status"
+    puts " #{COLOR_YELLOW}history#{COLOR_RESET} Show deployment history"
+    puts " #{COLOR_YELLOW}rollback [n]#{COLOR_RESET} Rollback n steps (default 1)"
   end
 end
+
 Hammer.main
