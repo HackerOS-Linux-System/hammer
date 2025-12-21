@@ -1,3 +1,4 @@
 // curl
 
->
+>>> cd ~/.hackeros/hammer/ &&  sudo rm -rf hammer-core hammer-updater hammer-builder hammer-tui && 
+>>> cd /usr/bin/ && sudo rm -rf hammer && 
