@@ -5,7 +5,8 @@
 > cd /tmp/hammer/
 > cd source-code
 >>> cd cli && crystal build src/main.cr --release && sudo mv main hammer && sudo mv hammer && sudo mv hammer /usr/bin/
->>> cd core && cargo build --release && cd target && cd release && sudo mv hammer-core ~/.hackeros/hammer/
->>> cd builder && crystal build src/main.cr --release && sudo mv main hammer-builder && sudo mv hammer-builder ~/.hackeros/hammer/
->>> cd updater && crystal build src/main.cr --release && sudo mv main hammer-updater && sudo cp -r hammer-updater ~/.hackeros/hammer/
->>> cd tui && go get hammer-tui && go build && sudo mv hammer-tui ~/.hackeros/hammer/hammer-tui
+>>> cd core && cargo build --release && cd target && cd release && sudo mv hammer-core /usr/lib/HackerOS/hammer/bin/
+>>> cd builder && crystal build src/main.cr --release && sudo mv main hammer-builder && sudo mv hammer-builder /usr/lib/HackerOS/hammer/bin/
+>>> cd updater && crystal build src/main.cr --release && sudo mv main hammer-updater && sudo cp -r hammer-updater /usr/lib/HackerOS/hammer/bin/
+>>> cd tui && go get hammer-tui && go build && sudo mv hammer-tui /usr/lib/HackerOS/hammer/bin/
+>>> cd progress-bar && crystal build src/main.cr --release && sudo mv hammer-progress-bar && sudo mv hammer-progress-bar /usr/lib/HackerOS/hammer/bin/
