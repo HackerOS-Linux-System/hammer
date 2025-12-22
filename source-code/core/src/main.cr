@@ -295,8 +295,8 @@ def refresh
 end
 
 def ensure_container_exists(container_name : String)
-  output = run_command(CONTAINER_TOOL, ["ps", "-a", "-f", "name=#{container_name}"])
-  if output[:stdout].empty?
+  exists_output = run_command(CONTAINER_TOOL, ["container", "exists", container_name])
+  unless exists_output[:success]
     create_output = run_command(CONTAINER_TOOL, ["run", "-d", "--name", container_name, CONTAINER_IMAGE, "sleep", "infinity"])
     raise "Failed to create container: #{create_output[:stderr]}" unless create_output[:success]
   end
@@ -502,10 +502,8 @@ def update_bootloader_entries(deployment : String)
   end.sort_by do |dep|
     Time.parse_rfc3339(read_meta(dep)["created"]? || "1970-01-01T00:00:00Z")
   end.reverse[0...5] # Limit to last 5 good deployments
-
   entries = [] of String
   uuid = get_fs_uuid
-
   good_deployments.each do |dep|
     name = File.basename(dep)
     meta = read_meta(dep)
@@ -524,14 +522,12 @@ menuentry 'HammerOS (#{name})' --class gnu-linux --class gnu --class os $menuent
 ENTRY
     entries << entry
   end
-
   script_content = <<-SCRIPT
 #!/bin/sh
 exec tail -n +3 $0
 # This file provides HammerOS deployment entries
 #{entries.join("\n")}
 SCRIPT
-
   grub_file = "#{deployment}/etc/grub.d/25_hammer_entries"
   File.write(grub_file, script_content)
   File.chmod(grub_file, 0o755)
