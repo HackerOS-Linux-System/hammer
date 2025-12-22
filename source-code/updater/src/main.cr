@@ -82,9 +82,14 @@ module HammerUpdater
       # Get current default subvolume path
       default_output = run_command("btrfs", ["subvolume", "get-default", "/"])
       raise "Failed to get default subvolume: #{default_output[:stderr]}" unless default_output[:success]
-      match = default_output[:stdout].match(/path (.*)$/)
-      raise "Unable to parse subvolume path." unless match
-      current_subvol = match[1].strip
+      output_str = default_output[:stdout].strip
+      if output_str.includes?("ID 5 (FS_TREE)")
+        current_subvol = ""
+      elsif match = output_str.match(/path (.*)$/)
+        current_subvol = match[1].strip
+      else
+        raise "Unable to parse subvolume path."
+      end
       current_path = if current_subvol.empty?
                        BTRFS_TOP
                      else
