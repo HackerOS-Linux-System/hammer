@@ -7,8 +7,8 @@ Atomic system for HackerOS
 
 ## Commands
 - hammer help - list of commands
-- hammer install {package} - install package with distrobox/toolbox
-- hammer remove {package} - remove package with distrobox/toolbox
+- hammer install {package} - install package with distrobox/podman/apt
+- hammer remove {package} - remove package with distrobox/podman/apt
 - hammer update - update system with transational system
 - hammer refresh - refresh packages
 - hammer clean - clean all tmp packages
