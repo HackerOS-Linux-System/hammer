@@ -1,7 +1,7 @@
 require "option_parser"
 
 module Hammer
-  VERSION = "0.4" # Updated version for expansions
+  VERSION = "0.6" # Updated version for expansions
   HAMMER_PATH = "/usr/lib/HackerOS/hammer/bin"
   # Color constants using ANSI escape codes (no external libraries)
   COLOR_RESET = "\033[0m"
