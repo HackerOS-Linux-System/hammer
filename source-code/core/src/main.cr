@@ -52,12 +52,14 @@ def validate_system
   end
 end
 
-def parse_install_remove(args : Array(String)) : {package: String, atomic: Bool}
+def parse_install_remove(args : Array(String)) : {package: String, atomic: Bool, gui: Bool}
   atomic = false
+  gui = false
   package = ""
   parser = OptionParser.new do |p|
     p.banner = "Usage: [subcommand] [options] package"
     p.on("--atomic", "Atomic operation") { atomic = true }
+    p.on("--gui", "Install as GUI application") { gui = true }
     p.invalid_option do |flag|
       STDERR.puts "Invalid option: #{flag}."
       exit(1)
@@ -75,7 +77,7 @@ def parse_install_remove(args : Array(String)) : {package: String, atomic: Bool}
     STDERR.puts "Package name required."
     exit(1)
   end
-  {package: package, atomic: atomic}
+  {package: package, atomic: atomic, gui: gui}
 end
 
 def parse_switch(args : Array(String)) : String?
@@ -100,55 +102,166 @@ def parse_rollback(args : Array(String)) : Int32
   n
 end
 
-def install_package(package : String, atomic : Bool)
-  puts "Installing package: #{package} (atomic: #{atomic})"
+def install_package(package : String, atomic : Bool, gui : Bool)
+  puts "Installing package: #{package} (atomic: #{atomic}, gui: #{gui})"
   if atomic
-    atomic_install(package)
+    atomic_install(package, gui)
   else
-    container_install(package)
+    container_install(package, gui)
   end
 end
 
-def remove_package(package : String, atomic : Bool)
-  puts "Removing package: #{package} (atomic: #{atomic})"
+def remove_package(package : String, atomic : Bool, gui : Bool)
+  puts "Removing package: #{package} (atomic: #{atomic}, gui: #{gui})"
   if atomic
-    atomic_remove(package)
+    atomic_remove(package, gui)
   else
-    container_remove(package)
+    container_remove(package, gui)
   end
 end
 
-def container_install(package : String)
+def container_install(package : String, gui : Bool)
   container_name = CONTAINER_NAME_PREFIX + "default"
   ensure_container_exists(container_name)
+
+  # Check if already installed
+  check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
+  if check_output[:success]
+    puts "Package #{package} is already installed in the container."
+    return
+  end
+
   update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
   raise "Failed to update in container: #{update_output[:stderr]}" unless update_output[:success]
+
   install_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "install", "-y", package])
   raise "Failed to install package in container: #{install_output[:stderr]}" unless install_output[:success]
+
   puts "Package #{package} installed in container successfully."
-  puts "To run: #{CONTAINER_TOOL} exec -it #{container_name} #{package}"
+
+  # Create wrappers or .desktop files
+  if gui
+    # Find .desktop files from the package
+    files_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-L", package])
+    raise "Failed to list package files: #{files_output[:stderr]}" unless files_output[:success]
+
+    files = files_output[:stdout].lines.map(&.strip)
+    desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
+
+    desktop_files.each do |df|
+      content_output = run_command(CONTAINER_TOOL, ["exec", container_name, "cat", df])
+      if content_output[:success]
+        desktop_content = content_output[:stdout]
+
+        # Modify Exec= to prefix with podman exec
+        new_content = desktop_content.lines.map do |line|
+          if line.starts_with?("Exec=")
+            exec_cmd = line[5..].strip
+            "Exec=#{CONTAINER_TOOL} exec #{container_name} #{exec_cmd}"
+          else
+            line
+          end
+        end.join("\n") + "\n"
+
+        # Handle Icon if absolute path
+        icon = nil
+        desktop_content.lines.each do |line|
+          if line.starts_with?("Icon=")
+            icon = line[5..].strip
+            break
+          end
+        end
+
+        if icon && icon.starts_with?("/")
+          # Copy icon to host
+          host_icon_dir = File.dirname(icon)
+          Dir.mkdir_p(host_icon_dir)
+          copy_output = run_command(CONTAINER_TOOL, ["cp", "#{container_name}:#{icon}", icon])
+          puts "Warning: Failed to copy icon #{icon}: #{copy_output[:stderr]}" unless copy_output[:success]
+        end
+
+        # Write to host
+        host_df = "/usr/share/applications/#{File.basename(df)}"
+        File.write(host_df, new_content)
+        File.chmod(host_df, 0o644)
+        puts "Created .desktop file: #{host_df}"
+      end
+    end
+  else
+    # Assume CLI, create wrapper in /usr/bin
+    wrapper_path = "/usr/bin/#{package}"
+    wrapper_content = <<-WRAPPER
+#!/bin/sh
+#{CONTAINER_TOOL} exec #{container_name} #{package} "$@"
+WRAPPER
+    File.write(wrapper_path, wrapper_content)
+    File.chmod(wrapper_path, 0o755)
+    puts "Created CLI wrapper: #{wrapper_path}"
+  end
+
+  puts "To run manually: #{CONTAINER_TOOL} exec -it #{container_name} #{package}"
 end
 
-def container_remove(package : String)
+def container_remove(package : String, gui : Bool)
   container_name = CONTAINER_NAME_PREFIX + "default"
   ensure_container_exists(container_name)
+
+  # Check if installed
+  check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
+  unless check_output[:success]
+    puts "Package #{package} is not installed in the container."
+    return
+  end
+
   output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "remove", "-y", package])
   raise "Failed to remove package from container: #{output[:stderr]}" unless output[:success]
+
   puts "Package #{package} removed from container successfully."
+
+  # Remove wrappers or .desktop files
+  if gui
+    # Find and remove .desktop files
+    files_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-L", package])
+    if files_output[:success]
+      files = files_output[:stdout].lines.map(&.strip)
+      desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
+      desktop_files.each do |df|
+        host_df = "/usr/share/applications/#{File.basename(df)}"
+        File.delete(host_df) if File.exists?(host_df)
+        puts "Removed .desktop file: #{host_df}"
+      end
+    end
+  else
+    # Remove CLI wrapper
+    wrapper_path = "/usr/bin/#{package}"
+    File.delete(wrapper_path) if File.exists?(wrapper_path)
+    puts "Removed CLI wrapper: #{wrapper_path}"
+  end
 end
 
-def atomic_install(package : String)
+def atomic_install(package : String, gui : Bool)
   new_deployment : String? = nil
   mounted = false
   begin
     acquire_lock
     validate_system
     puts "Performing atomic install of #{package}..."
-    new_deployment = create_deployment(true) # Fixed to true for writable
+
+    # Create new deployment
+    new_deployment = create_deployment(true)
     create_transaction_marker(new_deployment)
     parent = File.basename(File.readlink(CURRENT_SYMLINK))
     bind_mounts_for_chroot(new_deployment, true)
     mounted = true
+
+    # Check if already installed in chroot
+    check_cmd = "chroot #{new_deployment} /bin/bash -c 'dpkg -s #{package}'"
+    check_output = run_command("/bin/bash", ["-c", check_cmd])
+    if check_output[:success]
+      puts "Package #{package} is already installed in the system."
+      raise "Already installed" # To trigger cleanup
+    end
+
     chroot_cmd = "chroot #{new_deployment} /bin/bash -c 'apt update && apt install -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
     output = run_command("/bin/bash", ["-c", chroot_cmd])
     if !output[:success]
@@ -178,18 +291,29 @@ def atomic_install(package : String)
   end
 end
 
-def atomic_remove(package : String)
+def atomic_remove(package : String, gui : Bool)
   new_deployment : String? = nil
   mounted = false
   begin
     acquire_lock
     validate_system
     puts "Performing atomic remove of #{package}..."
-    new_deployment = create_deployment(true) # Fixed to true
+
+    # Create new deployment
+    new_deployment = create_deployment(true)
     create_transaction_marker(new_deployment)
     parent = File.basename(File.readlink(CURRENT_SYMLINK))
     bind_mounts_for_chroot(new_deployment, true)
     mounted = true
+
+    # Check if installed in chroot
+    check_cmd = "chroot #{new_deployment} /bin/bash -c 'dpkg -s #{package}'"
+    check_output = run_command("/bin/bash", ["-c", check_cmd])
+    unless check_output[:success]
+      puts "Package #{package} is not installed in the system."
+      raise "Not installed" # To trigger cleanup
+    end
+
     chroot_cmd = "chroot #{new_deployment} /bin/bash -c 'apt remove -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
     output = run_command("/bin/bash", ["-c", chroot_cmd])
     if !output[:success]
@@ -546,10 +670,10 @@ else
   case subcommand
   when "install"
     matches = parse_install_remove(ARGV)
-    install_package(matches[:package], matches[:atomic])
+    install_package(matches[:package], matches[:atomic], matches[:gui])
   when "remove"
     matches = parse_install_remove(ARGV)
-    remove_package(matches[:package], matches[:atomic])
+    remove_package(matches[:package], matches[:atomic], matches[:gui])
   when "deploy"
     begin
       acquire_lock
