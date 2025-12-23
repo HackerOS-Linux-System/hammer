@@ -15,5 +15,10 @@ Atomic system for HackerOS
 - hammer about - information about hammer
 - hammer build init - create project for live build - to build run hammer build
 - hammer build - build atomic HackerOS with live build
+- hammer rollback - rollback to other version
+- hammer hisotry - history of deploys
+- hammer status - show status of hammer
+- hammer about - information about hammer
+- hammer tui - launch tui interface for hammer
 
 ## How working 
