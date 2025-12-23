@@ -42,7 +42,7 @@ def validate_system
   raise "Root filesystem is not BTRFS." unless output[:success]
   # Check current symlink exists
   unless File.symlink?(CURRENT_SYMLINK)
-    raise "Current deployment symlink missing."
+    raise "Current deployment symlink missing. System may not be initialized. Run 'sudo hammer-updater update' to initialize."
   end
   # Check current is read-only
   current = File.readlink(CURRENT_SYMLINK)
@@ -123,36 +123,28 @@ end
 def container_install(package : String, gui : Bool)
   container_name = CONTAINER_NAME_PREFIX + "default"
   ensure_container_exists(container_name)
-
   # Check if already installed
   check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
   if check_output[:success]
     puts "Package #{package} is already installed in the container."
     return
   end
-
   update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
   raise "Failed to update in container: #{update_output[:stderr]}" unless update_output[:success]
-
   install_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "install", "-y", package])
   raise "Failed to install package in container: #{install_output[:stderr]}" unless install_output[:success]
-
   puts "Package #{package} installed in container successfully."
-
   # Create wrappers or .desktop files
   if gui
     # Find .desktop files from the package
     files_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-L", package])
     raise "Failed to list package files: #{files_output[:stderr]}" unless files_output[:success]
-
     files = files_output[:stdout].lines.map(&.strip)
     desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
-
     desktop_files.each do |df|
       content_output = run_command(CONTAINER_TOOL, ["exec", container_name, "cat", df])
       if content_output[:success]
         desktop_content = content_output[:stdout]
-
         # Modify Exec= to prefix with podman exec
         new_content = desktop_content.lines.map do |line|
           if line.starts_with?("Exec=")
@@ -162,7 +154,6 @@ def container_install(package : String, gui : Bool)
             line
           end
         end.join("\n") + "\n"
-
         # Handle Icon if absolute path
         icon = nil
         desktop_content.lines.each do |line|
@@ -171,7 +162,6 @@ def container_install(package : String, gui : Bool)
             break
           end
         end
-
         if icon && icon.starts_with?("/")
           # Copy icon to host
           host_icon_dir = File.dirname(icon)
@@ -179,7 +169,6 @@ def container_install(package : String, gui : Bool)
           copy_output = run_command(CONTAINER_TOOL, ["cp", "#{container_name}:#{icon}", icon])
           puts "Warning: Failed to copy icon #{icon}: #{copy_output[:stderr]}" unless copy_output[:success]
         end
-
         # Write to host
         host_df = "/usr/share/applications/#{File.basename(df)}"
         File.write(host_df, new_content)
@@ -198,26 +187,21 @@ WRAPPER
     File.chmod(wrapper_path, 0o755)
     puts "Created CLI wrapper: #{wrapper_path}"
   end
-
   puts "To run manually: #{CONTAINER_TOOL} exec -it #{container_name} #{package}"
 end
 
 def container_remove(package : String, gui : Bool)
   container_name = CONTAINER_NAME_PREFIX + "default"
   ensure_container_exists(container_name)
-
   # Check if installed
   check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
   unless check_output[:success]
     puts "Package #{package} is not installed in the container."
     return
   end
-
   output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "remove", "-y", package])
   raise "Failed to remove package from container: #{output[:stderr]}" unless output[:success]
-
   puts "Package #{package} removed from container successfully."
-
   # Remove wrappers or .desktop files
   if gui
     # Find and remove .desktop files
@@ -246,14 +230,12 @@ def atomic_install(package : String, gui : Bool)
     acquire_lock
     validate_system
     puts "Performing atomic install of #{package}..."
-
     # Create new deployment
     new_deployment = create_deployment(true)
     create_transaction_marker(new_deployment)
     parent = File.basename(File.readlink(CURRENT_SYMLINK))
     bind_mounts_for_chroot(new_deployment, true)
     mounted = true
-
     # Check if already installed in chroot
     check_cmd = "chroot #{new_deployment} /bin/bash -c 'dpkg -s #{package}'"
     check_output = run_command("/bin/bash", ["-c", check_cmd])
@@ -261,7 +243,6 @@ def atomic_install(package : String, gui : Bool)
       puts "Package #{package} is already installed in the system."
       raise "Already installed" # To trigger cleanup
     end
-
     chroot_cmd = "chroot #{new_deployment} /bin/bash -c 'apt update && apt install -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
     output = run_command("/bin/bash", ["-c", chroot_cmd])
     if !output[:success]
@@ -298,14 +279,12 @@ def atomic_remove(package : String, gui : Bool)
     acquire_lock
     validate_system
     puts "Performing atomic remove of #{package}..."
-
     # Create new deployment
     new_deployment = create_deployment(true)
     create_transaction_marker(new_deployment)
     parent = File.basename(File.readlink(CURRENT_SYMLINK))
     bind_mounts_for_chroot(new_deployment, true)
     mounted = true
-
     # Check if installed in chroot
     check_cmd = "chroot #{new_deployment} /bin/bash -c 'dpkg -s #{package}'"
     check_output = run_command("/bin/bash", ["-c", check_cmd])
@@ -313,7 +292,6 @@ def atomic_remove(package : String, gui : Bool)
       puts "Package #{package} is not installed in the system."
       raise "Not installed" # To trigger cleanup
     end
-
     chroot_cmd = "chroot #{new_deployment} /bin/bash -c 'apt remove -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
     output = run_command("/bin/bash", ["-c", chroot_cmd])
     if !output[:success]
@@ -426,9 +404,15 @@ end
 
 def ensure_container_exists(container_name : String)
   exists_output = run_command(CONTAINER_TOOL, ["container", "exists", container_name])
-  unless exists_output[:success]
+  if !exists_output[:success]
     create_output = run_command(CONTAINER_TOOL, ["run", "-d", "--name", container_name, CONTAINER_IMAGE, "sleep", "infinity"])
     raise "Failed to create container: #{create_output[:stderr]}" unless create_output[:success]
+  end
+  # Check if running
+  running_output = run_command(CONTAINER_TOOL, ["ps", "-q", "-f", "name=^#{container_name}$"])
+  if running_output[:stdout].strip.empty?
+    start_output = run_command(CONTAINER_TOOL, ["start", container_name])
+    raise "Failed to start container: #{start_output[:stderr]}" unless start_output[:success]
   end
 end
 
