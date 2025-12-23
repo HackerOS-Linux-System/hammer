@@ -34,7 +34,7 @@ module HammerUpdater
     Dir.mkdir(BTRFS_TOP) unless Dir.exists?(BTRFS_TOP)
     findmnt_output = run_command("findmnt", ["-no", "SOURCE", "/"])
     raise "Failed to find root device: #{findmnt_output[:stderr]}" unless findmnt_output[:success]
-    device = findmnt_output[:stdout].strip
+    device = findmnt_output[:stdout].strip.gsub(/\[\S+\]/, "")
     mount_output = run_command("mount", ["-o", "subvol=/", device, BTRFS_TOP])
     raise "Failed to mount btrfs top: #{mount_output[:stderr]}" unless mount_output[:success]
   end
