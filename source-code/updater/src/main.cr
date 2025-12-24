@@ -5,7 +5,7 @@ require "json"
 require "digest/sha256"
 
 module HammerUpdater
-  VERSION = "0.6" # Updated version
+  VERSION = "0.7" # Updated version
   DEPLOYMENTS_DIR = "/btrfs-root/deployments"
   CURRENT_SYMLINK = "/btrfs-root/current"
   LOCK_FILE = "/run/hammer.lock"
