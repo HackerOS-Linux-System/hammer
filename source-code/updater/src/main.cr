@@ -5,7 +5,7 @@ require "json"
 require "digest/sha256"
 
 module HammerUpdater
-  VERSION = "0.7" # Updated version
+  VERSION = "0.6" # Updated version
   DEPLOYMENTS_DIR = "/btrfs-root/deployments"
   CURRENT_SYMLINK = "/btrfs-root/current"
   LOCK_FILE = "/run/hammer.lock"
@@ -73,6 +73,87 @@ module HammerUpdater
     {success: status.success?, stdout: stdout.to_s, stderr: stderr.to_s}
   end
 
+  private def self.get_subvol_name(path : String) : String
+    show_output = run_command("btrfs", ["subvolume", "show", path])
+    raise "Failed to get subvolume for #{path}: #{show_output[:stderr]}" unless show_output[:success]
+    output_str = show_output[:stdout].lines.first?.try(&.strip) || ""
+    if output_str == "<FS_TREE>" || output_str == "/"
+      ""
+    else
+      output_str
+    end
+  end
+
+  private def self.snapshot_recursive(source : String, dest : String, writable : Bool)
+    # Create the main snapshot
+    args = ["subvolume", "snapshot"]
+    args << "-r" unless writable
+    args << source
+    args << dest
+    output = run_command("btrfs", args)
+    raise "Failed to snapshot #{source} to #{dest}: #{output[:stderr]}" unless output[:success]
+    # List subvolumes under source
+    list_output = run_command("btrfs", ["subvolume", "list", "-a", "--sort=path", source])
+    raise "Failed to list subvolumes: #{list_output[:stderr]}" unless list_output[:success]
+    lines = list_output[:stdout].lines
+    source_subvol = get_subvol_name(source)
+    prefix = if source_subvol.empty?
+               "<FS_TREE>/"
+             else
+               "<FS_TREE>/#{source_subvol}/"
+             end
+    prefix_length = prefix.size
+    lines.each do |line|
+      if line =~ /ID \d+ gen \d+ path (.*)/
+        full_path = $1
+        if full_path.starts_with?(prefix)
+          rel_path = full_path[prefix_length .. ]
+          next if rel_path.empty?
+          sub_source = "#{source}/#{rel_path}"
+          sub_dest = "#{dest}/#{rel_path}"
+          # Remove placeholder dir
+          rmdir_output = run_command("rmdir", [sub_dest])
+          unless rmdir_output[:success]
+            raise "Failed to rmdir placeholder #{sub_dest}: #{rmdir_output[:stderr]}"
+          end
+          # Create nested snapshot
+          args = ["subvolume", "snapshot"]
+          args << "-r" unless writable
+          args << sub_source
+          args << sub_dest
+          output = run_command("btrfs", args)
+          raise "Failed to snapshot nested #{sub_source} to #{sub_dest}: #{output[:stderr]}" unless output[:success]
+        end
+      end
+    end
+  end
+
+  private def self.set_readonly_recursive(path : String, readonly : Bool)
+    set_subvolume_readonly(path, readonly)
+    # List subvolumes under path
+    list_output = run_command("btrfs", ["subvolume", "list", "-a", "--sort=path", path])
+    raise "Failed to list subvolumes: #{list_output[:stderr]}" unless list_output[:success]
+    lines = list_output[:stdout].lines
+    path_subvol = get_subvol_name(path)
+    prefix = if path_subvol.empty?
+               "<FS_TREE>/"
+             else
+               "<FS_TREE>/#{path_subvol}/"
+             end
+    prefix_length = prefix.size
+    lines.each do |line|
+      if line =~ /ID \d+ gen \d+ path (.*)/
+        full_path = $1
+        if full_path.starts_with?(prefix)
+          rel_path = full_path[prefix_length .. ]
+          next if rel_path.empty?
+          sub_path = "#{path}/#{rel_path}"
+          set_subvolume_readonly(sub_path, readonly)
+        end
+      end
+    end
+  end
+
   private def self.update_command(args : Array(String))
     if args.size != 0
       puts "Usage: hammer-updater update"
@@ -91,19 +172,9 @@ module HammerUpdater
       # Check btrfs
       output = run_command("btrfs", ["filesystem", "show", "/"])
       raise "Root filesystem is not BTRFS." unless output[:success]
-      # Get current default subvolume path
-      default_output = run_command("btrfs", ["subvolume", "get-default", "/"])
-      raise "Failed to get default subvolume: #{default_output[:stderr]}" unless default_output[:success]
-      output_str = default_output[:stdout].strip
-      current_subvol = ""
-      if match = output_str.match(/path (.*)$/)
-        current_subvol = match[1].strip
-        if current_subvol == "<FS_TREE>"
-          current_subvol = ""
-        end
-      else
-        raise "Unable to parse subvolume path."
-      end
+      # Get current subvolume path using subvolume show
+      current_subvol = get_subvol_name("/")
+      raise "Unable to parse subvolume path from: #{current_subvol}" if current_subvol.includes?(" ") || current_subvol.includes?("\n")
       current_path = if current_subvol.empty?
                        BTRFS_TOP
                      else
@@ -117,13 +188,12 @@ module HammerUpdater
       # Create new deployment snapshot (writable)
       timestamp = Time.local.to_s("%Y%m%d%H%M%S")
       new_deployment = "#{DEPLOYMENTS_DIR}/hammer-#{timestamp}"
-      output = run_command("btrfs", ["subvolume", "snapshot", current_path, new_deployment])
-      raise "Failed to create initial deployment: #{output[:stderr]}" unless output[:success]
+      snapshot_recursive(current_path, new_deployment, true)
       # Bind mounts for chroot
       bind_mounts_for_chroot(new_deployment, true)
       mounted = true
       # Run commands in chroot
-      chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+      chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt update && apt install --reinstall -y plymouth && apt-mark manual plymouth && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && chmod -x /etc/grub.d/10_linux /etc/grub.d/20_linux_xen /etc/grub.d/30_os-prober && update-grub'"
       output = run_command("/bin/sh", ["-c", chroot_cmd])
       raise "Failed in chroot for initial setup: #{output[:stderr]}" unless output[:success]
       bind_mounts_for_chroot(new_deployment, false)
@@ -133,7 +203,7 @@ module HammerUpdater
       system_version = compute_system_version(new_deployment)
       write_meta(new_deployment, "initial", current_subvol, kernel, system_version, "ready")
       update_bootloader_entries(new_deployment)
-      set_subvolume_readonly(new_deployment, true)
+      set_readonly_recursive(new_deployment, true)
       create_transaction_marker(new_deployment)
       switch_to_deployment(new_deployment)
       # Do not remove transaction marker; it will be handled on boot
@@ -171,7 +241,7 @@ module HammerUpdater
       create_transaction_marker(new_deployment)
       bind_mounts_for_chroot(new_deployment, true)
       mounted = true
-      chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt update && apt upgrade -y -o Dpkg::Options::=\"--force-confold\" && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
+      chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt update && apt-mark manual plymouth && apt upgrade -y -o Dpkg::Options::=\\\"--force-confold\\\" && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && chmod -x /etc/grub.d/10_linux /etc/grub.d/20_linux_xen /etc/grub.d/30_os-prober && update-grub'"
       output = run_command("/bin/sh", ["-c", chroot_cmd])
       if !output[:success]
         raise "Failed to update in chroot: #{output[:stderr]}"
@@ -183,7 +253,7 @@ module HammerUpdater
       system_version = compute_system_version(new_deployment)
       write_meta(new_deployment, "update", parent, kernel, system_version, "ready")
       update_bootloader_entries(new_deployment)
-      set_subvolume_readonly(new_deployment, true)
+      set_readonly_recursive(new_deployment, true)
       switch_to_deployment(new_deployment)
       remove_transaction_marker
       puts "System updated. Reboot to apply changes."
@@ -206,13 +276,8 @@ module HammerUpdater
     current = File.readlink(CURRENT_SYMLINK)
     timestamp = Time.local.to_s("%Y%m%d%H%M%S")
     new_deployment = "#{DEPLOYMENTS_DIR}/hammer-#{timestamp}"
-    args = ["subvolume", "snapshot"]
-    args << "-r" unless writable
-    args << current
-    args << new_deployment
-    output = run_command("btrfs", args)
-    raise "Failed to create deployment: #{output[:stderr]}" unless output[:success]
-    set_subvolume_readonly(new_deployment, false) if writable
+    snapshot_recursive(current, new_deployment, writable)
+    set_readonly_recursive(new_deployment, false) if writable
     puts "Deployment created at: #{new_deployment}"
     new_deployment
   end
@@ -221,13 +286,48 @@ module HammerUpdater
     dirs = ["proc", "sys", "dev"]
     dirs.each do |dir|
       target = "#{chroot_path}/#{dir}"
-      Dir.mkdir_p(target)
+      Dir.mkdir_p(target) unless Dir.exists?(target)
       if mount
         output = run_command("mount", ["--bind", "/#{dir}", target])
+        raise "Failed to mount #{dir}: #{output[:stderr]}" unless output[:success]
       else
         output = run_command("umount", [target])
+        raise "Failed to umount #{dir}: #{output[:stderr]}" unless output[:success]
       end
-      raise "Failed to #{mount ? "mount" : "umount"} #{dir}: #{output[:stderr]}" unless output[:success]
+    end
+
+    # Additional mounts for /dev/pts and /dev/shm
+    if mount
+      dev_pts = "#{chroot_path}/dev/pts"
+      Dir.mkdir_p(dev_pts) unless Dir.exists?(dev_pts)
+      output = run_command("mount", ["-t", "devpts", "devpts", dev_pts, "-o", "ptmxmode=0666"])
+      raise "Failed to mount /dev/pts: #{output[:stderr]}" unless output[:success]
+
+      dev_shm = "#{chroot_path}/dev/shm"
+      Dir.mkdir_p(dev_shm) unless Dir.exists?(dev_shm)
+      output = run_command("mount", ["-t", "tmpfs", "tmpfs", dev_shm])
+      raise "Failed to mount /dev/shm: #{output[:stderr]}" unless output[:success]
+    else
+      dev_shm = "#{chroot_path}/dev/shm"
+      if Dir.exists?(dev_shm)
+        output = run_command("umount", [dev_shm])
+        # Ignore failure if not mounted
+      end
+
+      dev_pts = "#{chroot_path}/dev/pts"
+      if Dir.exists?(dev_pts)
+        output = run_command("umount", [dev_pts])
+        # Ignore failure if not mounted
+      end
+    end
+
+    if mount
+      resolv_target = "#{chroot_path}/etc/resolv.conf"
+      begin
+        File.write(resolv_target, File.read("/etc/resolv.conf"))
+      rescue ex
+        puts "Warning: Failed to copy resolv.conf: #{ex.message}"
+      end
     end
   end
 
