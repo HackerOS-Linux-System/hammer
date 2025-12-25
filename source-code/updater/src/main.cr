@@ -32,11 +32,15 @@ module HammerUpdater
     mountpoint_output = run_command("mountpoint", ["-q", BTRFS_TOP])
     return if mountpoint_output[:success]
     Dir.mkdir(BTRFS_TOP) unless Dir.exists?(BTRFS_TOP)
-    findmnt_output = run_command("findmnt", ["-no", "SOURCE", "/"])
-    raise "Failed to find root device: #{findmnt_output[:stderr]}" unless findmnt_output[:success]
-    device = findmnt_output[:stdout].strip.gsub(/\[\S+\]/, "")
+    device = get_root_device
     mount_output = run_command("mount", ["-o", "subvol=/", device, BTRFS_TOP])
     raise "Failed to mount btrfs top: #{mount_output[:stderr]}" unless mount_output[:success]
+  end
+
+  private def self.get_root_device : String
+    findmnt_output = run_command("findmnt", ["-no", "SOURCE", "/"])
+    raise "Failed to find root device: #{findmnt_output[:stderr]}" unless findmnt_output[:success]
+    findmnt_output[:stdout].strip.gsub(/\[\S+\]/, "")
   end
 
   private def self.acquire_lock
@@ -164,7 +168,9 @@ module HammerUpdater
 
   private def self.initialize_system
     new_deployment : String? = nil
-    mounted = false
+    temp_chroot : String? = nil
+    temp_mounted = false
+    chroot_mounted = false
     begin
       ensure_top_mounted
       acquire_lock
@@ -189,20 +195,29 @@ module HammerUpdater
       timestamp = Time.local.to_s("%Y%m%d%H%M%S")
       new_deployment = "#{DEPLOYMENTS_DIR}/hammer-#{timestamp}"
       snapshot_recursive(current_path, new_deployment, true)
-      # Bind mounts for chroot
-      bind_mounts_for_chroot(new_deployment, true)
-      mounted = true
-      # Run commands in chroot
-      chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt update && apt install --reinstall -y plymouth && apt-mark manual plymouth && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && chmod -x /etc/grub.d/10_linux /etc/grub.d/20_linux_xen /etc/grub.d/30_os-prober && update-grub'"
+      device = get_root_device
+      new_subvol = get_subvol_name(new_deployment)
+      temp_chroot = FileUtils.mktmpdir("hammer")
+      mount_output = run_command("mount", ["-o", "subvol=#{new_subvol}", device, temp_chroot])
+      raise "Failed to mount temp_chroot: #{mount_output[:stderr]}" unless mount_output[:success]
+      temp_mounted = true
+      bind_mounts_for_chroot(temp_chroot, true)
+      chroot_mounted = true
+      chroot_cmd = "chroot #{temp_chroot} /bin/sh -c 'apt update && apt install --reinstall -y plymouth && apt-mark manual plymouth && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && chmod -x /etc/grub.d/10_linux /etc/grub.d/20_linux_xen /etc/grub.d/30_os-prober'"
       output = run_command("/bin/sh", ["-c", chroot_cmd])
       raise "Failed in chroot for initial setup: #{output[:stderr]}" unless output[:success]
-      bind_mounts_for_chroot(new_deployment, false)
-      mounted = false
-      kernel = get_kernel_version(new_deployment)
-      sanity_check(new_deployment, kernel)
+      kernel = get_kernel_version(temp_chroot)
+      sanity_check(new_deployment, kernel, temp_chroot)
       system_version = compute_system_version(new_deployment)
       write_meta(new_deployment, "initial", current_subvol, kernel, system_version, "ready")
       update_bootloader_entries(new_deployment)
+      grub_cmd = "chroot #{temp_chroot} /bin/sh -c 'update-grub'"
+      grub_output = run_command("/bin/sh", ["-c", grub_cmd])
+      raise "Failed in chroot for grub update: #{grub_output[:stderr]}" unless grub_output[:success]
+      bind_mounts_for_chroot(temp_chroot, false)
+      chroot_mounted = false
+      umount_output = run_command("umount", [temp_chroot])
+      temp_mounted = false
       set_readonly_recursive(new_deployment, true)
       create_transaction_marker(new_deployment)
       switch_to_deployment(new_deployment)
@@ -214,8 +229,14 @@ module HammerUpdater
       end
       raise ex
     ensure
-      if mounted && new_deployment
-        bind_mounts_for_chroot(new_deployment, false) rescue nil
+      if chroot_mounted && temp_chroot
+        bind_mounts_for_chroot(temp_chroot, false) rescue nil
+      end
+      if temp_mounted && temp_chroot
+        run_command("umount", [temp_chroot]) rescue nil
+      end
+      if temp_chroot && Dir.exists?(temp_chroot)
+        Dir.rmdir(temp_chroot) rescue nil
       end
       release_lock
     end
@@ -229,7 +250,9 @@ module HammerUpdater
       return
     end
     new_deployment : String? = nil
-    mounted = false
+    temp_chroot : String? = nil
+    temp_mounted = false
+    chroot_mounted = false
     begin
       acquire_lock
       validate_system
@@ -239,20 +262,31 @@ module HammerUpdater
       parent = File.basename(current)
       new_deployment = create_deployment(true)
       create_transaction_marker(new_deployment)
-      bind_mounts_for_chroot(new_deployment, true)
-      mounted = true
-      chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt update && apt-mark manual plymouth && apt upgrade -y -o Dpkg::Options::=\\\"--force-confold\\\" && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && chmod -x /etc/grub.d/10_linux /etc/grub.d/20_linux_xen /etc/grub.d/30_os-prober && update-grub'"
+      device = get_root_device
+      new_subvol = get_subvol_name(new_deployment)
+      temp_chroot = FileUtils.mktmpdir("hammer")
+      mount_output = run_command("mount", ["-o", "subvol=#{new_subvol}", device, temp_chroot])
+      raise "Failed to mount temp_chroot: #{mount_output[:stderr]}" unless mount_output[:success]
+      temp_mounted = true
+      bind_mounts_for_chroot(temp_chroot, true)
+      chroot_mounted = true
+      chroot_cmd = "chroot #{temp_chroot} /bin/sh -c 'apt update && apt-mark manual plymouth && apt upgrade -y -o Dpkg::Options::=\\\"--force-confold\\\" && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && chmod -x /etc/grub.d/10_linux /etc/grub.d/20_linux_xen /etc/grub.d/30_os-prober'"
       output = run_command("/bin/sh", ["-c", chroot_cmd])
       if !output[:success]
         raise "Failed to update in chroot: #{output[:stderr]}"
       end
-      bind_mounts_for_chroot(new_deployment, false)
-      mounted = false
-      kernel = get_kernel_version(new_deployment)
-      sanity_check(new_deployment, kernel)
+      kernel = get_kernel_version(temp_chroot)
+      sanity_check(new_deployment, kernel, temp_chroot)
       system_version = compute_system_version(new_deployment)
       write_meta(new_deployment, "update", parent, kernel, system_version, "ready")
       update_bootloader_entries(new_deployment)
+      grub_cmd = "chroot #{temp_chroot} /bin/sh -c 'update-grub'"
+      grub_output = run_command("/bin/sh", ["-c", grub_cmd])
+      raise "Failed in chroot for grub update: #{grub_output[:stderr]}" unless grub_output[:success]
+      bind_mounts_for_chroot(temp_chroot, false)
+      chroot_mounted = false
+      umount_output = run_command("umount", [temp_chroot])
+      temp_mounted = false
       set_readonly_recursive(new_deployment, true)
       switch_to_deployment(new_deployment)
       remove_transaction_marker
@@ -263,8 +297,14 @@ module HammerUpdater
       end
       raise ex
     ensure
-      if mounted && new_deployment
-        bind_mounts_for_chroot(new_deployment, false) rescue nil
+      if chroot_mounted && temp_chroot
+        bind_mounts_for_chroot(temp_chroot, false) rescue nil
+      end
+      if temp_mounted && temp_chroot
+        run_command("umount", [temp_chroot]) rescue nil
+      end
+      if temp_chroot && Dir.exists?(temp_chroot)
+        Dir.rmdir(temp_chroot) rescue nil
       end
       release_lock
     end
@@ -295,14 +335,12 @@ module HammerUpdater
         raise "Failed to umount #{dir}: #{output[:stderr]}" unless output[:success]
       end
     end
-
     # Additional mounts for /dev/pts and /dev/shm
     if mount
       dev_pts = "#{chroot_path}/dev/pts"
       Dir.mkdir_p(dev_pts) unless Dir.exists?(dev_pts)
       output = run_command("mount", ["-t", "devpts", "devpts", dev_pts, "-o", "ptmxmode=0666"])
       raise "Failed to mount /dev/pts: #{output[:stderr]}" unless output[:success]
-
       dev_shm = "#{chroot_path}/dev/shm"
       Dir.mkdir_p(dev_shm) unless Dir.exists?(dev_shm)
       output = run_command("mount", ["-t", "tmpfs", "tmpfs", dev_shm])
@@ -313,14 +351,12 @@ module HammerUpdater
         output = run_command("umount", [dev_shm])
         # Ignore failure if not mounted
       end
-
       dev_pts = "#{chroot_path}/dev/pts"
       if Dir.exists?(dev_pts)
         output = run_command("umount", [dev_pts])
         # Ignore failure if not mounted
       end
     end
-
     if mount
       resolv_target = "#{chroot_path}/etc/resolv.conf"
       begin
@@ -405,7 +441,7 @@ module HammerUpdater
     File.delete(TRANSACTION_MARKER) if File.exists?(TRANSACTION_MARKER)
   end
 
-  private def self.sanity_check(deployment : String, kernel : String)
+  private def self.sanity_check(deployment : String, kernel : String, chroot_path : String = deployment)
     unless File.exists?("#{deployment}/boot/vmlinuz-#{kernel}")
       raise "Kernel file missing: /boot/vmlinuz-#{kernel}"
     end
@@ -413,7 +449,7 @@ module HammerUpdater
       raise "Initramfs file missing: /boot/initrd.img-#{kernel}"
     end
     # Check fstab
-    cmd = "chroot #{deployment} /bin/mount -f -a"
+    cmd = "chroot #{chroot_path} /bin/mount -f -a"
     output = run_command("/bin/sh", ["-c", cmd])
     raise "Fstab sanity check failed: #{output[:stderr]}" unless output[:success]
   end
