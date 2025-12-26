@@ -330,19 +330,13 @@ module HammerUpdater
 
   private def self.bind_mounts_for_chroot(chroot_path : String, mount : Bool)
     dirs = ["proc", "sys", "dev"]
-    dirs.each do |dir|
-      target = "#{chroot_path}/#{dir}"
-      Dir.mkdir_p(target) unless Dir.exists?(target)
-      if mount
+    if mount
+      dirs.each do |dir|
+        target = "#{chroot_path}/#{dir}"
+        Dir.mkdir_p(target) unless Dir.exists?(target)
         output = run_command("mount", ["--bind", "/#{dir}", target])
         raise "Failed to mount #{dir}: #{output[:stderr]}" unless output[:success]
-      else
-        output = run_command("umount", [target])
-        raise "Failed to umount #{dir}: #{output[:stderr]}" unless output[:success]
       end
-    end
-    # Additional mounts for /dev/pts and /dev/shm
-    if mount
       dev_pts = "#{chroot_path}/dev/pts"
       Dir.mkdir_p(dev_pts) unless Dir.exists?(dev_pts)
       output = run_command("mount", ["-t", "devpts", "devpts", dev_pts, "-o", "ptmxmode=0666"])
@@ -351,6 +345,12 @@ module HammerUpdater
       Dir.mkdir_p(dev_shm) unless Dir.exists?(dev_shm)
       output = run_command("mount", ["-t", "tmpfs", "tmpfs", dev_shm])
       raise "Failed to mount /dev/shm: #{output[:stderr]}" unless output[:success]
+      resolv_target = "#{chroot_path}/etc/resolv.conf"
+      begin
+        File.write(resolv_target, File.read("/etc/resolv.conf"))
+      rescue ex
+        puts "Warning: Failed to copy resolv.conf: #{ex.message}"
+      end
     else
       dev_shm = "#{chroot_path}/dev/shm"
       if Dir.exists?(dev_shm)
@@ -362,19 +362,16 @@ module HammerUpdater
         output = run_command("umount", [dev_pts])
         # Ignore failure if not mounted
       end
-    end
-    if mount
-      resolv_target = "#{chroot_path}/etc/resolv.conf"
-      begin
-        File.write(resolv_target, File.read("/etc/resolv.conf"))
-      rescue ex
-        puts "Warning: Failed to copy resolv.conf: #{ex.message}"
+      dirs.reverse.each do |dir|
+        target = "#{chroot_path}/#{dir}"
+        output = run_command("umount", [target])
+        raise "Failed to umount #{dir}: #{output[:stderr]}" unless output[:success]
       end
     end
   end
 
   private def self.get_kernel_version(chroot_path : String) : String
-    cmd = "chroot #{chroot_path} /bin/sh -c \"dpkg -l | grep ^ii | grep linux-image | awk '{print \\$3}' | sort -V | tail -1\""
+    cmd = "chroot #{chroot_path} /bin/sh -c \"dpkg -l | grep ^ii | grep linux-image-[0-9] | awk '{print \\$2}' | sed 's/linux-image-//' | sort -V | tail -1\""
     output = run_command("/bin/sh", ["-c", cmd])
     raise "Failed to get kernel version: #{output[:stderr]}" unless output[:success]
     output[:stdout].strip
