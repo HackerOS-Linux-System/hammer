@@ -1,4 +1,0 @@
-// curl
-
->>> cd ~/.hackeros/hammer/ &&  sudo rm -rf hammer-core hammer-updater hammer-builder hammer-tui && curl -L --output-dir ~/.hackeros/hammer -O https://github.com/HackerOS-Linux-System/hammer/releases/download/v0.4/hammer-updater -O https://github.com/HackerOS-Linux-System/hammer/releases/download/v0.4/hammer-tui -O https://github.com/HackerOS-Linux-System/hammer/releases/download/v0.4/hammer-core -O https://github.com/HackerOS-Linux-System/hammer/releases/download/v0.4/hammer-builder && sudo chmod a+x hammer-builder hammer-core hammer-updater hammer-tui
->>> cd /usr/bin/ && sudo rm -rf hammer && sudo curl -L -o /usr/bin/hammer https://github.com/HackerOS-Linux-System/hammer/releases/download/v0.4/hammer && sudo chmod a+x /usr/bin/hammer
