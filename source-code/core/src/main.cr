@@ -15,6 +15,9 @@ DEPLOYMENTS_DIR = "/btrfs-root/deployments"
 CURRENT_SYMLINK = "/btrfs-root/current"
 LOCK_FILE = "/run/hammer.lock"
 TRANSACTION_MARKER = "/btrfs-root/hammer-transaction"
+BINARY_MAP = {
+  "golang" => "go",
+}
 def run_command(cmd : String, args : Array(String)) : {success: Bool, stdout: String, stderr: String}
   stdout = IO::Memory.new
   stderr = IO::Memory.new
@@ -135,7 +138,8 @@ def container_install(package : String, gui : Bool)
       return
     end
     # Setup sources and architecture
-    sources_setup = run_as_user(user, "distrobox enter #{container_name} -- sudo sed -i 's/main$/main contrib non-free non-free-firmware/g' /etc/apt/sources.list")
+    sources_setup_cmd = "sudo bash -c 'if [ ! -f /etc/apt/sources.list ]; then echo \\\"deb http://deb.debian.org/debian stable main contrib non-free non-free-firmware\\\" > /etc/apt/sources.list; else sed -i \\\"s/main$/main contrib non-free non-free-firmware/g\\\" /etc/apt/sources.list; fi'"
+    sources_setup = run_as_user(user, "distrobox enter #{container_name} -- #{sources_setup_cmd}")
     if !sources_setup[:success]
       puts "Warning: Failed to setup sources: #{sources_setup[:stderr]}"
     end
@@ -157,7 +161,7 @@ def container_install(package : String, gui : Bool)
       desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
       app_names = desktop_files.map { |df| File.basename(df, ".desktop") }
       app_names.each do |app|
-        export_output = run_as_user(user, "distrobox-export --name #{container_name} --app #{app}")
+        export_output = run_as_user(user, "distrobox enter #{container_name} -- distrobox-export --app #{app}")
         if export_output[:success]
           puts "Exported app: #{app}"
         else
@@ -171,6 +175,7 @@ def container_install(package : String, gui : Bool)
       puts "Warning: Failed to list package files for export: #{files_output[:stderr]}"
     end
   else
+    binary = BINARY_MAP[package]? || package
     container_name = CONTAINER_NAME_PREFIX + "default"
     ensure_container_exists(container_name)
     # Check if already installed
@@ -185,16 +190,16 @@ def container_install(package : String, gui : Bool)
     raise "Failed to install package in container: #{install_output[:stderr]}" unless install_output[:success]
     puts "Package #{package} installed in container successfully."
     # Assume CLI, create wrapper in /usr/bin
-    wrapper_path = "/usr/bin/#{package}"
+    wrapper_path = "/usr/bin/#{binary}"
     wrapper_content = <<-WRAPPER
 #!/bin/sh
 sudo #{CONTAINER_TOOL} ps --filter name=^#{container_name}$ --filter status=running -q | grep -q . || sudo #{CONTAINER_TOOL} start #{container_name}
-sudo #{CONTAINER_TOOL} exec #{container_name} #{package} "$@"
+sudo #{CONTAINER_TOOL} exec #{container_name} #{binary} "$@"
 WRAPPER
     File.write(wrapper_path, wrapper_content)
     File.chmod(wrapper_path, 0o755)
     puts "Created CLI wrapper: #{wrapper_path}"
-    puts "To run manually: sudo #{CONTAINER_TOOL} exec -it #{container_name} #{package}"
+    puts "To run manually: sudo #{CONTAINER_TOOL} exec -it #{container_name} #{binary}"
   end
 end
 def container_remove(package : String, gui : Bool)
@@ -228,7 +233,7 @@ def container_remove(package : String, gui : Bool)
     end
     # Unexport apps
     app_names.each do |app|
-      unexport_output = run_as_user(user, "distrobox-export --name #{container_name} --app #{app} --delete")
+      unexport_output = run_as_user(user, "distrobox enter #{container_name} -- distrobox-export --app #{app} --delete")
       if unexport_output[:success]
         puts "Unexported app: #{app}"
       else
@@ -240,6 +245,7 @@ def container_remove(package : String, gui : Bool)
     raise "Failed to remove package from distrobox: #{remove_output[:stderr]}" unless remove_output[:success]
     puts "Package #{package} removed from distrobox successfully."
   else
+    binary = BINARY_MAP[package]? || package
     container_name = CONTAINER_NAME_PREFIX + "default"
     ensure_container_exists(container_name)
     # Check if installed
@@ -253,7 +259,7 @@ def container_remove(package : String, gui : Bool)
     raise "Failed to remove package from container: #{remove_output[:stderr]}" unless remove_output[:success]
     puts "Package #{package} removed from container successfully."
     # Remove CLI wrapper
-    wrapper_path = "/usr/bin/#{package}"
+    wrapper_path = "/usr/bin/#{binary}"
     File.delete(wrapper_path) if File.exists?(wrapper_path)
     puts "Removed CLI wrapper: #{wrapper_path}"
   end
@@ -675,6 +681,63 @@ SCRIPT
   File.write(grub_file, script_content)
   File.chmod(grub_file, 0o755)
 end
+def lock_system
+  begin
+    acquire_lock
+    puts "Locking system (setting readonly)..."
+    current = File.readlink(CURRENT_SYMLINK)
+    set_readonly_recursive(current, true)
+    puts "System locked."
+  ensure
+    release_lock
+  end
+end
+def unlock_system
+  begin
+    acquire_lock
+    puts "Unlocking system (setting writable)..."
+    current = File.readlink(CURRENT_SYMLINK)
+    set_readonly_recursive(current, false)
+    puts "System unlocked."
+  ensure
+    release_lock
+  end
+end
+def set_readonly_recursive(path : String, readonly : Bool)
+  set_subvolume_readonly(path, readonly)
+  # List subvolumes under path
+  list_output = run_command("btrfs", ["subvolume", "list", "-a", "--sort=path", path])
+  raise "Failed to list subvolumes: #{list_output[:stderr]}" unless list_output[:success]
+  lines = list_output[:stdout].lines
+  path_subvol = get_subvol_name(path)
+  prefix = if path_subvol.empty?
+             "<FS_TREE>/"
+           else
+             "<FS_TREE>/#{path_subvol}/"
+           end
+  prefix_length = prefix.size
+  lines.each do |line|
+    if line =~ /ID \d+ gen \d+ path (.*)/
+      full_path = $1
+      if full_path.starts_with?(prefix)
+        rel_path = full_path[prefix_length .. ]
+        next if rel_path.empty?
+        sub_path = "#{path}/#{rel_path}"
+        set_subvolume_readonly(sub_path, readonly)
+      end
+    end
+  end
+end
+def get_subvol_name(path : String) : String
+  show_output = run_command("btrfs", ["subvolume", "show", path])
+  raise "Failed to get subvolume for #{path}: #{show_output[:stderr]}" unless show_output[:success]
+  output_str = show_output[:stdout].lines.first?.try(&.strip) || ""
+  if output_str == "<FS_TREE>" || output_str == "/"
+    ""
+  else
+    output_str
+  end
+end
 if ARGV.empty?
   puts "No subcommand was used"
 else
@@ -731,6 +794,10 @@ else
       hammer_rollback(n)
     when "check-transaction"
       hammer_check_transaction
+    when "lock"
+      lock_system
+    when "unlock"
+      unlock_system
     else
       puts "Unknown subcommand: #{subcommand}"
     end
@@ -739,3 +806,4 @@ else
     exit(1)
   end
 end
+
