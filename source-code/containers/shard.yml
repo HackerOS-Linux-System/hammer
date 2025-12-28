@@ -1,1 +1,15 @@
+name: hammer-container
+version: 0.9
+
+authors:
+  - Your Name <hackeros068@gmail.com>
+
+description: |
+  Hammer container management tool
+
+dependencies:
+
+crystal: 1.0.0
+
+license: MIT
 
