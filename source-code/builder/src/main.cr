@@ -33,7 +33,6 @@ def init_project(args : Array(String))
     p.on("--no-atomic", "Disable atomic features") { atomic = false }
   end
   parser.parse(args)
-
   # Map common names to codenames
   actual_suite = case suite
                  when "stable"
@@ -45,15 +44,12 @@ def init_project(args : Array(String))
                  else
                    suite
                  end
-
   puts "Initializing live-build project with suite: #{actual_suite}, edition: #{edition} (atomic: #{atomic})"
-
   # Check if config exists
   if Dir.exists?("config")
     puts "Project already initialized."
     exit(1)
   end
-
   # Run lb config with more options for installer
   cmd_args = [
     "config",
@@ -74,11 +70,9 @@ def init_project(args : Array(String))
     puts "Failed to initialize: #{status.exit_reason}"
     exit(1)
   end
-
   # Create package lists
   pkg_lists_dir = File.join("config", "package-lists")
   FileUtils.mkdir_p(pkg_lists_dir)
-
   # Base packages for atomic system
   atomic_pkgs = [
     "btrfs-progs",
@@ -101,7 +95,6 @@ def init_project(args : Array(String))
     "parted",
     # Add more as needed
   ]
-
   # DE packages based on edition
   de_pkgs = [] of String
   case edition
@@ -144,11 +137,9 @@ def init_project(args : Array(String))
     puts "Unknown edition: #{edition}"
     exit(1)
   end
-
   pkg_content = (atomic ? atomic_pkgs : [] of String).join("\n") + "\n" + de_pkgs.join("\n") + "\n"
   pkg_file = File.join(pkg_lists_dir, "base.list.chroot")
   File.write(pkg_file, pkg_content)
-
   # For hydra edition, download look-and-feel offline
   if edition == "hydra"
     hydra_dir = File.join("config", "includes.chroot/tmp/hydra-look-and-feel")
@@ -159,12 +150,10 @@ def init_project(args : Array(String))
       exit(1)
     end
   end
-
   # Create hooks dir if atomic
   if atomic
     hooks_dir = File.join("config", "includes.chroot_after_packages/lib/live/config")
     FileUtils.mkdir_p(hooks_dir)
-
     # Hook for BTRFS and atomic setup
     hook_file = File.join(hooks_dir, "9999-setup-atomic.hook.chroot")
     hook_content = <<-HOOK
@@ -259,7 +248,6 @@ EOF
 fi
 # Make sure /etc/fstab has correct subvol mounts
 HOOK
-
     # Add hydra specific setup if edition is hydra
     if edition == "hydra"
       hook_content += <<-HYDRA
@@ -269,31 +257,25 @@ cp -r /tmp/hydra-look-and-feel/files/* /
 rm -rf /tmp/hydra-look-and-feel
 HYDRA
     end
-
     hook_content += <<-HOOK
 # Create systemd service for hammer lock on boot
 cat << EOF > /etc/systemd/system/hammer-lock.service
 [Unit]
 Description=Hammer Lock Root on Boot
 After=multi-user.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/hammer lock
 RemainAfterExit=true
-
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl enable hammer-lock.service
-
 echo "Atomic setup completed."
 HOOK
-
     File.write(hook_file, hook_content)
     File.chmod(hook_file, 0o755)
   end
-
   # Add includes for hammer binaries
   hammer_dir = File.join("config", "includes.chroot/usr/bin")
   FileUtils.mkdir_p(hammer_dir)
@@ -308,7 +290,6 @@ HOOK
       puts "Warning: #{src} not found, skipping."
     end
   end
-
   # Add boot loader config if needed
   bootloader_dir = File.join("config", "includes.binary/boot/grub")
   FileUtils.mkdir_p(bootloader_dir)
@@ -321,7 +302,6 @@ search --no-floppy --fs-uuid --set=root $rootuuid
 configfile /@root/boot/grub/grub.cfg
 GRUB
   File.write(grub_cfg, grub_content)
-
   # Add grub.d script for dynamic entries
   grubd_dir = File.join("config", "includes.chroot/etc/grub.d")
   FileUtils.mkdir_p(grubd_dir)
@@ -334,7 +314,6 @@ exec tail -n +3 $0
 SCRIPT
   File.write(grub_script, grub_script_content)
   File.chmod(grub_script, 0o755)
-
   puts "Project initialized. Edit config/ as needed."
 end
 
@@ -343,13 +322,11 @@ def build_iso(args : Array(String))
     p.banner = "Usage: build [options]"
   end
   parser.parse(args)
-
   # Check if in project dir
   unless Dir.exists?("config")
     puts "Not in a live-build project directory. Run 'hammer-builder init' first."
     exit(1)
   end
-
   puts "Building ISO..."
   # Run lb clean first to ensure clean build
   puts "Cleaning with sudo lb clean --purge..."
@@ -358,7 +335,6 @@ def build_iso(args : Array(String))
     puts "Failed to clean: #{status.exit_reason}"
     # Continue or exit?
   end
-
   # Run lb build
   puts "Building with sudo lb build..."
   status = Process.run("sudo", ["lb", "build"], output: STDOUT, error: STDERR)
@@ -366,7 +342,6 @@ def build_iso(args : Array(String))
     puts "Failed to build: #{status.exit_reason}"
     exit(1)
   end
-
   puts "ISO built successfully. Find it as live-image-amd64.hybrid.iso or similar."
 end
 
@@ -375,7 +350,7 @@ def usage
   puts ""
   puts "Commands:"
   puts " init [--suite <suite>] [--edition <edition>] [--no-atomic] Initialize live-build project"
-  puts "   - Supports stable (trixie), testing (forky), unstable (sid)"
+  puts " - Supports stable (trixie), testing (forky), unstable (sid)"
   puts " build Build the atomic ISO"
 end
 
