@@ -3,65 +3,77 @@ require "file_utils"
 require "time"
 require "json"
 require "digest/sha256"
+
 if LibC.getuid != 0
   puts "This tool must be run as root."
   exit(1)
 end
-CONTAINER_TOOL = "podman"
-CONTAINER_NAME_PREFIX = "hammer-container-"
-CONTAINER_IMAGE = "debian:stable"
+
 BTRFS_TOP = "/btrfs-root"
 DEPLOYMENTS_DIR = "/btrfs-root/deployments"
 CURRENT_SYMLINK = "/btrfs-root/current"
 LOCK_FILE = "/run/hammer.lock"
 TRANSACTION_MARKER = "/btrfs-root/hammer-transaction"
-BINARY_MAP = {
-  "golang" => "go",
-}
+
+LOG_DIR = "/usr/lib/HackerOS/hammer/logs"
+LOG_FILE = "#{LOG_DIR}/hammer-core.log"
+
+def log(message : String)
+  Dir.mkdir_p(LOG_DIR)
+  File.open(LOG_FILE, "a") do |f|
+    f.puts "#{Time.local.to_s("%Y-%m-%d %H:%M:%S")} - #{message}"
+  end
+end
+
 def run_command(cmd : String, args : Array(String)) : {success: Bool, stdout: String, stderr: String}
   stdout = IO::Memory.new
   stderr = IO::Memory.new
   status = Process.run(cmd, args: args, output: stdout, error: stderr)
   {success: status.success?, stdout: stdout.to_s, stderr: stderr.to_s}
 end
-def run_as_user(user : String, cmd : String) : {success: Bool, stdout: String, stderr: String}
-  stdout = IO::Memory.new
-  stderr = IO::Memory.new
-  status = Process.run("su", args: ["-", user, "-c", cmd], output: stdout, error: stderr)
-  {success: status.success?, stdout: stdout.to_s, stderr: stderr.to_s}
-end
+
 def acquire_lock
   if File.exists?(LOCK_FILE)
+    log("Failed to acquire lock: operation in progress")
     raise "Hammer operation in progress (lock file exists)."
   end
   File.touch(LOCK_FILE)
+  log("Acquired lock")
 end
+
 def release_lock
   File.delete(LOCK_FILE) if File.exists?(LOCK_FILE)
+  log("Released lock")
 end
+
 def validate_system
   # Check if root is BTRFS
   output = run_command("btrfs", ["filesystem", "show", "/"])
-  raise "Root filesystem is not BTRFS." unless output[:success]
+  unless output[:success]
+    log("Root filesystem is not BTRFS")
+    raise "Root filesystem is not BTRFS."
+  end
   # Check current symlink exists
   unless File.symlink?(CURRENT_SYMLINK)
+    log("Current deployment symlink missing")
     raise "Current deployment symlink missing. System may not be initialized. Run 'sudo hammer-updater update' to initialize."
   end
   # Check current is read-only
   current = File.readlink(CURRENT_SYMLINK)
   prop_output = run_command("btrfs", ["property", "get", "-ts", current, "ro"])
   unless prop_output[:success] && prop_output[:stdout].strip == "ro=true"
+    log("Current deployment is not read-only")
     raise "Current deployment is not read-only."
   end
+  log("System validated")
 end
-def parse_install_remove(args : Array(String)) : {package: String, atomic: Bool, gui: Bool}
-  atomic = false
-  gui = false
+
+def parse_install_remove(args : Array(String)) : {package: String, container: Bool}
+  container = false
   package = ""
   parser = OptionParser.new do |p|
     p.banner = "Usage: [subcommand] [options] package"
-    p.on("--atomic", "Atomic operation") { atomic = true }
-    p.on("--gui", "Install as GUI application") { gui = true }
+    p.on("--container", "Install in container") { container = true }
     p.invalid_option do |flag|
       STDERR.puts "Invalid option: #{flag}."
       exit(1)
@@ -79,8 +91,9 @@ def parse_install_remove(args : Array(String)) : {package: String, atomic: Bool,
     STDERR.puts "Package name required."
     exit(1)
   end
-  {package: package, atomic: atomic, gui: gui}
+  {package: package, container: container}
 end
+
 def parse_switch(args : Array(String)) : String?
   deployment = nil
   parser = OptionParser.new do |p|
@@ -91,6 +104,7 @@ def parse_switch(args : Array(String)) : String?
   parser.parse(args)
   deployment
 end
+
 def parse_rollback(args : Array(String)) : Int32
   n = 1
   parser = OptionParser.new do |p|
@@ -101,175 +115,44 @@ def parse_rollback(args : Array(String)) : Int32
   parser.parse(args)
   n
 end
-def install_package(package : String, atomic : Bool, gui : Bool)
-  puts "Installing package: #{package} (atomic: #{atomic}, gui: #{gui})"
-  if atomic
-    atomic_install(package, gui)
-  else
-    container_install(package, gui)
-  end
-end
-def remove_package(package : String, atomic : Bool, gui : Bool)
-  puts "Removing package: #{package} (atomic: #{atomic}, gui: #{gui})"
-  if atomic
-    atomic_remove(package, gui)
-  else
-    container_remove(package, gui)
-  end
-end
-def container_install(package : String, gui : Bool)
-  if gui
-    user = ENV["SUDO_USER"]? || begin
-      puts "This command with --gui must be run using sudo by a non-root user."
-      exit(1)
-    end
-    container_name = "hammer-gui"
-    # Ensure distrobox exists
-    check_container = run_as_user(user, "distrobox list | grep -q '#{container_name}'")
-    if !check_container[:success]
-      create_output = run_as_user(user, "distrobox create --name #{container_name} --image #{CONTAINER_IMAGE} --yes")
-      raise "Failed to create distrobox container: #{create_output[:stderr]}" unless create_output[:success]
-      puts "Created distrobox container: #{container_name}"
-    end
-    # Check if already installed
-    check_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -s #{package}")
-    if check_output[:success]
-      puts "Package #{package} is already installed in the distrobox."
-      return
-    end
-    # Setup sources and architecture
-    sources_setup_cmd = "sudo bash -c 'if [ ! -f /etc/apt/sources.list ]; then echo \\\"deb http://deb.debian.org/debian stable main contrib non-free non-free-firmware\\\" > /etc/apt/sources.list; else sed -i \\\"s/main$/main contrib non-free non-free-firmware/g\\\" /etc/apt/sources.list; fi'"
-    sources_setup = run_as_user(user, "distrobox enter #{container_name} -- #{sources_setup_cmd}")
-    if !sources_setup[:success]
-      puts "Warning: Failed to setup sources: #{sources_setup[:stderr]}"
-    end
-    arch_setup = run_as_user(user, "distrobox enter #{container_name} -- sudo dpkg --add-architecture i386")
-    if !arch_setup[:success]
-      puts "Warning: Failed to add i386 architecture: #{arch_setup[:stderr]}"
-    end
-    # Update
-    update_output = run_as_user(user, "distrobox enter #{container_name} -- sudo apt update")
-    raise "Failed to update in distrobox: #{update_output[:stderr]}" unless update_output[:success]
-    # Install
-    install_output = run_as_user(user, "distrobox enter #{container_name} -- sudo apt install -y #{package}")
-    raise "Failed to install package in distrobox: #{install_output[:stderr]}" unless install_output[:success]
-    puts "Package #{package} installed in distrobox successfully."
-    # Find .desktop files and export
-    files_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -L #{package}")
-    if files_output[:success]
-      files = files_output[:stdout].lines.map(&.strip)
-      desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
-      app_names = desktop_files.map { |df| File.basename(df, ".desktop") }
-      app_names.each do |app|
-        export_output = run_as_user(user, "distrobox enter #{container_name} -- distrobox-export --app #{app}")
-        if export_output[:success]
-          puts "Exported app: #{app}"
-        else
-          puts "Warning: Failed to export app #{app}: #{export_output[:stderr]}"
-        end
-      end
-      if app_names.empty?
-        puts "No .desktop files found for export. If this is a GUI app, check the package."
-      end
-    else
-      puts "Warning: Failed to list package files for export: #{files_output[:stderr]}"
+
+def install_package(package : String, container : Bool)
+  log("Installing package: #{package} (container: #{container})")
+  puts "Installing package: #{package} (container: #{container})"
+  if container
+    containers_bin = "/usr/lib/HackerOS/hammer/bin/hammer-containers"
+    status = Process.run(containers_bin, ["install", package], output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
+    unless status.success?
+      log("Failed to install in container")
+      raise "Failed to install in container"
     end
   else
-    binary = BINARY_MAP[package]? || package
-    container_name = CONTAINER_NAME_PREFIX + "default"
-    ensure_container_exists(container_name)
-    # Check if already installed
-    check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
-    if check_output[:success]
-      puts "Package #{package} is already installed in the container."
-      return
-    end
-    update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
-    raise "Failed to update in container: #{update_output[:stderr]}" unless update_output[:success]
-    install_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "install", "-y", package])
-    raise "Failed to install package in container: #{install_output[:stderr]}" unless install_output[:success]
-    puts "Package #{package} installed in container successfully."
-    # Assume CLI, create wrapper in /usr/bin
-    wrapper_path = "/usr/bin/#{binary}"
-    wrapper_content = <<-WRAPPER
-#!/bin/sh
-sudo #{CONTAINER_TOOL} ps --filter name=^#{container_name}$ --filter status=running -q | grep -q . || sudo #{CONTAINER_TOOL} start #{container_name}
-sudo #{CONTAINER_TOOL} exec #{container_name} #{binary} "$@"
-WRAPPER
-    File.write(wrapper_path, wrapper_content)
-    File.chmod(wrapper_path, 0o755)
-    puts "Created CLI wrapper: #{wrapper_path}"
-    puts "To run manually: sudo #{CONTAINER_TOOL} exec -it #{container_name} #{binary}"
+    atomic_install(package)
   end
 end
-def container_remove(package : String, gui : Bool)
-  if gui
-    user = ENV["SUDO_USER"]? || begin
-      puts "This command with --gui must be run using sudo by a non-root user."
-      exit(1)
+
+def remove_package(package : String, container : Bool)
+  log("Removing package: #{package} (container: #{container})")
+  puts "Removing package: #{package} (container: #{container})"
+  if container
+    containers_bin = "/usr/lib/HackerOS/hammer/bin/hammer-containers"
+    status = Process.run(containers_bin, ["remove", package], output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
+    unless status.success?
+      log("Failed to remove from container")
+      raise "Failed to remove from container"
     end
-    container_name = "hammer-gui"
-    # Check if container exists
-    check_container = run_as_user(user, "distrobox list | grep -q '#{container_name}'")
-    if !check_container[:success]
-      puts "Package #{package} is not installed in the distrobox."
-      return
-    end
-    # Check if installed
-    check_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -s #{package}")
-    unless check_output[:success]
-      puts "Package #{package} is not installed in the distrobox."
-      return
-    end
-    # Get .desktop files before remove
-    files_output = run_as_user(user, "distrobox enter #{container_name} -- dpkg -L #{package}")
-    app_names = [] of String
-    if files_output[:success]
-      files = files_output[:stdout].lines.map(&.strip)
-      desktop_files = files.select { |f| f.ends_with?(".desktop") && f.starts_with?("/usr/share/applications/") }
-      app_names = desktop_files.map { |df| File.basename(df, ".desktop") }
-    else
-      puts "Warning: Failed to list package files for unexport: #{files_output[:stderr]}"
-    end
-    # Unexport apps
-    app_names.each do |app|
-      unexport_output = run_as_user(user, "distrobox enter #{container_name} -- distrobox-export --app #{app} --delete")
-      if unexport_output[:success]
-        puts "Unexported app: #{app}"
-      else
-        puts "Warning: Failed to unexport app #{app}: #{unexport_output[:stderr]}"
-      end
-    end
-    # Remove package
-    remove_output = run_as_user(user, "distrobox enter #{container_name} -- sudo apt remove -y #{package}")
-    raise "Failed to remove package from distrobox: #{remove_output[:stderr]}" unless remove_output[:success]
-    puts "Package #{package} removed from distrobox successfully."
   else
-    binary = BINARY_MAP[package]? || package
-    container_name = CONTAINER_NAME_PREFIX + "default"
-    ensure_container_exists(container_name)
-    # Check if installed
-    check_output = run_command(CONTAINER_TOOL, ["exec", container_name, "dpkg", "-s", package])
-    unless check_output[:success]
-      puts "Package #{package} is not installed in the container."
-      return
-    end
-    # Get files list before remove for GUI, but since not gui, skip
-    remove_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "remove", "-y", package])
-    raise "Failed to remove package from container: #{remove_output[:stderr]}" unless remove_output[:success]
-    puts "Package #{package} removed from container successfully."
-    # Remove CLI wrapper
-    wrapper_path = "/usr/bin/#{binary}"
-    File.delete(wrapper_path) if File.exists?(wrapper_path)
-    puts "Removed CLI wrapper: #{wrapper_path}"
+    atomic_remove(package)
   end
 end
-def atomic_install(package : String, gui : Bool)
+
+def atomic_install(package : String)
   new_deployment : String? = nil
   mounted = false
   begin
     acquire_lock
     validate_system
+    log("Performing atomic install of #{package}")
     puts "Performing atomic install of #{package}..."
     # Create new deployment
     new_deployment = create_deployment(true)
@@ -281,12 +164,14 @@ def atomic_install(package : String, gui : Bool)
     check_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -s #{package}'"
     check_output = run_command("/bin/sh", ["-c", check_cmd])
     if check_output[:success]
+      log("Package #{package} already installed in system")
       puts "Package #{package} is already installed in the system."
       raise "Already installed" # To trigger cleanup
     end
     chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt update && apt install -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
     output = run_command("/bin/sh", ["-c", chroot_cmd])
-    if !output[:success]
+    unless output[:success]
+      log("Failed to install in chroot: #{output[:stderr]}")
       raise "Failed to install in chroot: #{output[:stderr]}"
     end
     bind_mounts_for_chroot(new_deployment, false)
@@ -299,8 +184,10 @@ def atomic_install(package : String, gui : Bool)
     set_subvolume_readonly(new_deployment, true)
     switch_to_deployment(new_deployment)
     remove_transaction_marker
+    log("Atomic install of #{package} completed")
     puts "Atomic install completed. Reboot to apply."
   rescue ex : Exception
+    log("Error during atomic install: #{ex.message}")
     if new_deployment
       set_status_broken(new_deployment)
     end
@@ -312,12 +199,14 @@ def atomic_install(package : String, gui : Bool)
     release_lock
   end
 end
-def atomic_remove(package : String, gui : Bool)
+
+def atomic_remove(package : String)
   new_deployment : String? = nil
   mounted = false
   begin
     acquire_lock
     validate_system
+    log("Performing atomic remove of #{package}")
     puts "Performing atomic remove of #{package}..."
     # Create new deployment
     new_deployment = create_deployment(true)
@@ -329,12 +218,14 @@ def atomic_remove(package : String, gui : Bool)
     check_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -s #{package}'"
     check_output = run_command("/bin/sh", ["-c", check_cmd])
     unless check_output[:success]
+      log("Package #{package} not installed in system")
       puts "Package #{package} is not installed in the system."
       raise "Not installed" # To trigger cleanup
     end
     chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'apt remove -y #{package} && apt autoremove -y && dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
     output = run_command("/bin/sh", ["-c", chroot_cmd])
-    if !output[:success]
+    unless output[:success]
+      log("Failed to remove in chroot: #{output[:stderr]}")
       raise "Failed to remove in chroot: #{output[:stderr]}"
     end
     bind_mounts_for_chroot(new_deployment, false)
@@ -347,8 +238,10 @@ def atomic_remove(package : String, gui : Bool)
     set_subvolume_readonly(new_deployment, true)
     switch_to_deployment(new_deployment)
     remove_transaction_marker
+    log("Atomic remove of #{package} completed")
     puts "Atomic remove completed. Reboot to apply."
   rescue ex : Exception
+    log("Error during atomic remove: #{ex.message}")
     if new_deployment
       set_status_broken(new_deployment)
     end
@@ -360,7 +253,9 @@ def atomic_remove(package : String, gui : Bool)
     release_lock
   end
 end
+
 def create_deployment(writable : Bool) : String
+  log("Creating new deployment")
   puts "Creating new deployment..."
   Dir.mkdir_p(DEPLOYMENTS_DIR)
   current = File.readlink(CURRENT_SYMLINK)
@@ -371,126 +266,129 @@ def create_deployment(writable : Bool) : String
   args << current
   args << new_deployment
   output = run_command("btrfs", args)
-  raise "Failed to create deployment: #{output[:stderr]}" unless output[:success]
+  unless output[:success]
+    log("Failed to create deployment: #{output[:stderr]}")
+    raise "Failed to create deployment: #{output[:stderr]}"
+  end
   set_subvolume_readonly(new_deployment, false) if writable
+  log("Deployment created at: #{new_deployment}")
   puts "Deployment created at: #{new_deployment}"
   new_deployment
 end
+
 def switch_deployment(deployment : String?)
   begin
     acquire_lock
     validate_system
+    log("Switching deployment")
     puts "Switching deployment..."
     target = if deployment
       "#{DEPLOYMENTS_DIR}/#{deployment}"
     else
       deployments = get_deployments
-      raise "Not enough deployments for rollback." if deployments.size < 2
+      if deployments.size < 2
+        log("Not enough deployments for rollback")
+        raise "Not enough deployments for rollback."
+      end
       deployments.sort[deployments.size - 2]
     end
-    raise "Deployment #{target} does not exist." unless File.exists?(target)
+    unless File.exists?(target)
+      log("Deployment #{target} does not exist")
+      raise "Deployment #{target} does not exist."
+    end
     old_current = File.readlink(CURRENT_SYMLINK)
     switch_to_deployment(target)
     update_meta(old_current, status: "previous", rollback_reason: "manual")
+    log("Switched to deployment: #{target}")
     puts "Switched to deployment: #{target}. Reboot to apply."
   ensure
     release_lock
   end
 end
+
 def switch_to_deployment(deployment : String)
   id = get_subvol_id(deployment)
   output = run_command("btrfs", ["subvolume", "set-default", id, "/"])
-  raise "Failed to set default subvolume: #{output[:stderr]}" unless output[:success]
+  unless output[:success]
+    log("Failed to set default subvolume: #{output[:stderr]}")
+    raise "Failed to set default subvolume: #{output[:stderr]}"
+  end
   File.delete(CURRENT_SYMLINK) if File.exists?(CURRENT_SYMLINK)
   File.symlink(deployment, CURRENT_SYMLINK)
 end
+
 def clean_up
   begin
     acquire_lock
     validate_system
+    log("Cleaning up unused resources")
     puts "Cleaning up unused resources..."
-    run_command(CONTAINER_TOOL, ["system", "prune", "-f"])
+    # Clean containers
+    containers_bin = "/usr/lib/HackerOS/hammer/bin/hammer-containers"
+    Process.run(containers_bin, ["clean"], output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
     deployments = get_deployments.sort
     if deployments.size > 5
       deployments[0...(deployments.size - 5)].each do |dep|
         output = run_command("btrfs", ["subvolume", "delete", dep])
-        STDERR.puts "Failed to delete deployment #{dep}: #{output[:stderr]}" unless output[:success]
+        if output[:success]
+          log("Deleted deployment #{dep}")
+        else
+          log("Failed to delete deployment #{dep}: #{output[:stderr]}")
+          STDERR.puts "Failed to delete deployment #{dep}: #{output[:stderr]}"
+        end
       end
     end
+    log("Clean up completed")
     puts "Clean up completed."
   ensure
     release_lock
   end
 end
+
 def refresh
-  begin
-    acquire_lock
-    validate_system
-    puts "Refreshing container metadata..."
-    container_name = CONTAINER_NAME_PREFIX + "default"
-    ensure_container_exists(container_name)
-    output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
-    raise "Failed to refresh: #{output[:stderr]}" unless output[:success]
-    puts "Refresh completed."
-  ensure
-    release_lock
+  log("Refreshing repositories")
+  puts "Refreshing repositories..."
+  containers_bin = "/usr/lib/HackerOS/hammer/bin/hammer-containers"
+  status = Process.run(containers_bin, ["refresh"], output: Process::Redirect::Inherit, error: Process::Redirect::Inherit)
+  unless status.success?
+    log("Failed to refresh")
+    raise "Failed to refresh"
   end
+  log("Refresh completed")
 end
-def ensure_container_exists(container_name : String)
-  exists_output = run_command(CONTAINER_TOOL, ["container", "exists", container_name])
-  newly_created = false
-  if !exists_output[:success]
-    create_output = run_command(CONTAINER_TOOL, ["run", "-d", "--name", container_name, CONTAINER_IMAGE, "sleep", "infinity"])
-    raise "Failed to create container: #{create_output[:stderr]}" unless create_output[:success]
-    newly_created = true
-  end
-  # Setup apt sources if newly created
-  if newly_created
-    sed_args = ["exec", container_name, "sed", "-i", "s/main$/main contrib non-free non-free-firmware/g", "/etc/apt/sources.list"]
-    setup_output = run_command(CONTAINER_TOOL, sed_args)
-    unless setup_output[:success]
-      puts "Warning: Failed to setup apt sources: #{setup_output[:stderr]}"
-    end
-    update_output = run_command(CONTAINER_TOOL, ["exec", container_name, "apt", "update"])
-    unless update_output[:success]
-      raise "Failed to initial apt update in container: #{update_output[:stderr]}"
-    end
-    # Set up sudoers for podman commands
-    sudoers_path = "/etc/sudoers.d/hammer-podman"
-    sudoers_content = <<-SUDOERS
-%sudo ALL=(ALL) NOPASSWD: /usr/bin/podman start #{container_name}, /usr/bin/podman exec #{container_name} *, /usr/bin/podman ps --filter name=^#{container_name}$ --filter status=running -q
-SUDOERS
-    File.write(sudoers_path, sudoers_content)
-    File.chmod(sudoers_path, 0o440)
-  end
-  # Check if running
-  running_output = run_command(CONTAINER_TOOL, ["ps", "-q", "-f", "name=^#{container_name}$"])
-  if running_output[:stdout].strip.empty?
-    start_output = run_command(CONTAINER_TOOL, ["start", container_name])
-    raise "Failed to start container: #{start_output[:stderr]}" unless start_output[:success]
-  end
-end
+
 def get_deployments : Array(String)
   Dir.entries(DEPLOYMENTS_DIR).select(&.starts_with?("hammer-")).map { |f| File.join(DEPLOYMENTS_DIR, f) }
 rescue ex : Exception
+  log("Failed to list deployments: #{ex.message}")
   raise "Failed to list deployments: #{ex.message}"
 end
+
 def get_subvol_id(path : String) : String
   output = run_command("btrfs", ["subvolume", "show", path])
-  raise "Failed to get subvolume ID." unless output[:success]
+  unless output[:success]
+    log("Failed to get subvolume ID: #{output[:stderr]}")
+    raise "Failed to get subvolume ID."
+  end
   output[:stdout].lines.each do |line|
     if line.includes?("Subvolume ID:")
       parts = line.split(":")
       return parts[1].strip if parts.size > 1
     end
   end
+  log("Subvolume ID not found")
   raise "Subvolume ID not found."
 end
+
 def set_subvolume_readonly(path : String, readonly : Bool)
   value = readonly ? "true" : "false"
   output = run_command("btrfs", ["property", "set", "-ts", path, "ro", value])
-  raise "Failed to set readonly #{value}: #{output[:stderr]}" unless output[:success]
+  unless output[:success]
+    log("Failed to set readonly #{value}: #{output[:stderr]}")
+    raise "Failed to set readonly #{value}: #{output[:stderr]}"
+  end
 end
+
 def bind_mounts_for_chroot(chroot_path : String, mount : Bool)
   dirs = ["proc", "sys", "dev"]
   dirs.each do |dir|
@@ -501,15 +399,23 @@ def bind_mounts_for_chroot(chroot_path : String, mount : Bool)
     else
       output = run_command("umount", [target])
     end
-    raise "Failed to #{mount ? "mount" : "umount"} #{dir}: #{output[:stderr]}" unless output[:success]
+    unless output[:success]
+      log("Failed to #{mount ? "mount" : "umount"} #{dir}: #{output[:stderr]}")
+      raise "Failed to #{mount ? "mount" : "umount"} #{dir}: #{output[:stderr]}"
+    end
   end
 end
+
 def get_kernel_version(chroot_path : String) : String
   cmd = "chroot #{chroot_path} /bin/sh -c \"dpkg -l | grep ^ii | grep linux-image | awk '{print \\$3}' | sort -V | tail -1\""
   output = run_command("/bin/sh", ["-c", cmd])
-  raise "Failed to get kernel version: #{output[:stderr]}" unless output[:success]
+  unless output[:success]
+    log("Failed to get kernel version: #{output[:stderr]}")
+    raise "Failed to get kernel version: #{output[:stderr]}"
+  end
   output[:stdout].strip
 end
+
 def write_meta(deployment : String, action : String, parent : String, kernel : String, system_version : String, status : String = "ready", rollback_reason : String? = nil)
   meta = {
     "created" => Time.utc.to_rfc3339,
@@ -522,6 +428,7 @@ def write_meta(deployment : String, action : String, parent : String, kernel : S
   }.reject { |k, v| v.nil? }
   File.write("#{deployment}/meta.json", meta.to_json)
 end
+
 def read_meta(deployment : String) : Hash(String, String)
   meta_path = "#{deployment}/meta.json"
   if File.exists?(meta_path)
@@ -530,17 +437,22 @@ def read_meta(deployment : String) : Hash(String, String)
     {} of String => String
   end
 end
+
 def update_meta(deployment : String, **updates)
   meta = read_meta(deployment)
   updates.each { |k, v| meta[k.to_s] = v.to_s if v }
   File.write("#{deployment}/meta.json", meta.to_json)
 end
+
 def set_status_broken(deployment : String)
   update_meta(deployment, status: "broken")
+  log("Set deployment #{deployment} to broken")
 end
+
 def set_status_booted(deployment : String)
   update_meta(deployment, status: "booted")
 end
+
 def hammer_status
   validate_system
   current = File.readlink(CURRENT_SYMLINK)
@@ -554,6 +466,7 @@ def hammer_status
   puts "Status: #{meta["status"]? || "N/A"}"
   puts "Rollback Reason: #{meta["rollback_reason"]? || "N/A"}"
 end
+
 def hammer_history
   validate_system
   deployments = get_deployments
@@ -569,6 +482,7 @@ def hammer_history
     puts "#{index}: #{item[:name]}#{mark} | Created: #{item[:meta]["created"]?} | Action: #{item[:meta]["action"]?} | Parent: #{item[:meta]["parent"]?} | Kernel: #{item[:meta]["kernel"]?} | Version: #{item[:meta]["system_version"]?} | Status: #{item[:meta]["status"]?} | Rollback: #{item[:meta]["rollback_reason"]?}"
   end
 end
+
 def hammer_rollback(n : Int32)
   begin
     acquire_lock
@@ -580,23 +494,30 @@ def hammer_rollback(n : Int32)
       {name: dep, created: Time.parse_rfc3339(meta["created"]? || Time.utc.to_rfc3339)}
     end
     history.sort_by!(&.[:created]).reverse!
-    raise "Not enough deployments for rollback #{n}." if history.size <= n
+    if history.size <= n
+      log("Not enough deployments for rollback #{n}")
+      raise "Not enough deployments for rollback #{n}."
+    end
     target = history[n][:name]
     old_current = current
     switch_to_deployment(target)
     update_meta(old_current, status: "previous", rollback_reason: "manual")
+    log("Rolled back #{n} steps to #{File.basename(target)}")
     puts "Rolled back #{n} steps to #{File.basename(target)}. Reboot to apply."
   ensure
     release_lock
   end
 end
+
 def create_transaction_marker(deployment : String)
   data = {"deployment" => File.basename(deployment)}
   File.write(TRANSACTION_MARKER, data.to_json)
 end
+
 def remove_transaction_marker
   File.delete(TRANSACTION_MARKER) if File.exists?(TRANSACTION_MARKER)
 end
+
 def hammer_check_transaction
   if File.exists?(TRANSACTION_MARKER)
     data = JSON.parse(File.read(TRANSACTION_MARKER))
@@ -611,18 +532,25 @@ def hammer_check_transaction
     end
   end
 end
+
 def sanity_check(deployment : String, kernel : String)
   unless File.exists?("#{deployment}/boot/vmlinuz-#{kernel}")
+    log("Kernel file missing: /boot/vmlinuz-#{kernel}")
     raise "Kernel file missing: /boot/vmlinuz-#{kernel}"
   end
   unless File.exists?("#{deployment}/boot/initrd.img-#{kernel}")
+    log("Initramfs file missing: /boot/initrd.img-#{kernel}")
     raise "Initramfs file missing: /boot/initrd.img-#{kernel}"
   end
   # Check fstab
   cmd = "chroot #{deployment} /bin/mount -f -a"
   output = run_command("/bin/sh", ["-c", cmd])
-  raise "Fstab sanity check failed: #{output[:stderr]}" unless output[:success]
+  unless output[:success]
+    log("Fstab sanity check failed: #{output[:stderr]}")
+    raise "Fstab sanity check failed: #{output[:stderr]}"
+  end
 end
+
 def compute_system_version(deployment : String) : String
   packages_file = "#{deployment}/tmp/packages.list"
   if File.exists?(packages_file)
@@ -631,19 +559,26 @@ def compute_system_version(deployment : String) : String
     File.delete(packages_file)
     hash
   else
+    log("Packages list not found for version computation")
     raise "Packages list not found for version computation"
   end
 end
+
 def get_fs_uuid : String
   output = run_command("btrfs", ["filesystem", "show", "/"])
-  raise "Failed to get BTRFS UUID: #{output[:stderr]}" unless output[:success]
+  unless output[:success]
+    log("Failed to get BTRFS UUID: #{output[:stderr]}")
+    raise "Failed to get BTRFS UUID: #{output[:stderr]}"
+  end
   output[:stdout].lines.each do |line|
     if line.includes?("uuid:")
       return line.split("uuid:")[1].strip
     end
   end
+  log("BTRFS UUID not found")
   raise "BTRFS UUID not found"
 end
+
 def update_bootloader_entries(deployment : String)
   good_deployments = get_deployments.select do |dep|
     meta = read_meta(dep)
@@ -681,33 +616,43 @@ SCRIPT
   File.write(grub_file, script_content)
   File.chmod(grub_file, 0o755)
 end
+
 def lock_system
   begin
     acquire_lock
+    log("Locking system")
     puts "Locking system (setting readonly)..."
     current = File.readlink(CURRENT_SYMLINK)
     set_readonly_recursive(current, true)
+    log("System locked")
     puts "System locked."
   ensure
     release_lock
   end
 end
+
 def unlock_system
   begin
     acquire_lock
+    log("Unlocking system")
     puts "Unlocking system (setting writable)..."
     current = File.readlink(CURRENT_SYMLINK)
     set_readonly_recursive(current, false)
+    log("System unlocked")
     puts "System unlocked."
   ensure
     release_lock
   end
 end
+
 def set_readonly_recursive(path : String, readonly : Bool)
   set_subvolume_readonly(path, readonly)
   # List subvolumes under path
   list_output = run_command("btrfs", ["subvolume", "list", "-a", "--sort=path", path])
-  raise "Failed to list subvolumes: #{list_output[:stderr]}" unless list_output[:success]
+  unless list_output[:success]
+    log("Failed to list subvolumes: #{list_output[:stderr]}")
+    raise "Failed to list subvolumes: #{list_output[:stderr]}"
+  end
   lines = list_output[:stdout].lines
   path_subvol = get_subvol_name(path)
   prefix = if path_subvol.empty?
@@ -728,9 +673,13 @@ def set_readonly_recursive(path : String, readonly : Bool)
     end
   end
 end
+
 def get_subvol_name(path : String) : String
   show_output = run_command("btrfs", ["subvolume", "show", path])
-  raise "Failed to get subvolume for #{path}: #{show_output[:stderr]}" unless show_output[:success]
+  unless show_output[:success]
+    log("Failed to get subvolume for #{path}: #{show_output[:stderr]}")
+    raise "Failed to get subvolume for #{path}: #{show_output[:stderr]}"
+  end
   output_str = show_output[:stdout].lines.first?.try(&.strip) || ""
   if output_str == "<FS_TREE>" || output_str == "/"
     ""
@@ -738,6 +687,7 @@ def get_subvol_name(path : String) : String
     output_str
   end
 end
+
 if ARGV.empty?
   puts "No subcommand was used"
 else
@@ -746,21 +696,26 @@ else
     case subcommand
     when "install"
       matches = parse_install_remove(ARGV)
-      install_package(matches[:package], matches[:atomic], matches[:gui])
+      install_package(matches[:package], matches[:container])
     when "remove"
       matches = parse_install_remove(ARGV)
-      remove_package(matches[:package], matches[:atomic], matches[:gui])
+      remove_package(matches[:package], matches[:container])
     when "deploy"
+      new_deployment : String? = nil
       begin
         acquire_lock
         validate_system
+        log("Performing deploy")
         new_deployment = create_deployment(true)
         create_transaction_marker(new_deployment)
         parent = File.basename(File.readlink(CURRENT_SYMLINK))
         bind_mounts_for_chroot(new_deployment, true)
         chroot_cmd = "chroot #{new_deployment} /bin/sh -c 'dpkg -l > /tmp/packages.list && update-initramfs -u -k all && update-grub'"
         output = run_command("/bin/sh", ["-c", chroot_cmd])
-        raise "Failed in chroot: #{output[:stderr]}" unless output[:success]
+        unless output[:success]
+          log("Failed in chroot: #{output[:stderr]}")
+          raise "Failed in chroot: #{output[:stderr]}"
+        end
         bind_mounts_for_chroot(new_deployment, false)
         kernel = get_kernel_version(new_deployment)
         sanity_check(new_deployment, kernel)
@@ -770,7 +725,9 @@ else
         set_subvolume_readonly(new_deployment, true)
         switch_to_deployment(new_deployment)
         remove_transaction_marker
+        log("Deploy completed")
       rescue ex : Exception
+        log("Error during deploy: #{ex.message}")
         if new_deployment
           set_status_broken(new_deployment)
         end
@@ -802,8 +759,8 @@ else
       puts "Unknown subcommand: #{subcommand}"
     end
   rescue ex : Exception
+    log("Error in subcommand #{subcommand}: #{ex.message}")
     STDERR.puts "Error: #{ex.message}"
     exit(1)
   end
 end
-
