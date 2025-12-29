@@ -1,15 +1,16 @@
-name: hammer-container
-version: 0.9
+name: hammer-containers
+version: 0.8
 
 authors:
-  - HackerOS Team <hackeros068@gmail.com>
+  - HackerOS Team
 
 description: |
-  Hammer container management tool
+  Container management component for Hammer tool in HackerOS.
 
-dependencies:
+crystal: ">= 1.0.0"
 
-crystal: 1.0.0
+license: Apache-2.0
 
-license: MIT
-
+targets:
+  hammer-containers:
+    main: src/main.cr
