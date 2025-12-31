@@ -3,12 +3,10 @@ require "file_utils"
 require "time"
 require "json"
 require "digest/sha256"
-
 if LibC.getuid != 0
   puts "This tool must be run as root."
   exit(1)
 end
-
 CONTAINER_TOOL = "podman"
 CONTAINER_NAME_PREFIX = "hammer-container-"
 CONTAINER_IMAGE = "debian:stable"
@@ -21,39 +19,33 @@ BINARY_MAP = {
   "golang" => "go",
 }
 LOG_DIR = "/usr/lib/HackerOS/hammer/logs/"
-
 def log(message : String)
   Dir.mkdir_p(LOG_DIR) unless Dir.exists?(LOG_DIR)
   File.open("#{LOG_DIR}/hammer-core.log", "a") do |f|
     f.puts "#{Time.local}: #{message}"
   end
 end
-
 def run_command(cmd : String, args : Array(String)) : {success: Bool, stdout: String, stderr: String}
   stdout = IO::Memory.new
   stderr = IO::Memory.new
   status = Process.run(cmd, args: args, output: stdout, error: stderr)
   {success: status.success?, stdout: stdout.to_s, stderr: stderr.to_s}
 end
-
 def run_as_user(user : String, cmd : String) : {success: Bool, stdout: String, stderr: String}
   stdout = IO::Memory.new
   stderr = IO::Memory.new
   status = Process.run("su", args: ["-", user, "-c", cmd], output: stdout, error: stderr)
   {success: status.success?, stdout: stdout.to_s, stderr: stderr.to_s}
 end
-
 def acquire_lock
   if File.exists?(LOCK_FILE)
     raise "Hammer operation in progress (lock file exists)."
   end
   File.touch(LOCK_FILE)
 end
-
 def release_lock
   File.delete(LOCK_FILE) if File.exists?(LOCK_FILE)
 end
-
 def validate_system
   # Check if root is BTRFS
   output = run_command("btrfs", ["filesystem", "show", "/"])
@@ -69,7 +61,6 @@ def validate_system
     raise "Current deployment is not read-only."
   end
 end
-
 def parse_install_remove(args : Array(String)) : {package: String}
   package = ""
   parser = OptionParser.new do |p|
@@ -93,7 +84,6 @@ def parse_install_remove(args : Array(String)) : {package: String}
   end
   {package: package}
 end
-
 def parse_switch(args : Array(String)) : String?
   deployment = nil
   parser = OptionParser.new do |p|
@@ -104,7 +94,6 @@ def parse_switch(args : Array(String)) : String?
   parser.parse(args)
   deployment
 end
-
 def parse_rollback(args : Array(String)) : Int32
   n = 1
   parser = OptionParser.new do |p|
@@ -115,7 +104,6 @@ def parse_rollback(args : Array(String)) : Int32
   parser.parse(args)
   n
 end
-
 def install_package(package : String)
   new_deployment : String? = nil
   mounted = false
@@ -166,7 +154,6 @@ def install_package(package : String)
     release_lock
   end
 end
-
 def remove_package(package : String)
   new_deployment : String? = nil
   mounted = false
@@ -217,7 +204,6 @@ def remove_package(package : String)
     release_lock
   end
 end
-
 def create_deployment(writable : Bool) : String
   puts "Creating new deployment..."
   Dir.mkdir_p(DEPLOYMENTS_DIR)
@@ -234,7 +220,6 @@ def create_deployment(writable : Bool) : String
   puts "Deployment created at: #{new_deployment}"
   new_deployment
 end
-
 def switch_deployment(deployment : String?)
   begin
     acquire_lock
@@ -257,7 +242,6 @@ def switch_deployment(deployment : String?)
     release_lock
   end
 end
-
 def switch_to_deployment(deployment : String)
   id = get_subvol_id(deployment)
   output = run_command("btrfs", ["subvolume", "set-default", id, "/"])
@@ -265,7 +249,6 @@ def switch_to_deployment(deployment : String)
   File.delete(CURRENT_SYMLINK) if File.exists?(CURRENT_SYMLINK)
   File.symlink(deployment, CURRENT_SYMLINK)
 end
-
 def clean_up
   begin
     acquire_lock
@@ -285,7 +268,26 @@ def clean_up
     release_lock
   end
 end
-
+def ensure_container_exists(container_name : String)
+  # Pull image if not exists
+  image_check = run_command("#{CONTAINER_TOOL}", ["image", "exists", CONTAINER_IMAGE])
+  unless image_check[:success]
+    pull_output = run_command("#{CONTAINER_TOOL}", ["pull", CONTAINER_IMAGE])
+    raise "Failed to pull image: #{pull_output[:stderr]}" unless pull_output[:success]
+  end
+  # Check if container exists
+  container_check = run_command("#{CONTAINER_TOOL}", ["ps", "-a", "-q", "--filter", "name=^#{container_name}$"])
+  if container_check[:stdout].strip.empty?
+    create_output = run_command("#{CONTAINER_TOOL}", ["create", "--name", container_name, CONTAINER_IMAGE])
+    raise "Failed to create container: #{create_output[:stderr]}" unless create_output[:success]
+  end
+  # Check if running
+  running_check = run_command("#{CONTAINER_TOOL}", ["ps", "-q", "--filter", "name=^#{container_name}$", "--filter", "status=running"])
+  if running_check[:stdout].strip.empty?
+    start_output = run_command("#{CONTAINER_TOOL}", ["start", container_name])
+    raise "Failed to start container: #{start_output[:stderr]}" unless start_output[:success]
+  end
+end
 def refresh
   begin
     acquire_lock
@@ -301,13 +303,11 @@ def refresh
     release_lock
   end
 end
-
 def get_deployments : Array(String)
   Dir.entries(DEPLOYMENTS_DIR).select(&.starts_with?("hammer-")).map { |f| File.join(DEPLOYMENTS_DIR, f) }
 rescue ex : Exception
   raise "Failed to list deployments: #{ex.message}"
 end
-
 def get_subvol_id(path : String) : String
   output = run_command("btrfs", ["subvolume", "show", path])
   raise "Failed to get subvolume ID." unless output[:success]
@@ -319,13 +319,11 @@ def get_subvol_id(path : String) : String
   end
   raise "Subvolume ID not found."
 end
-
 def set_subvolume_readonly(path : String, readonly : Bool)
   value = readonly ? "true" : "false"
   output = run_command("btrfs", ["property", "set", "-ts", path, "ro", value])
   raise "Failed to set readonly #{value}: #{output[:stderr]}" unless output[:success]
 end
-
 def bind_mounts_for_chroot(chroot_path : String, mount : Bool)
   dirs = ["proc", "sys", "dev"]
   dirs.each do |dir|
@@ -339,14 +337,12 @@ def bind_mounts_for_chroot(chroot_path : String, mount : Bool)
     raise "Failed to #{mount ? "mount" : "umount"} #{dir}: #{output[:stderr]}" unless output[:success]
   end
 end
-
 def get_kernel_version(chroot_path : String) : String
   cmd = "chroot #{chroot_path} /bin/sh -c \"dpkg -l | grep ^ii | grep linux-image | awk '{print \\$3}' | sort -V | tail -1\""
   output = run_command("/bin/sh", ["-c", cmd])
   raise "Failed to get kernel version: #{output[:stderr]}" unless output[:success]
   output[:stdout].strip
 end
-
 def write_meta(deployment : String, action : String, parent : String, kernel : String, system_version : String, status : String = "ready", rollback_reason : String? = nil)
   meta = {
     "created" => Time.utc.to_rfc3339,
@@ -359,7 +355,6 @@ def write_meta(deployment : String, action : String, parent : String, kernel : S
   }.reject { |k, v| v.nil? }
   File.write("#{deployment}/meta.json", meta.to_json)
 end
-
 def read_meta(deployment : String) : Hash(String, String)
   meta_path = "#{deployment}/meta.json"
   if File.exists?(meta_path)
@@ -368,21 +363,17 @@ def read_meta(deployment : String) : Hash(String, String)
     {} of String => String
   end
 end
-
 def update_meta(deployment : String, **updates)
   meta = read_meta(deployment)
   updates.each { |k, v| meta[k.to_s] = v.to_s if v }
   File.write("#{deployment}/meta.json", meta.to_json)
 end
-
 def set_status_broken(deployment : String)
   update_meta(deployment, status: "broken")
 end
-
 def set_status_booted(deployment : String)
   update_meta(deployment, status: "booted")
 end
-
 def hammer_status
   validate_system
   current = File.readlink(CURRENT_SYMLINK)
@@ -397,7 +388,6 @@ def hammer_status
   puts "Rollback Reason: #{meta["rollback_reason"]? || "N/A"}"
   log("Displayed status")
 end
-
 def hammer_history
   validate_system
   deployments = get_deployments
@@ -414,7 +404,6 @@ def hammer_history
   end
   log("Displayed history")
 end
-
 def hammer_rollback(n : Int32)
   begin
     acquire_lock
@@ -437,16 +426,13 @@ def hammer_rollback(n : Int32)
     release_lock
   end
 end
-
 def create_transaction_marker(deployment : String)
   data = {"deployment" => File.basename(deployment)}
   File.write(TRANSACTION_MARKER, data.to_json)
 end
-
 def remove_transaction_marker
   File.delete(TRANSACTION_MARKER) if File.exists?(TRANSACTION_MARKER)
 end
-
 def hammer_check_transaction
   if File.exists?(TRANSACTION_MARKER)
     data = JSON.parse(File.read(TRANSACTION_MARKER))
@@ -461,7 +447,6 @@ def hammer_check_transaction
     end
   end
 end
-
 def sanity_check(deployment : String, kernel : String)
   unless File.exists?("#{deployment}/boot/vmlinuz-#{kernel}")
     raise "Kernel file missing: /boot/vmlinuz-#{kernel}"
@@ -474,7 +459,6 @@ def sanity_check(deployment : String, kernel : String)
   output = run_command("/bin/sh", ["-c", cmd])
   raise "Fstab sanity check failed: #{output[:stderr]}" unless output[:success]
 end
-
 def compute_system_version(deployment : String) : String
   packages_file = "#{deployment}/tmp/packages.list"
   if File.exists?(packages_file)
@@ -486,7 +470,6 @@ def compute_system_version(deployment : String) : String
     raise "Packages list not found for version computation"
   end
 end
-
 def get_fs_uuid : String
   output = run_command("btrfs", ["filesystem", "show", "/"])
   raise "Failed to get BTRFS UUID: #{output[:stderr]}" unless output[:success]
@@ -497,7 +480,6 @@ def get_fs_uuid : String
   end
   raise "BTRFS UUID not found"
 end
-
 def update_bootloader_entries(deployment : String)
   good_deployments = get_deployments.select do |dep|
     meta = read_meta(dep)
@@ -535,7 +517,6 @@ SCRIPT
   File.write(grub_file, script_content)
   File.chmod(grub_file, 0o755)
 end
-
 def lock_system
   begin
     acquire_lock
@@ -548,7 +529,6 @@ def lock_system
     release_lock
   end
 end
-
 def unlock_system
   begin
     acquire_lock
@@ -561,7 +541,6 @@ def unlock_system
     release_lock
   end
 end
-
 def set_readonly_recursive(path : String, readonly : Bool)
   set_subvolume_readonly(path, readonly)
   # List subvolumes under path
@@ -587,7 +566,6 @@ def set_readonly_recursive(path : String, readonly : Bool)
     end
   end
 end
-
 def get_subvol_name(path : String) : String
   show_output = run_command("btrfs", ["subvolume", "show", path])
   raise "Failed to get subvolume for #{path}: #{show_output[:stderr]}" unless show_output[:success]
@@ -598,7 +576,6 @@ def get_subvol_name(path : String) : String
     output_str
   end
 end
-
 if ARGV.empty?
   puts "No subcommand was used"
 else
