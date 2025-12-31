@@ -3,7 +3,7 @@ require "http/client"
 require "file_utils"
 
 module Hammer
-  VERSION = "0.9" # Updated version
+  VERSION = "0.8" # Updated version
   HAMMER_PATH = "/usr/lib/HackerOS/hammer/bin"
   VERSION_FILE = "/usr/lib/hammer/version.hacker"
   REMOTE_VERSION_URL = "https://raw.githubusercontent.com/HackerOS-Linux-System/hammer/main/config/version.hacker"
