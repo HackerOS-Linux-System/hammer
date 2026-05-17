@@ -1,4 +1,9 @@
 // cargo
+// valac
+// meson
+// ninja
 
-> cd source-code
 > cargo build --release
+> cd store
+> meson setup build
+> ninja -C build
