@@ -1,7 +1,15 @@
 [package]
-name    = "hammer"
-version = "0.1.0"
-edition = "2021"
+name        = "hammer"
+version     = "0.0.1"
+edition     = "2021"
+authors     = ["HackerOS Team <hackeros068@gmail.com>"]
+description = "Atomic Debian package manager — rpm-ostree model, changes after reboot"
+license     = "Apache-2.0"
+repository  = "https://github.com/HackerOS-Linux-System/hammer/"
+
+[[bin]]
+name = "hammer"
+path = "source-code/main.rs"
 
 [dependencies]
 anyhow          = "1"
@@ -31,3 +39,4 @@ nix             = { version = "0.27", features = ["user"] }
 axum            = "0.7"
 tower           = "0.4"
 tower-http      = { version = "0.5", features = ["cors"] }
+hk-parser       = "0.3.0"
