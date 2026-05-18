@@ -1,1 +1,45 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! Dokumentacja formatu: https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hk.html
+! Składnia:
+!   [section-name]          — jedna sekcja = jedno repozytorium
+!   -> klucz => wartość     — para klucz/wartość
+!   ! komentarz             — linie zaczynające się od ! są ignorowane
+!
+! Dostępne klucze:
+!   name       — nazwa wyświetlana (opcjonalna)
+!   baseurl    — bazowy URL repozytorium (wymagany)
+!   suite      — nazwa dystrybucji, np. forky (wymagany)
+!   components — lista składowych, np. ["main", "contrib"] (wymagany)
+!   arch       — lista architektur, np. ["amd64"] (opcjonalny — domyślnie arch hosta)
+!   enabled    — true/false (opcjonalny — domyślnie true)
+!   gpgkey     — URL lub ścieżka do klucza GPG (opcjonalny)
+!   type       — "deb" lub "deb-src" (opcjonalny — domyślnie deb)
+!
+! Po edycji uruchom:  hammer sync
 
+[debian-forky]
+-> name       => debian-forky
+-> baseurl    => http://deb.debian.org/debian
+-> suite      => forky
+-> components => ["main", "contrib", "non-free", "non-free-firmware"]
+-> arch       => ["amd64"]
+-> enabled    => true
+
+[debian-forky-security]
+-> name       => debian-forky-security
+-> baseurl    => http://security.debian.org/debian-security
+-> suite      => forky-security
+-> components => ["main", "contrib", "non-free", "non-free-firmware"]
+-> arch       => ["amd64"]
+-> enabled    => true
+
+! Backports — domyślnie wyłączone
+! Odkomentuj enabled => true aby włączyć
+[debian-forky-backports]
+-> name       => debian-forky-backports
+-> baseurl    => http://deb.debian.org/debian
+-> suite      => forky-backports
+-> components => ["main", "contrib", "non-free", "non-free-firmware"]
+-> arch       => ["amd64"]
+-> enabled    => false
