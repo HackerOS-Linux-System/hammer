@@ -9,14 +9,29 @@ set(CMAKE_CXX_STANDARD          20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS        OFF)
 
-# Release by default
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Hardening flags
+# ─────────────────────────────────────────────────────────────
+#  Compiler flags
+#
+#  Notes:
+#   • -Wpedantic removed — it triggers false positives for
+#     UTF-8 multi-byte character constants used in rule().
+#     We now use raw UTF-8 byte sequences (\xNN) instead, so
+#     -Wpedantic would be safe again, but we keep it out to
+#     avoid noise from system headers on some distros.
+#   • -finput-charset=UTF-8 — tell GCC our source is UTF-8.
+#   • -fexec-charset=UTF-8  — output strings are also UTF-8.
+#   • -fstack-protector-strong + _FORTIFY_SOURCE — hardening.
+# ─────────────────────────────────────────────────────────────
+
 add_compile_options(
-    -Wall -Wextra -Wpedantic
+    -Wall
+    -Wextra
+    -finput-charset=UTF-8
+    -fexec-charset=UTF-8
     -fstack-protector-strong
     -D_FORTIFY_SOURCE=2
     -fPIC
@@ -24,10 +39,12 @@ add_compile_options(
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     add_compile_options(-O2)
+elseif(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    add_compile_options(-g -O0 -DDEBUG)
 endif()
 
 # ─────────────────────────────────────────────────────────────
-#  libanvil — static library (linked into hammer)
+#  libanvil — static library (linked into hammer via FFI)
 # ─────────────────────────────────────────────────────────────
 
 add_library(anvil_static STATIC
@@ -41,7 +58,7 @@ target_include_directories(anvil_static
 )
 
 set_target_properties(anvil_static PROPERTIES
-    OUTPUT_NAME anvil
+    OUTPUT_NAME              anvil
     ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib
 )
 
@@ -57,11 +74,16 @@ add_executable(anvil_bin
 target_include_directories(anvil_bin PRIVATE include)
 
 set_target_properties(anvil_bin PROPERTIES
-    OUTPUT_NAME anvil
+    OUTPUT_NAME              anvil
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin
 )
 
-target_compile_options(anvil_bin PRIVATE -DANVIL_STANDALONE)
+target_compile_definitions(anvil_bin PRIVATE ANVIL_STANDALONE)
+
+# Threads (needed for std::thread in inotify watch + cmd_watch)
+find_package(Threads REQUIRED)
+target_link_libraries(anvil_bin PRIVATE Threads::Threads)
+target_link_libraries(anvil_static PRIVATE Threads::Threads)
 
 # ─────────────────────────────────────────────────────────────
 #  Install
@@ -82,9 +104,14 @@ install(FILES include/anvil.h
 )
 
 # ─────────────────────────────────────────────────────────────
-#  Build instructions (comment)
+#  Build & install instructions
+#
+#   cmake -B build -DCMAKE_BUILD_TYPE=Release
+#   cmake --build build -j$(nproc)
+#   sudo cmake --install build --prefix /usr
+#
+#  After install:
+#   /usr/bin/anvil          ← standalone CLI
+#   /usr/lib/libanvil.a     ← static lib for hammer FFI
+#   /usr/include/anvil/anvil.h
 # ─────────────────────────────────────────────────────────────
-
-# cmake -B build -DCMAKE_BUILD_TYPE=Release
-# cmake --build build -j$(nproc)
-# sudo cmake --install build --prefix /usr
