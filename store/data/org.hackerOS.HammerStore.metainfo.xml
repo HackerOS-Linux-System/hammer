@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.hackerOS.HammerStore</id>
+  <metadata_license>FSFAP</metadata_license>
+  <project_license>Apache-2.0</project_license>
+
+  <name>Hammer Store</name>
+  <summary>Browse and install packages with hammer</summary>
+
+  <description>
+    <p>
+      Hammer Store is a graphical frontend for the hammer atomic package
+      manager. Browse, search, install and remove Debian packages with a
+      clean GTK4 interface. All operations run hammer under the hood.
+    </p>
+  </description>
+
+  <url type="homepage">https://github.com/hammer-pkg/hammer</url>
+
+  <provides>
+    <binary>store</binary>
+  </provides>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.0.1" date="2025-01-01">
+      <description><p>Initial release.</p></description>
+    </release>
+  </releases>
+</component>
