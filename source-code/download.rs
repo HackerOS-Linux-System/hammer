@@ -18,10 +18,14 @@ const MAX_RETRIES:    usize = 3;
 const RETRY_DELAY:    u64   = 2;
 
 const USER_AGENT: &str = concat!(
-    "hammer/",
-    env!("CARGO_PKG_VERSION"),
-                                 " (https://github.com/HackerOS-Linux-System/hammer/)"
+    "hammer/", env!("CARGO_PKG_VERSION"),
+                                 " (https://github.com/HackerOS-Linux-System/hammer)"
 );
+
+// Progress bar characters — filled / empty blocks (▰ ▱)
+// These are U+25B0 and U+25B1
+const FILLED: &str = "\u{25B0}";  // ▰
+const EMPTY:  &str = "\u{25B1}";  // ▱
 
 // ─────────────────────────────────────────────────────────────
 //  HttpClient
@@ -29,7 +33,7 @@ const USER_AGENT: &str = concat!(
 
 #[derive(Clone)]
 pub struct HttpClient {
-    inner: Client,
+    pub inner: Client,
 }
 
 impl HttpClient {
@@ -48,16 +52,17 @@ impl HttpClient {
     }
 
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = self
-        .inner
-        .get(url)
-        .send()
-        .await
+        let resp = self.inner.get(url).send().await
         .with_context(|| format!("GET {}", url))?;
         if !resp.status().is_success() {
             bail!("HTTP {} for {}", resp.status(), url);
         }
         Ok(resp.bytes().await?.to_vec())
+    }
+
+    pub async fn get_string(&self, url: &str) -> Result<String> {
+        let bytes = self.get_bytes(url).await?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 }
 
@@ -71,33 +76,63 @@ pub struct DownloadResult {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Progress bar styles — yarn-inspired
+//  Progress bar styles
 //
-//  Each package gets a spinner line:
-//    ⠙ fetch  vim 9.1.0646-1             1.7 MiB/s
-//    ✔ fetch  vim 9.1.0646-1             2.3 MiB  cached
-//    ✗ fetch  vim 9.1.0646-1             404 Not Found
+//  Overall header (spinner + total):
+//    ⠙ Downloading  [▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱]  19.18 MiB/373.63 MiB  10.17 MiB/s  ETA 35s
 //
-//  Below all spinners, one overall bytes bar:
-//    ⬡  [━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━] 100%  38.4 MiB / 38.4 MiB
+//  Per-package line:
+//    breeze-wallpaper 4:6.6.4-1           ▰▰▰▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱▱  4.09 MiB/38.31 MiB
+//
+//  The ▰ chars are printed in bright orange (\x1b[38;5;208m)
+//  and ▱ chars in dim grey.
 // ─────────────────────────────────────────────────────────────
 
-fn pkg_spinner_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "  {spinner:.cyan}  {prefix:<38.bold}  {bytes_per_sec:>10}  {bytes:>8}",
-    )
-    .unwrap()
-    .tick_strings(&[
-        "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "·",
-    ])
+/// Build a visual progress bar string using ▰/▱ with ANSI colour.
+/// `filled_frac` is 0.0–1.0. `width` is number of characters.
+fn block_bar(filled_frac: f64, width: usize) -> String {
+    let filled = (filled_frac.clamp(0.0, 1.0) * width as f64).round() as usize;
+    let empty  = width.saturating_sub(filled);
+    // Orange for filled (256-colour code 208), dim white for empty
+    let f_part = format!("\x1b[38;5;208m{}\x1b[0m", FILLED.repeat(filled));
+    let e_part = format!("\x1b[2m{}\x1b[0m", EMPTY.repeat(empty));
+    format!("{}{}", f_part, e_part)
 }
 
-fn overall_bar_style() -> ProgressStyle {
+fn overall_style() -> ProgressStyle {
+    // indicatif template — we customise the bar chars via progress_chars
+    // Orange filled ▰, empty ▱
     ProgressStyle::with_template(
-        "  {prefix:.bold.cyan}  [{bar:42.cyan/238}]  {percent:>3}%  {bytes:>9} / {total_bytes}  {elapsed}",
+        "  {spinner:.cyan}  {prefix:.bold}  [{wide_bar}]  {bytes}/{total_bytes}  {bytes_per_sec}  ETA {eta}"
     )
     .unwrap()
-    .progress_chars("━━─")
+    .with_key("wide_bar", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+        let pct = if state.len().unwrap_or(1) == 0 { 0.0 }
+        else { state.pos() as f64 / state.len().unwrap() as f64 };
+        let width: usize = 38;
+        let filled = (pct * width as f64).round() as usize;
+        let empty  = width.saturating_sub(filled);
+        let _ = write!(w, "\x1b[38;5;208m{}\x1b[0m\x1b[2m{}\x1b[0m",
+                       "\u{25B0}".repeat(filled), "\u{25B1}".repeat(empty));
+    })
+    .tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","·"])
+}
+
+fn pkg_style() -> ProgressStyle {
+    // Per-package: label  [bar]  bytes/total
+    ProgressStyle::with_template(
+        "    {prefix:<42}  [{wide_bar}]  {bytes:>9}/{total_bytes}"
+    )
+    .unwrap()
+    .with_key("wide_bar", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
+        let pct = if state.len().unwrap_or(1) == 0 { 0.0 }
+        else { state.pos() as f64 / state.len().unwrap() as f64 };
+        let width: usize = 28;
+        let filled = (pct * width as f64).round() as usize;
+        let empty  = width.saturating_sub(filled);
+        let _ = write!(w, "\x1b[38;5;208m{}\x1b[0m\x1b[2m{}\x1b[0m",
+                       "\u{25B0}".repeat(filled), "\u{25B1}".repeat(empty));
+    })
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -108,23 +143,21 @@ pub async fn download_packages(
     client:   &HttpClient,
     packages: &[Package],
 ) -> Result<Vec<DownloadResult>> {
-    if packages.is_empty() {
-        return Ok(Vec::new());
-    }
+    if packages.is_empty() { return Ok(Vec::new()); }
 
     std::fs::create_dir_all(DL_DIR).context("Cannot create download cache dir")?;
 
     let total_bytes: u64 = packages.iter().filter_map(|p| p.download_size).sum();
-
     let mp = MultiProgress::new();
 
-    // ── Overall progress bar (at the bottom) ──────────────────
+    // ── Overall bar ───────────────────────────────────────────
     let overall = mp.add(ProgressBar::new(total_bytes.max(1)));
-    overall.set_style(overall_bar_style());
-    overall.set_prefix("downloading");
+    overall.set_style(overall_style());
+    overall.set_prefix("Downloading");
+    overall.enable_steady_tick(Duration::from_millis(100));
 
-    // ── Per-package spinner (inserted above overall) ──────────
-    let sty = pkg_spinner_style();
+    // ── Per-package bars (inserted above overall) ─────────────
+    let sty = pkg_style();
     let sem = Arc::new(Semaphore::new(MAX_CONCURRENT));
     let mut handles = Vec::new();
 
@@ -132,26 +165,24 @@ pub async fn download_packages(
         let base_uri = match &pkg.repo_base_uri {
             Some(u) => u.clone(),
             None => bail!(
-                "Package '{}' has no repository URI — run `hammer sync` first.",
-                pkg.name
-            ),
+                "Package '{}' has no repository URI — run `hammer sync` first.", pkg.name),
         };
         let filename = match &pkg.filename {
             Some(f) => f.clone(),
             None => bail!(
-                "Package '{}' has no filename in metadata — run `hammer sync` first.",
-                pkg.name
-            ),
+                "Package '{}' has no filename in metadata — run `hammer sync` first.", pkg.name),
         };
 
         let url  = format!("{}/{}", base_uri.trim_end_matches('/'), filename);
         let dest = pkg_dest_path(pkg);
+        let size = pkg.download_size.unwrap_or(0);
 
-        let pb = mp.insert_before(&overall, ProgressBar::new_spinner());
+        // Label: "name version" padded to 40 chars
+        let label = format!("{} {}", pkg.name, pkg.version);
+
+        let pb = mp.insert_before(&overall, ProgressBar::new(size.max(1)));
         pb.set_style(sty.clone());
-        pb.set_prefix(format!("{} {}", pkg.name, pkg.version));
-        pb.set_message("pending".dimmed().to_string());
-        pb.enable_steady_tick(Duration::from_millis(80));
+        pb.set_prefix(label);
 
         let client_c  = client.clone();
         let overall_c = overall.clone();
@@ -160,31 +191,18 @@ pub async fn download_packages(
 
         let handle: tokio::task::JoinHandle<Result<DownloadResult>> =
         tokio::spawn(async move {
-            let _permit = sem_c.acquire().await.expect("Semaphore closed");
-            let result =
-            download_with_retry(&client_c, &url, &dest, &pb, &overall_c)
-            .await;
-            match result {
+            let _permit = sem_c.acquire().await.expect("semaphore closed");
+            let res = download_with_retry(&client_c, &url, &dest, &pb, &overall_c).await;
+            match &res {
                 Ok(()) => {
-                    let size = std::fs::metadata(&dest)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                    pb.finish_with_message(format!(
-                        "{}",
-                        crate::ui::human_size(size).green()
-                    ));
-                    Ok(DownloadResult {
-                        package: pkg_c,
-                        path:    dest,
-                    })
+                    let sz = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                    pb.finish_with_message(crate::ui::human_size(sz).green().to_string());
                 }
                 Err(e) => {
-                    pb.finish_with_message(
-                        format!("✗ {}", e).red().to_string(),
-                    );
-                    Err(e)
+                    pb.finish_with_message(format!("\x1b[31m✗\x1b[0m {}", e));
                 }
             }
+            res.map(|_| DownloadResult { package: pkg_c, path: dest })
         });
         handles.push(handle);
     }
@@ -206,14 +224,9 @@ pub async fn download_packages(
     if !failures.is_empty() {
         eprintln!();
         eprintln!("  {} {} download(s) failed:", "✗".red().bold(), failures.len());
-        for f in &failures {
-            eprintln!("    {} {}", "·".dimmed(), f);
-        }
+        for f in &failures { eprintln!("    {} {}", "·".dimmed(), f); }
         eprintln!();
-        bail!(
-            "{} package(s) could not be downloaded.\nTransaction aborted.",
-              failures.len()
-        );
+        bail!("{} package(s) could not be downloaded.\nTransaction aborted.", failures.len());
     }
 
     Ok(results)
@@ -230,34 +243,24 @@ async fn download_with_retry(
     pb:      &ProgressBar,
     overall: &ProgressBar,
 ) -> Result<()> {
-    // Already cached?
     if let Ok(meta) = std::fs::metadata(dest) {
         if meta.len() > 0 {
-            let n = meta.len();
-            overall.inc(n);
-            pb.set_message("cached".dimmed().to_string());
+            pb.inc(meta.len());
+            overall.inc(meta.len());
             return Ok(());
         }
     }
-
     let mut last_err = anyhow::anyhow!("No attempts made");
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            let delay = RETRY_DELAY * attempt as u64;
-            pb.set_message(
-                format!("retry {}/{}", attempt, MAX_RETRIES - 1)
-                    .yellow()
-                    .to_string(),
-            );
-            tokio::time::sleep(Duration::from_secs(delay)).await;
+            tokio::time::sleep(Duration::from_secs(RETRY_DELAY * attempt as u64)).await;
+            pb.reset();
         }
         match download_one(client, url, dest, pb, overall).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = e;
-                if last_err.to_string().contains("404") {
-                    break;
-                }
+                if last_err.to_string().contains("404") { break; }
             }
         }
     }
@@ -271,28 +274,16 @@ async fn download_one(
     pb:      &ProgressBar,
     overall: &ProgressBar,
 ) -> Result<()> {
-    let resp = client
-    .inner
-    .get(url)
-    .send()
-    .await
+    let resp = client.inner.get(url).send().await
     .with_context(|| format!("GET {}", url))?;
+    if resp.status() == StatusCode::NOT_FOUND { bail!("404 Not Found: {}", url); }
+    if !resp.status().is_success() { bail!("HTTP {} for {}", resp.status(), url); }
 
-    if resp.status() == StatusCode::NOT_FOUND {
-        bail!("404 Not Found: {}", url);
-    }
-    if !resp.status().is_success() {
-        bail!("HTTP {} for {}", resp.status(), url);
-    }
-
-    if let Some(len) = resp.content_length() {
-        pb.set_length(len);
-    }
+    if let Some(len) = resp.content_length() { pb.set_length(len); }
 
     let tmp = dest.with_extension("part");
     let _ = tokio::fs::remove_file(&tmp).await;
-    let mut file = tokio::fs::File::create(&tmp)
-    .await
+    let mut file = tokio::fs::File::create(&tmp).await
     .with_context(|| format!("Cannot create {:?}", tmp))?;
 
     let mut stream = resp.bytes_stream();
@@ -305,9 +296,7 @@ async fn download_one(
     }
     file.flush().await?;
     drop(file);
-
-    tokio::fs::rename(&tmp, dest)
-    .await
+    tokio::fs::rename(&tmp, dest).await
     .with_context(|| format!("Cannot rename {:?} → {:?}", tmp, dest))?;
     Ok(())
 }
@@ -318,21 +307,17 @@ async fn download_one(
 
 pub fn pkg_dest_path(pkg: &Package) -> PathBuf {
     let safe_ver = pkg.version.replace(':', "%3A").replace('/', "%2F");
-    PathBuf::from(DL_DIR)
-    .join(format!("{}_{}_{}.deb", pkg.name, safe_ver, pkg.architecture))
+    PathBuf::from(DL_DIR).join(format!("{}_{}_{}.deb", pkg.name, safe_ver, pkg.architecture))
 }
 
 pub fn clean_cache() -> anyhow::Result<usize> {
-    let dir = std::path::Path::new(DL_DIR);
-    if !dir.exists() {
-        return Ok(0);
-    }
-    let mut count = 0usize;
+    let dir = Path::new(DL_DIR);
+    if !dir.exists() { return Ok(0); }
+    let mut count = 0;
     for entry in std::fs::read_dir(dir)? {
-        let entry = entry?;
-        let path  = entry.path();
-        if path.extension().map_or(false, |e| e == "deb") {
-            std::fs::remove_file(&path)?;
+        let p = entry?.path();
+        if p.extension().map_or(false, |e| e == "deb") {
+            std::fs::remove_file(&p)?;
             count += 1;
         }
     }
@@ -340,9 +325,7 @@ pub fn clean_cache() -> anyhow::Result<usize> {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  UnpackSpinner — yarn-style unpack indicator
-//
-//    ⠙  Unpacking  vim 9.1.0646-1…
+//  UnpackSpinner
 // ─────────────────────────────────────────────────────────────
 
 pub struct UnpackSpinner(ProgressBar);
@@ -351,13 +334,9 @@ impl UnpackSpinner {
     pub fn new(mp: &MultiProgress, label: &str) -> Self {
         let pb = mp.add(ProgressBar::new_spinner());
         pb.set_style(
-            ProgressStyle::with_template(
-                "  {spinner:.cyan}  {prefix:.bold}  {wide_msg}",
-            )
+            ProgressStyle::with_template("  {spinner:.cyan}  {prefix:.bold}  {wide_msg}")
             .unwrap()
-            .tick_strings(&[
-                "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "·",
-            ]),
+            .tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","·"]),
         );
         pb.set_prefix("unpacking");
         pb.set_message(label.to_string());
@@ -367,11 +346,9 @@ impl UnpackSpinner {
 
     pub fn finish_ok(self, label: &str) {
         self.0.finish_with_message(
-            format!("{}  {}", "✔".bright_green(), label).to_string(),
+            format!("{} {}", "\x1b[32m✔\x1b[0m", label)
         );
     }
 
-    pub fn finish(self) {
-        self.0.finish_and_clear();
-    }
+    pub fn finish(self) { self.0.finish_and_clear(); }
 }
