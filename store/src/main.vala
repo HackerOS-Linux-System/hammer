@@ -33,13 +33,11 @@ public class HammerPackage : Object {
 // ─────────────────────────────────────────────────────────────
 
 public class PackageLoader : Object {
-    // Use fully-qualified GLib.ListStore to avoid ambiguity with Gtk.ListStore
     public signal void packages_loaded (GLib.ListStore store);
     public signal void load_error      (string message);
 
     public void load_async () {
         new Thread<void> ("pkg-loader", () => {
-            // GLib.ListStore — unambiguous
             var store = new GLib.ListStore (typeof (HammerPackage));
             load_from_hammer (store);
             Idle.add (() => {
@@ -96,6 +94,7 @@ public class PackageLoader : Object {
             if (is_installed_pass && !inst) continue;
             if (!is_installed_pass && inst) continue;
 
+            // Find first alphabetic character
             int start = 0;
             while (start < (int) line.length) {
                 unichar c;
@@ -103,7 +102,7 @@ public class PackageLoader : Object {
                 line.get_next_char (ref start, out c);
                 if (c.isalpha ()) { start = old; break; }
             }
-            var rest = line.substring (start).strip ();
+            var rest  = line.substring (start).strip ();
             var parts = rest.split_set (" \t", 4);
             if (parts.length < 1) continue;
 
@@ -141,7 +140,8 @@ public class PackageRow : ListBoxRow {
 
         var grid = new Grid () { column_spacing = 12, row_spacing = 2 };
 
-        var name_lbl = new Label (p.name) { xalign = 0f, halign = Align.START, hexpand = true };
+        var name_lbl = new Label (p.name) {
+            xalign = 0f, halign = Align.START, hexpand = true };
         name_lbl.add_css_class ("heading");
         if (p.installed) name_lbl.add_css_class ("accent");
 
@@ -152,8 +152,12 @@ public class PackageRow : ListBoxRow {
         var repo_lbl = new Label (p.repo) { xalign = 1f, halign = Align.END, hexpand = true };
         repo_lbl.add_css_class ("dim-label");
 
-        var badge = new Label (p.installed ? "installed" : "") { xalign = 1f, halign = Align.END };
-        if (p.installed) { badge.add_css_class ("success"); badge.add_css_class ("caption"); }
+        var badge = new Label (p.installed ? "installed" : "") {
+            xalign = 1f, halign = Align.END };
+        if (p.installed) {
+            badge.add_css_class ("success");
+            badge.add_css_class ("caption");
+        }
 
         grid.attach (name_lbl, 0, 0, 1, 1);
         grid.attach (ver_lbl,  0, 1, 1, 1);
@@ -183,15 +187,17 @@ public class PackageDetail : Box {
 
     public PackageDetail () {
         orientation = Orientation.VERTICAL; spacing = 16;
-        margin_start = 24; margin_end = 24; margin_top = 24; margin_bottom = 24;
+        margin_start = 24; margin_end = 24;
+        margin_top   = 24; margin_bottom = 24;
         halign = Align.FILL; valign = Align.START;
 
         var icon = new Image.from_icon_name ("system-software-install") {
             pixel_size = 64, halign = Align.CENTER };
         append (icon);
 
-        name_label = new Label ("") { halign = Align.CENTER, wrap = true,
-                                       justify = Justification.CENTER };
+        name_label = new Label ("") {
+            halign = Align.CENTER, wrap = true,
+            justify = Justification.CENTER };
         name_label.add_css_class ("title-1");
         append (name_label);
 
@@ -200,8 +206,10 @@ public class PackageDetail : Box {
         arch_label      = make_dim ("");
         repo_label      = make_dim ("");
         installed_label = make_dim ("");
-        info_box.append (version_label); info_box.append (arch_label);
-        info_box.append (repo_label);    info_box.append (installed_label);
+        info_box.append (version_label);
+        info_box.append (arch_label);
+        info_box.append (repo_label);
+        info_box.append (installed_label);
         append (info_box);
 
         summary_label = new Label ("") {
@@ -219,7 +227,8 @@ public class PackageDetail : Box {
 
     private Label make_dim (string text) {
         var l = new Label (text) { halign = Align.CENTER };
-        l.add_css_class ("dim-label"); l.add_css_class ("caption");
+        l.add_css_class ("dim-label");
+        l.add_css_class ("caption");
         return l;
     }
 
@@ -229,12 +238,18 @@ public class PackageDetail : Box {
         version_label.set_label   ("Version: " + pkg.version);
         arch_label.set_label      ("Arch: "    + pkg.architecture);
         repo_label.set_label      ("Repo: "    + pkg.repo);
-        installed_label.set_label (pkg.installed ? "\xe2\x97\x8f Installed" : "\xe2\x97\x8b Not installed");
+        installed_label.set_label (pkg.installed
+            ? "\xe2\x97\x8f Installed"
+            : "\xe2\x97\x8b Not installed");
+
         installed_label.remove_css_class ("success");
         installed_label.remove_css_class ("dim-label");
         if (pkg.installed) installed_label.add_css_class ("success");
         else               installed_label.add_css_class ("dim-label");
-        summary_label.set_label (pkg.summary.length > 0 ? pkg.summary : "(no description)");
+
+        summary_label.set_label (
+            pkg.summary.length > 0 ? pkg.summary : "(no description)");
+
         action_button.sensitive = true;
         if (pkg.installed) {
             action_button.set_label ("Remove");
@@ -249,9 +264,9 @@ public class PackageDetail : Box {
 
     public void clear () {
         _current = null;
-        name_label.set_label (""); version_label.set_label ("");
-        arch_label.set_label ("");  repo_label.set_label ("");
-        summary_label.set_label (""); installed_label.set_label ("");
+        name_label.set_label ("");      version_label.set_label ("");
+        arch_label.set_label ("");      repo_label.set_label ("");
+        summary_label.set_label ("");   installed_label.set_label ("");
         action_button.set_label ("Select a package");
         action_button.sensitive = false;
         action_button.remove_css_class ("suggested-action");
@@ -274,29 +289,44 @@ public class TerminalDialog : Dialog {
     private Button     close_btn;
 
     public TerminalDialog (Window parent, string title_str) {
-        set_transient_for (parent); set_modal (true);
-        set_title (title_str); set_default_size (680, 420);
+        set_transient_for (parent);
+        set_modal (true);
+        set_title (title_str);
+        set_default_size (680, 420);
 
         buf       = new TextBuffer (null);
         text_view = new TextView.with_buffer (buf) {
-            editable = false, cursor_visible = false, monospace = true,
-            wrap_mode = WrapMode.CHAR,
-            margin_start = 10, margin_end = 10, margin_top = 10, margin_bottom = 10 };
+            editable       = false,
+            cursor_visible = false,
+            monospace      = true,
+            wrap_mode      = WrapMode.CHAR,
+            margin_start   = 10, margin_end   = 10,
+            margin_top     = 10, margin_bottom = 10
+        };
 
         var scroll = new ScrolledWindow () {
-            vexpand = true, hexpand = true,
-            hscrollbar_policy = PolicyType.NEVER, child = text_view };
+            vexpand           = true,
+            hexpand           = true,
+            hscrollbar_policy = PolicyType.NEVER,
+            child             = text_view
+        };
 
         close_btn = new Button.with_label ("Close") {
-            sensitive = false, halign = Align.END, margin_top = 8 };
-        close_btn.add_css_class ("suggested-action"); close_btn.add_css_class ("pill");
+            sensitive  = false,
+            halign     = Align.END,
+            margin_top = 8
+        };
+        close_btn.add_css_class ("suggested-action");
+        close_btn.add_css_class ("pill");
         close_btn.clicked.connect (() => close ());
 
         var box = get_content_area ();
-        box.orientation = Orientation.VERTICAL; box.spacing = 0;
-        box.margin_start = 12; box.margin_end = 12;
-        box.margin_top   = 12; box.margin_bottom = 12;
-        box.append (scroll); box.append (close_btn);
+        box.orientation   = Orientation.VERTICAL;
+        box.spacing       = 0;
+        box.margin_start  = 12; box.margin_end   = 12;
+        box.margin_top    = 12; box.margin_bottom = 12;
+        box.append (scroll);
+        box.append (close_btn);
     }
 
     public void append_text (string text) {
@@ -312,7 +342,10 @@ public class TerminalDialog : Dialog {
     }
 
     public void set_done () {
-        Idle.add (() => { close_btn.sensitive = true; return Source.REMOVE; });
+        Idle.add (() => {
+            close_btn.sensitive = true;
+            return Source.REMOVE;
+        });
     }
 }
 
@@ -321,13 +354,12 @@ public class TerminalDialog : Dialog {
 // ─────────────────────────────────────────────────────────────
 
 public class HammerStoreWindow : ApplicationWindow {
-    private SearchEntry   search_entry;
-    private ListBox       pkg_list;
-    private PackageDetail detail_panel;
-    private Spinner       spinner;
-    private Stack         main_stack;
-    private Label         status_label;
-    // GLib.ListStore — fully qualified to avoid ambiguity
+    private SearchEntry    search_entry;
+    private ListBox        pkg_list;
+    private PackageDetail  detail_panel;
+    private Spinner        spinner;
+    private Stack          main_stack;
+    private Label          status_label;
     private GLib.ListStore _all_packages;
     private string         _filter = "";
 
@@ -338,11 +370,15 @@ public class HammerStoreWindow : ApplicationWindow {
         load_packages ();
     }
 
+    // ── UI ────────────────────────────────────────────────────
+
     private void build_ui () {
         var header = new HeaderBar ();
 
         search_entry = new SearchEntry () {
-            placeholder_text = "Search packages\xe2\x80\xa6", width_chars = 30 };
+            placeholder_text = "Search packages\xe2\x80\xa6",
+            width_chars = 30
+        };
         search_entry.search_changed.connect (() => {
             _filter = search_entry.get_text ().down ();
             pkg_list.invalidate_filter ();
@@ -351,13 +387,16 @@ public class HammerStoreWindow : ApplicationWindow {
         header.set_title_widget (search_entry);
 
         var sync_btn = new Button.with_label ("Sync") {
-            tooltip_text = "Run hammer sync" };
-        sync_btn.add_css_class ("suggested-action"); sync_btn.add_css_class ("pill");
+            tooltip_text = "Run hammer sync"
+        };
+        sync_btn.add_css_class ("suggested-action");
+        sync_btn.add_css_class ("pill");
         sync_btn.clicked.connect (run_hammer_sync);
         header.pack_start (sync_btn);
 
         var refresh_btn = new Button.from_icon_name ("view-refresh-symbolic") {
-            tooltip_text = "Reload package list" };
+            tooltip_text = "Reload package list"
+        };
         refresh_btn.clicked.connect (load_packages);
         header.pack_end (refresh_btn);
         set_titlebar (header);
@@ -370,32 +409,50 @@ public class HammerStoreWindow : ApplicationWindow {
         loading_box.append (new Label ("Loading packages\xe2\x80\xa6"));
 
         // Package list
-        pkg_list = new ListBox () { selection_mode = SelectionMode.SINGLE, show_separators = true };
+        pkg_list = new ListBox () {
+            selection_mode  = SelectionMode.SINGLE,
+            show_separators = true
+        };
         pkg_list.set_filter_func (filter_func);
         pkg_list.row_selected.connect (on_row_selected);
         var list_scroll = new ScrolledWindow () {
-            vexpand = true, hscrollbar_policy = PolicyType.NEVER,
-            child = pkg_list, width_request = 420 };
+            vexpand           = true,
+            hscrollbar_policy = PolicyType.NEVER,
+            child             = pkg_list,
+            width_request     = 420
+        };
 
         // Detail panel
         detail_panel = new PackageDetail ();
         detail_panel.action_requested.connect (on_action_requested);
         detail_panel.clear ();
         var detail_scroll = new ScrolledWindow () {
-            vexpand = true, hscrollbar_policy = PolicyType.NEVER,
-            child = detail_panel, width_request = 320 };
+            vexpand           = true,
+            hscrollbar_policy = PolicyType.NEVER,
+            child             = detail_panel,
+            width_request     = 320
+        };
 
         // Status bar
         status_label = new Label ("") {
-            xalign = 0f, margin_start = 8, margin_top = 4, margin_bottom = 4 };
-        status_label.add_css_class ("dim-label"); status_label.add_css_class ("caption");
+            xalign        = 0f,
+            margin_start  = 8,
+            margin_top    = 4,
+            margin_bottom = 4
+        };
+        status_label.add_css_class ("dim-label");
+        status_label.add_css_class ("caption");
 
         var paned = new Paned (Orientation.HORIZONTAL) {
-            start_child = list_scroll, end_child = detail_scroll,
-            position = 480, wide_handle = true };
+            start_child = list_scroll,
+            end_child   = detail_scroll,
+            position    = 480,
+            wide_handle = true
+        };
 
         var content_box = new Box (Orientation.VERTICAL, 0);
-        content_box.append (paned); content_box.append (status_label);
+        content_box.append (paned);
+        content_box.append (status_label);
 
         main_stack = new Stack ();
         main_stack.add_named (loading_box, "loading");
@@ -404,9 +461,12 @@ public class HammerStoreWindow : ApplicationWindow {
         set_child (main_stack);
     }
 
+    // ── Load packages ─────────────────────────────────────────
+
     private void load_packages () {
         main_stack.set_visible_child_name ("loading");
         spinner.spinning = true;
+
         var loader = new PackageLoader ();
         loader.packages_loaded.connect ((store) => {
             _all_packages = store;
@@ -439,7 +499,7 @@ public class HammerStoreWindow : ApplicationWindow {
 
     private void update_status () {
         if (_all_packages == null) return;
-        uint total = _all_packages.get_n_items ();
+        uint total   = _all_packages.get_n_items ();
         uint visible = 0;
         for (int i = 0; ; i++) {
             var r = pkg_list.get_row_at_index (i);
@@ -451,6 +511,8 @@ public class HammerStoreWindow : ApplicationWindow {
             : "%u packages".printf (total));
     }
 
+    // ── Filter ────────────────────────────────────────────────
+
     private bool filter_func (ListBoxRow list_row) {
         if (_filter.length == 0) return true;
         var pkg = ((PackageRow) list_row).get_package ();
@@ -459,19 +521,26 @@ public class HammerStoreWindow : ApplicationWindow {
             || pkg.repo.down ().contains (_filter);
     }
 
+    // ── Row selection ─────────────────────────────────────────
+
     private void on_row_selected (ListBoxRow? list_row) {
         if (list_row == null) { detail_panel.clear (); return; }
         detail_panel.show_package (((PackageRow) list_row).get_package ());
     }
 
+    // ── Install / Remove ──────────────────────────────────────
+
     private void on_action_requested (HammerPackage pkg, bool do_install) {
         string op    = do_install ? "install" : "remove";
-        string title = do_install ? "Installing %s".printf (pkg.name)
-                                  : "Removing %s".printf (pkg.name);
+        string title = do_install
+            ? "Installing %s".printf (pkg.name)
+            : "Removing %s".printf (pkg.name);
         var dlg = new TerminalDialog (this, title);
         dlg.present ();
         run_hammer_command ({ "/usr/bin/hammer", op, "-y", pkg.name }, dlg);
     }
+
+    // ── Sync ─────────────────────────────────────────────────
 
     private void run_hammer_sync () {
         var dlg = new TerminalDialog (this, "hammer sync");
@@ -479,24 +548,51 @@ public class HammerStoreWindow : ApplicationWindow {
         run_hammer_command ({ "/usr/bin/hammer", "sync" }, dlg);
     }
 
+    // ── Command runner ────────────────────────────────────────
+    //
+    //  FIX: replaced UnixInputStream (needs gio-unix-2.0) and
+    //  Posix.waitpid (needs posix pkg) with pure GLib IOChannel
+    //  + ChildWatch.add — no extra pkg dependencies needed.
+
     private void run_hammer_command (string[] argv, TerminalDialog dlg) {
         var argv_copy = argv;
+
         new Thread<void> ("hammer-cmd", () => {
             try {
                 Pid child_pid;
-                int stdout_fd, stderr_fd;
+                int stdout_fd;
+                int stderr_fd;
+
                 Process.spawn_async_with_pipes (
-                    null, argv_copy, null,
+                    null,
+                    argv_copy,
+                    null,
                     SpawnFlags.SEARCH_PATH | SpawnFlags.DO_NOT_REAP_CHILD,
-                    null, out child_pid, null, out stdout_fd, out stderr_fd);
-                read_fd_to_dialog (stdout_fd, dlg);
-                read_fd_to_dialog (stderr_fd, dlg);
-                int status = 0;
-                Posix.waitpid (child_pid, out status, 0);
-                Process.close_pid (child_pid);
+                    null,
+                    out child_pid,
+                    null,
+                    out stdout_fd,
+                    out stderr_fd
+                );
+
+                // Read stdout via IOChannel (pure GLib, no posix/gio-unix needed)
+                drain_channel (stdout_fd, dlg);
+                drain_channel (stderr_fd, dlg);
+
+                // Reap child using GLib ChildWatch (runs in main loop)
+                Pid pid_copy = child_pid;
+                Idle.add (() => {
+                    ChildWatch.add (pid_copy, (pid, _status) => {
+                        Process.close_pid (pid);
+                    });
+                    return Source.REMOVE;
+                });
+
                 dlg.append_text ("\n\xe2\x94\x80\xe2\x94\x80 Done. \xe2\x94\x80\xe2\x94\x80\n");
                 dlg.set_done ();
+
                 Idle.add (() => { load_packages (); return Source.REMOVE; });
+
             } catch (Error e) {
                 dlg.append_text ("Error: %s\n".printf (e.message));
                 dlg.set_done ();
@@ -504,23 +600,79 @@ public class HammerStoreWindow : ApplicationWindow {
         });
     }
 
-    private void read_fd_to_dialog (int fd, TerminalDialog dlg) {
-        var stream      = new UnixInputStream (fd, true);
-        var data_stream = new DataInputStream (stream);
+    // Drain a file descriptor line-by-line into the terminal dialog.
+    // Uses GLib.IOChannel — available without any extra .vapi.
+    private static void drain_channel (int fd, TerminalDialog dlg) {
         try {
-            string? line;
-            while ((line = data_stream.read_line ()) != null) {
-                dlg.append_text (line + "\n");
+            var chan = new IOChannel.unix_new (fd);
+            // Set encoding to null (binary / raw bytes) to avoid encoding errors
+            chan.set_encoding (null);
+            chan.set_buffered (true);
+
+            string line;
+            size_t length;
+            IOStatus st;
+
+            // Switch to UTF-8 for line reading
+            chan.set_encoding ("UTF-8");
+
+            while (true) {
+                st = chan.read_line (out line, out length, null);
+                if (st == IOStatus.NORMAL && line != null) {
+                    dlg.append_text (line);
+                } else {
+                    break;
+                }
             }
-        } catch (Error e) { /* EOF — normal */ }
+        } catch (Error e) {
+            // EOF / broken pipe — normal at process end
+        }
     }
 
-    private void show_error (string title_str, string message) {
-        var dlg = new MessageDialog (this, DialogFlags.MODAL,
-            MessageType.ERROR, ButtonsType.OK, "%s", title_str);
-        dlg.secondary_text = message;
-        dlg.response.connect (() => dlg.close ());
-        dlg.present ();
+    // ── Error dialog ──────────────────────────────────────────
+    //
+    //  FIX: MessageDialog is deprecated since GTK 4.10.
+    //  Replaced with AlertDialog (GTK >= 4.10) with a fallback
+    //  to a plain Dialog for older GTK versions.
+
+    private void show_error (string title_str, string msg_str) {
+        // AlertDialog is available since GTK 4.10 — use it when possible.
+        // We check at compile time via Vala's version conditional.
+#if GTK_4_10
+        var alert = new AlertDialog (title_str);
+        alert.set_detail (msg_str);
+        alert.set_buttons ({ "OK" });
+        alert.set_default_button (0);
+        alert.choose.begin (this, null, (obj, res) => {
+            try { alert.choose.end (res); } catch { }
+        });
+#else
+        // Fallback: plain Dialog with a label (no deprecated MessageDialog)
+        var err_dlg  = new Dialog ();
+        err_dlg.set_transient_for (this);
+        err_dlg.set_modal (true);
+        err_dlg.set_title (title_str);
+        err_dlg.set_default_size (360, 160);
+
+        var lbl = new Label (msg_str) {
+            wrap            = true,
+            max_width_chars = 48,
+            margin_start    = 16, margin_end    = 16,
+            margin_top      = 16, margin_bottom = 16
+        };
+        var ok_btn = new Button.with_label ("OK") {
+            halign     = Align.CENTER,
+            margin_top = 8,
+            margin_bottom = 12
+        };
+        ok_btn.add_css_class ("suggested-action");
+        ok_btn.clicked.connect (() => err_dlg.close ());
+
+        var box = err_dlg.get_content_area ();
+        box.append (lbl);
+        box.append (ok_btn);
+        err_dlg.present ();
+#endif
     }
 }
 
@@ -534,8 +686,7 @@ public class HammerStoreApp : Gtk.Application {
                 flags: ApplicationFlags.FLAGS_NONE);
     }
     protected override void activate () {
-        var win = new HammerStoreWindow (this);
-        win.present ();
+        new HammerStoreWindow (this).present ();
     }
 }
 
