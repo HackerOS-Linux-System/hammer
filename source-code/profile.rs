@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2025 Hammer Contributors
+
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -102,17 +105,17 @@ pub fn compose_profile(gen_number: u32, entries: &[StoreEntry], note: Option<Str
 
     for entry in entries {
         compose_entry(&profile_path, entry)
-        .with_context(|| format!("Composing {} into gen-{}", entry.name, gen_number))?;
+            .with_context(|| format!("Composing {} into gen-{}", entry.name, gen_number))?;
     }
 
     Ok(Generation {
         number:    gen_number,
-       timestamp: Utc::now(),
-       packages:  entries.iter().map(|e| GenPackage {
-           name: e.name.clone(), version: e.version.clone(), store_hash: e.hash.clone(),
-       }).collect(),
-       note,
-       state: Some(GenState::Pending),
+        timestamp: Utc::now(),
+        packages:  entries.iter().map(|e| GenPackage {
+            name: e.name.clone(), version: e.version.clone(), store_hash: e.hash.clone(),
+        }).collect(),
+        note,
+        state: Some(GenState::Pending),
     })
 }
 
@@ -131,7 +134,7 @@ fn compose_entry(profile: &Path, entry: &StoreEntry) -> Result<()> {
             if let Some(p) = dest.parent() { std::fs::create_dir_all(p)?; }
             if dest.symlink_metadata().is_ok() { std::fs::remove_file(&dest)?; }
             std::os::unix::fs::symlink(item.path(), &dest)
-            .with_context(|| format!("symlink {:?} → {:?}", dest, item.path()))?;
+                .with_context(|| format!("symlink {:?} → {:?}", dest, item.path()))?;
         }
     }
     Ok(())
@@ -203,8 +206,8 @@ pub fn activate_pending() -> Result<ActivationResult> {
 
     let gens_db = GenerationsDb::load()?;
     let gen = gens_db.get(pending_num)
-    .ok_or_else(|| anyhow::anyhow!("Pending gen-{} not in DB", pending_num))?
-    .clone();
+        .ok_or_else(|| anyhow::anyhow!("Pending gen-{} not in DB", pending_num))?
+        .clone();
 
     let old_num      = gens_db.current;
     let profile_path = gen.profile_path();
@@ -321,8 +324,8 @@ fn create_editor_wrappers(profile: &Path) {
 
         // Create /usr/local/bin/<canonical> → /hammer/active/usr/bin/<alternative>
         let active_rel = target_path.strip_prefix(profile)
-        .map(|r| PathBuf::from("/hammer/active").join(r))
-        .unwrap_or(target_path.clone());
+            .map(|r| PathBuf::from("/hammer/active").join(r))
+            .unwrap_or(target_path.clone());
 
         let dest = local_bin.join(canonical);
 
@@ -361,24 +364,24 @@ pub fn install_activate_service() -> Result<()> {
     }
 
     let service_content = r#"[Unit]
-    Description=Hammer — Activate Pending Generation
-    Documentation=man:hammer(1)
-    DefaultDependencies=no
-    After=local-fs.target
-    Before=sysinit.target basic.target
-    ConditionPathExists=/hammer/pending
+Description=Hammer — Activate Pending Generation
+Documentation=man:hammer(1)
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target basic.target
+ConditionPathExists=/hammer/pending
 
-    [Service]
-    Type=oneshot
-    RemainAfterExit=yes
-    ExecStart=/usr/bin/hammer _activate
-    StandardOutput=journal+console
-    StandardError=journal+console
-    TimeoutStartSec=300
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/hammer _activate
+StandardOutput=journal+console
+StandardError=journal+console
+TimeoutStartSec=300
 
-    [Install]
-    WantedBy=sysinit.target
-    "#;
+[Install]
+WantedBy=sysinit.target
+"#;
 
     let path = Path::new("/etc/systemd/system/hammer-activate.service");
     let existing = std::fs::read_to_string(path).unwrap_or_default();
@@ -386,7 +389,7 @@ pub fn install_activate_service() -> Result<()> {
         std::fs::write(path, service_content)?;
         let _ = std::process::Command::new("systemctl").args(["daemon-reload"]).status();
         let _ = std::process::Command::new("systemctl")
-        .args(["enable", "hammer-activate.service"]).status();
+            .args(["enable", "hammer-activate.service"]).status();
         log::info("profile: installed/updated hammer-activate.service");
     }
     Ok(())
@@ -430,8 +433,8 @@ fn merge_etc(profile: &Path) -> Result<(usize, Vec<String>)> {
             let existing = std::fs::read(&sys_path).unwrap_or_default();
             if existing != src_content {
                 let new_path = sys_path.parent().unwrap_or(Path::new("/etc"))
-                .join(format!("{}.hammer-new",
-                              sys_path.file_name().unwrap_or_default().to_string_lossy()));
+                    .join(format!("{}.hammer-new",
+                        sys_path.file_name().unwrap_or_default().to_string_lossy()));
                 std::fs::write(&new_path, &src_content)?;
                 let s = sys_path.to_string_lossy().to_string();
                 log::file_op("etc-conflict", &s);
@@ -539,8 +542,8 @@ fn run_postinst_scripts(profile: &Path, gen: &Generation) -> Result<(Vec<String>
     let profile_path_env = format!(
         "{}:{}:{}:/usr/bin:/usr/sbin:/bin:/sbin:/usr/local/bin:/usr/local/sbin",
         profile.join("usr/bin").display(),
-                                   profile.join("usr/sbin").display(),
-                                   profile.join("bin").display(),
+        profile.join("usr/sbin").display(),
+        profile.join("bin").display(),
     );
 
     // Packages whose postinst we SKIP entirely — they configure
@@ -579,7 +582,7 @@ fn run_postinst_scripts(profile: &Path, gen: &Generation) -> Result<(Vec<String>
 
         // Choose interpreter: prefer bash if script uses bash features
         let interpreter = if content.contains("#!/bin/bash") || content.contains("#!/usr/bin/bash")
-        || content.contains("function ") || content.contains("local ")
+            || content.contains("function ") || content.contains("local ")
         {
             "bash"
         } else {
@@ -589,20 +592,20 @@ fn run_postinst_scripts(profile: &Path, gen: &Generation) -> Result<(Vec<String>
         log::info(&format!("activate: running postinst for {} ({})", pkg.name, interpreter));
 
         let status = std::process::Command::new(interpreter)
-        .arg(&tmp)
-        .arg("configure")
-        .arg("")
-        .env("DPKG_MAINTSCRIPT_PACKAGE",    &pkg.name)
-        .env("DPKG_RUNNING_VERSION",        "1.23.5")
-        .env("DEBIAN_FRONTEND",             "noninteractive")
-        .env("DEBCONF_NONINTERACTIVE_SEEN", "true")
-        .env("DPKG_NO_TSTP",                "1")
-        .env("PATH",                        &profile_path_env)
-        .env("DPKG",                        "/bin/true")
-        .env("APT_GET",                     "/bin/true")
-        // Tell update-alternatives where to look
-        .env("ADMINDIR",                    "/var/lib/dpkg")
-        .status();
+            .arg(&tmp)
+            .arg("configure")
+            .arg("")
+            .env("DPKG_MAINTSCRIPT_PACKAGE",    &pkg.name)
+            .env("DPKG_RUNNING_VERSION",        "1.23.5")
+            .env("DEBIAN_FRONTEND",             "noninteractive")
+            .env("DEBCONF_NONINTERACTIVE_SEEN", "true")
+            .env("DPKG_NO_TSTP",                "1")
+            .env("PATH",                        &profile_path_env)
+            .env("DPKG",                        "/bin/true")
+            .env("APT_GET",                     "/bin/true")
+            // Tell update-alternatives where to look
+            .env("ADMINDIR",                    "/var/lib/dpkg")
+            .status();
 
         let _ = std::fs::remove_file(&tmp);
 
@@ -644,10 +647,10 @@ fn patch_maintainer_script(script: &str) -> String {
     for line in script.lines() {
         let trimmed = line.trim();
         let neutralise =
-        !trimmed.starts_with('#') && (
-            NEUTRALISE_CONTAINS.iter().any(|pat| trimmed.contains(pat)) ||
-            NEUTRALISE_STARTS.iter().any(|pat| trimmed.starts_with(pat))
-        );
+            !trimmed.starts_with('#') && (
+                NEUTRALISE_CONTAINS.iter().any(|pat| trimmed.contains(pat)) ||
+                NEUTRALISE_STARTS.iter().any(|pat| trimmed.starts_with(pat))
+            );
         if neutralise {
             out.push_str(&format!("# HAMMER-NEUTRALISED: {}\ntrue\n", line));
         } else {
@@ -715,16 +718,16 @@ fn ensure_system_users() -> Result<Vec<String>> {
 
 fn extract_last_non_flag(line: &str, skip: &[&str]) -> Option<String> {
     line.split_whitespace()
-    .filter(|t| !t.starts_with('-') && !skip.contains(t))
-    .last().map(|s| s.to_string())
+        .filter(|t| !t.starts_with('-') && !skip.contains(t))
+        .last().map(|s| s.to_string())
 }
 fn user_exists(name: &str) -> bool {
     std::process::Command::new("id").arg(name).output()
-    .map(|o| o.status.success()).unwrap_or(false)
+        .map(|o| o.status.success()).unwrap_or(false)
 }
 fn group_exists(name: &str) -> bool {
     std::fs::read_to_string("/etc/group").unwrap_or_default()
-    .lines().any(|l| l.starts_with(&format!("{}:", name)))
+        .lines().any(|l| l.starts_with(&format!("{}:", name)))
 }
 fn create_system_user(user: &str, original: &str) -> Result<()> {
     let tokens: Vec<&str> = original.split_whitespace().collect();
@@ -741,7 +744,7 @@ fn create_system_user(user: &str, original: &str) -> Result<()> {
     }
     args.push(user.to_string());
     let ok = std::process::Command::new("adduser").args(&args).status()
-    .map(|s| s.success()).unwrap_or(false);
+        .map(|s| s.success()).unwrap_or(false);
     if !ok {
         let status = std::process::Command::new("useradd").args(["-r", "-M", user]).status()?;
         if !status.success() { anyhow::bail!("Could not create user '{}'", user); }
@@ -801,22 +804,22 @@ fn update_alternatives(profile: &Path) -> Result<usize> {
         for &(link, name, priority) in editor_alts {
             // Only register if the link doesn't already point to the right thing
             let active_target = vpath.strip_prefix(profile)
-            .map(|r| PathBuf::from("/hammer/active").join(r))
-            .unwrap_or(vpath.clone());
+                .map(|r| PathBuf::from("/hammer/active").join(r))
+                .unwrap_or(vpath.clone());
 
             let _ = std::process::Command::new("update-alternatives")
-            .args([
-                "--install",
-                link,
-                name,
-                &active_target.to_string_lossy(),
-                  &priority.to_string(),
-            ])
-            .status();
+                .args([
+                    "--install",
+                    link,
+                    name,
+                    &active_target.to_string_lossy(),
+                    &priority.to_string(),
+                ])
+                .status();
 
             let _ = std::process::Command::new("update-alternatives")
-            .args(["--set", name, &active_target.to_string_lossy()])
-            .status();
+                .args(["--set", name, &active_target.to_string_lossy()])
+                .status();
 
             count += 1;
         }
@@ -849,28 +852,28 @@ fn link_bins_to_system(profile: &Path, _old_gen: u32) -> Result<(usize, usize)> 
     let bin_pairs: &[(PathBuf, PathBuf, Option<PathBuf>)] = &[
         (
             profile.join("usr/bin"),
-         PathBuf::from("/usr/local/bin"),
-         Some(PathBuf::from("/usr/bin")),
+            PathBuf::from("/usr/local/bin"),
+            Some(PathBuf::from("/usr/bin")),
         ),
         (
             profile.join("usr/sbin"),
-         PathBuf::from("/usr/local/sbin"),
-         Some(PathBuf::from("/usr/sbin")),
+            PathBuf::from("/usr/local/sbin"),
+            Some(PathBuf::from("/usr/sbin")),
         ),
         (
             profile.join("bin"),
-         PathBuf::from("/usr/local/bin"),
-         Some(PathBuf::from("/usr/bin")),
+            PathBuf::from("/usr/local/bin"),
+            Some(PathBuf::from("/usr/bin")),
         ),
         (
             profile.join("sbin"),
-         PathBuf::from("/usr/local/sbin"),
-         Some(PathBuf::from("/usr/sbin")),
+            PathBuf::from("/usr/local/sbin"),
+            Some(PathBuf::from("/usr/sbin")),
         ),
         (
             profile.join("usr/games"),
-         PathBuf::from("/usr/local/games"),
-         None,
+            PathBuf::from("/usr/local/games"),
+            None,
         ),
     ];
 
@@ -908,8 +911,8 @@ fn link_bins_to_system(profile: &Path, _old_gen: u32) -> Result<(usize, usize)> 
             let file_name = match src_path.file_name() { Some(n) => n.to_owned(), None => continue };
 
             let active_rel = src_path.strip_prefix(profile)
-            .map(|r| PathBuf::from("/hammer/active").join(r))
-            .unwrap_or_else(|_| src_path.clone());
+                .map(|r| PathBuf::from("/hammer/active").join(r))
+                .unwrap_or_else(|_| src_path.clone());
 
             // Try primary dest (/usr/local/bin)
             let primary_path = primary_dest.join(&file_name);
@@ -922,9 +925,9 @@ fn link_bins_to_system(profile: &Path, _old_gen: u32) -> Result<(usize, usize)> 
                 // Only link if /usr/bin/<name> does not exist as a real file
                 if !sec_path.exists() || sec_path.symlink_metadata()
                     .map(|m| m.file_type().is_symlink()).unwrap_or(false)
-                    {
-                        if link_one(&sec_path, &active_rel) { linked += 1; }
-                    }
+                {
+                    if link_one(&sec_path, &active_rel) { linked += 1; }
+                }
             }
         }
     }
@@ -1057,7 +1060,7 @@ fn write_activation_log(r: &ActivationResult) {
 
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true).append(true).open(ACTIVATION_LOG)
-        {
-            let _ = std::io::Write::write_all(&mut f, s.as_bytes());
-        }
+    {
+        let _ = std::io::Write::write_all(&mut f, s.as_bytes());
+    }
 }
