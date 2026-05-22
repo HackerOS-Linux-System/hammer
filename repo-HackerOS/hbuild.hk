@@ -1,1 +1,5 @@
-
+[hbuild]
+-> releases    => https://github.com/HackerOS-Linux-System/hbuild/releases
+-> binary      => hbuild
+-> description => A system inspired by cmake, meson and ninja.
+-> hidden      => false
