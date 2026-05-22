@@ -1,0 +1,5 @@
+[H-Sharp]
+-> releases    => https://github.com/HackerOS-Linux-System/H-Sharp/releases
+-> binaries    => ["hsharp:h#", "bytes", "hhc"]
+-> description => HackerOS programing language - H#.
+-> hidden      => false
