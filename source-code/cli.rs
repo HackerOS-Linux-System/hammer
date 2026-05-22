@@ -6,11 +6,16 @@ use crate::cache::{detect_arch, PackageCache};
 use crate::db::InstalledDb;
 use crate::diff::compute_diff;
 use crate::grub;
+use crate::hk_tools;
+use crate::livecheck;
 use crate::livepatch;
 use crate::profile::{
     self, activate_pending, clear_pending, GenerationsDb,
     read_active_gen, read_pending_gen,
 };
+use crate::repo::SOURCES_HK;
+use crate::selfupdate;
+use crate::setup;
 use crate::solver::Solver;
 use crate::store::Store;
 use crate::transaction::{execute_transaction, TransactionContext};
@@ -33,14 +38,11 @@ impl GlobalFlags {
         let mut f = GlobalFlags::default();
         args.retain(|a| {
             if a == "--user" || a == "-U" {
-                f.user_mode = true;
-                false
+                f.user_mode = true; false
             } else if let Some(arch) = a.strip_prefix("--arch=") {
-                f.arch = Some(arch.to_string());
-                false
+                f.arch = Some(arch.to_string()); false
             } else if a == "-y" || a == "--yes" {
-                f.yes = true;
-                false
+                f.yes = true; false
             } else {
                 true
             }
@@ -61,45 +63,80 @@ pub async fn run(mut args: Vec<String>) -> Result<()> {
     let cmd   = args.get(1).map(|s| s.as_str()).unwrap_or("help");
     let rest  = args[2.min(args.len())..].to_vec();
 
+    // ── Internal / hidden commands (no live check) ────────────
+    // These are only used from live-build hooks and must never
+    // appear in `hammer help`.
+    match cmd {
+        "_activate"   => return cmd_activate_internal(),
+        "_setup"      => return setup::cmd_setup().await,
+        "_import"     => return setup::cmd_import().await,
+        "version" | "--version" => {
+            println!(
+                "  {} {}  {}",
+                "⬡ hammer".bright_cyan().bold(),
+                env!("CARGO_PKG_VERSION").bold(),
+                "Apache-2.0".dimmed()
+            );
+            return Ok(());
+        }
+        "help" | "--help" | "-h" | "" => { print_help(); return Ok(()); }
+        _ => {}
+    }
+
+    // ── Live system guard ─────────────────────────────────────
+    // All user-facing commands require an installed system.
+    livecheck::assert_not_live();
+
     if flags.user_mode {
         return run_user(cmd, &rest, &flags).await;
     }
 
     match cmd {
+        // ── Package management ────────────────────────────────
         "install"    | "in"              => cmd_install(&rest, false, &flags).await,
         "remove"     | "rm"              => cmd_remove(&rest, false).await,
         "upgrade"    | "up"              => cmd_upgrade(&rest, false, &flags).await,
         "autoremove" | "ar"              => cmd_autoremove(false).await,
+
+        // ── Index ─────────────────────────────────────────────
         "sync"       | "ref" | "update"  => cmd_sync().await,
+
+        // ── Self-update ───────────────────────────────────────
+        "self-update" | "selfupdate"     => cmd_self_update().await,
+
+        // ── Query ─────────────────────────────────────────────
         "search"     | "se"              => cmd_search(&rest, &flags),
         "info"                           => cmd_info(&rest, &flags),
         "list"       | "ls"              => cmd_list(&rest),
+
+        // ── Status / history ──────────────────────────────────
         "status"     | "st"              => cmd_status(),
         "history"    | "hi"              => cmd_history(),
+
+        // ── Generations ───────────────────────────────────────
         "gen"                            => cmd_gen(&rest).await,
         "rollback"   | "rb"              => cmd_rollback(),
         "diff"                           => cmd_diff(&rest),
+
+        // ── Pending ───────────────────────────────────────────
         "pending"                        => cmd_pending(&rest),
+
+        // ── Export / import ───────────────────────────────────
         "export"                         => cmd_export(&rest),
-        "import"                         => cmd_import(&rest).await,
+        "import"                         => cmd_import_pkg(&rest).await,
+
+        // ── Key management ────────────────────────────────────
         "key"                            => cmd_key(&rest).await,
+
+        // ── Maintenance ───────────────────────────────────────
         "gc"                             => cmd_gc(&rest),
         "clean"                          => cmd_clean(),
         "init"                           => cmd_init(&rest),
-        "_activate"                      => cmd_activate_internal(),
         "relink"                         => cmd_relink(),
+
+        // ── Graphical store ───────────────────────────────────
         "store"                          => cmd_store(),
 
-        "help" | "--help" | "-h" | "" => { print_help(); Ok(()) }
-        "version" | "--version"       => {
-            println!(
-                "  {} {}  {}",
-                "⬡ hammer".bright_cyan().bold(),
-                     env!("CARGO_PKG_VERSION").bold(),
-                     "Apache-2.0".dimmed()
-            );
-            Ok(())
-        }
         other => {
             eprintln!("  Unknown command: '{}'. Try `hammer help`.", other);
             process::exit(1);
@@ -138,21 +175,17 @@ async fn cmd_install(args: &[String], pre_confirmed: bool, flags: &GlobalFlags) 
         bail!("Usage: hammer install <package...> [-y] [--arch=ARCH] [--no-recommends]");
     }
 
-    let target_arch = flags
-    .arch.as_ref()
-    .map(|a| userenv::normalise_arch(a))
-    .transpose()?
-    .unwrap_or_else(detect_arch);
+    let target_arch = flags.arch.as_ref()
+        .map(|a| userenv::normalise_arch(a)).transpose()?
+        .unwrap_or_else(detect_arch);
 
     ui::print_header();
     let db    = InstalledDb::open()?;
     let cache = PackageCache::load_for_arch(&target_arch)?;
 
     if flags.arch.is_some() && !userenv::is_native_arch(&target_arch) {
-        println!(
-            "  {} Cross-arch: installing {} packages on {} host",
-            "⚡".yellow().bold(), target_arch.bold(), detect_arch().dimmed()
-        );
+        println!("  {} Cross-arch: installing {} packages on {} host",
+                 "⚡".yellow().bold(), target_arch.bold(), detect_arch().dimmed());
     }
 
     let solver = Solver::new(&cache, &db);
@@ -171,9 +204,7 @@ async fn cmd_install(args: &[String], pre_confirmed: bool, flags: &GlobalFlags) 
     let ctx     = TransactionContext::system(&plan, &db, &names, false);
     let gen_num = execute_transaction(ctx, &note).await?;
 
-    if let Ok(gens_db) = GenerationsDb::load() {
-        let _ = grub::update_grub(&gens_db);
-    }
+    if let Ok(gens_db) = GenerationsDb::load() { let _ = grub::update_grub(&gens_db); }
     ui::print_pending_notice(gen_num);
     Ok(())
 }
@@ -210,7 +241,7 @@ async fn cmd_remove(args: &[String], pre_confirmed: bool) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  upgrade
+//  upgrade  — Debian packages + HackerOS .hk tools + self
 // ─────────────────────────────────────────────────────────────
 
 async fn cmd_upgrade(args: &[String], pre_confirmed: bool, flags: &GlobalFlags) -> Result<()> {
@@ -219,32 +250,59 @@ async fn cmd_upgrade(args: &[String], pre_confirmed: bool, flags: &GlobalFlags) 
     ui::print_header();
 
     let arch   = flags.arch.as_ref()
-    .map(|a| userenv::normalise_arch(a)).transpose()?
-    .unwrap_or_else(detect_arch);
+        .map(|a| userenv::normalise_arch(a)).transpose()?
+        .unwrap_or_else(detect_arch);
     let db     = InstalledDb::open()?;
     let cache  = PackageCache::load_for_arch(&arch)?;
     let solver = Solver::new(&cache, &db);
     let plan   = if pkgs.is_empty() { solver.resolve_upgrade()? }
-    else { solver.resolve_install(&pkgs, false)? };
+                 else { solver.resolve_install(&pkgs, false)? };
 
-    if plan.is_empty() {
-        println!("  {} All packages up to date.", "✔".bright_green());
-        return Ok(());
+    // ── Debian packages ───────────────────────────────────────
+    if !plan.is_empty() {
+        ui::deps_resolved();
+        ui::print_transaction_table(&plan, &arch);
+        ui::print_transaction_summary(&plan);
+        if !yes && !ui::confirm("Proceed with upgrade?")? {
+            println!("  Aborted."); return Ok(());
+        }
+        let explicit: Vec<String> = plan.to_upgrade.iter().map(|p| p.name.clone()).collect();
+        let ctx     = TransactionContext::system(&plan, &db, &explicit, true);
+        let gen_num = execute_transaction(ctx, "upgrade").await?;
+        if let Ok(gens_db) = GenerationsDb::load() { let _ = grub::update_grub(&gens_db); }
+        ui::print_pending_notice(gen_num);
+    } else {
+        println!("  {} All Debian packages up to date.", "✔".bright_green());
     }
 
-    ui::deps_resolved();
-    ui::print_transaction_table(&plan, &arch);
-    ui::print_transaction_summary(&plan);
-    if !yes && !ui::confirm("Proceed with upgrade?")? {
-        println!("  Aborted."); return Ok(());
+    // ── HackerOS .hk tools ────────────────────────────────────
+    let client = crate::download::HttpClient::new();
+    hk_tools::update_all_tools(&client).await?;
+
+    // ── Self-update check ─────────────────────────────────────
+    println!(
+        "  {}  Checking for hammer self-update…",
+        "⬡".cyan().bold()
+    );
+    match selfupdate::check_for_update(&client).await {
+        Ok(Some(new_ver)) => {
+            println!(
+                "  {} New hammer version available: {}",
+                "↑".yellow().bold(), new_ver.bright_cyan()
+            );
+            println!(
+                "  Run {} to update.",
+                "hammer self-update".cyan()
+            );
+        }
+        Ok(None) => {
+            println!("  {} hammer is up to date.", "✔".bright_green());
+        }
+        Err(e) => {
+            println!("  {} Self-update check failed: {}", "!".yellow(), e);
+        }
     }
 
-    let explicit: Vec<String> = plan.to_upgrade.iter().map(|p| p.name.clone()).collect();
-    let ctx     = TransactionContext::system(&plan, &db, &explicit, true);
-    let gen_num = execute_transaction(ctx, "upgrade").await?;
-
-    if let Ok(gens_db) = GenerationsDb::load() { let _ = grub::update_grub(&gens_db); }
-    ui::print_pending_notice(gen_num);
     Ok(())
 }
 
@@ -285,25 +343,35 @@ async fn cmd_sync() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  self-update
+// ─────────────────────────────────────────────────────────────
+
+async fn cmd_self_update() -> Result<()> {
+    ui::print_header();
+    let client = crate::download::HttpClient::new();
+    selfupdate::self_update(&client).await
+}
+
+// ─────────────────────────────────────────────────────────────
 //  search
 // ─────────────────────────────────────────────────────────────
 
 fn cmd_search(args: &[String], flags: &GlobalFlags) -> Result<()> {
     let installed_only = has_flag(args, "--installed");
     let query: String  = args.iter().filter(|a| !a.starts_with('-'))
-    .cloned().collect::<Vec<_>>().join(" ");
+        .cloned().collect::<Vec<_>>().join(" ");
     if query.is_empty() { bail!("Usage: hammer search <query> [--installed] [--arch=ARCH]"); }
 
     let arch  = flags.arch.as_ref()
-    .map(|a| userenv::normalise_arch(a)).transpose()?
-    .unwrap_or_else(detect_arch);
+        .map(|a| userenv::normalise_arch(a)).transpose()?
+        .unwrap_or_else(detect_arch);
     let db    = InstalledDb::open()?;
     let cache = PackageCache::load_for_arch(&arch)?;
 
     let mut results: Vec<_> = cache.search(&query)
-    .into_iter()
-    .filter(|p| !installed_only || db.is_installed(&p.name))
-    .collect();
+        .into_iter()
+        .filter(|p| !installed_only || db.is_installed(&p.name))
+        .collect();
     results.sort_by(|a, b| a.name.cmp(&b.name));
 
     ui::print_search_header(&query, results.len());
@@ -320,8 +388,8 @@ fn cmd_search(args: &[String], flags: &GlobalFlags) -> Result<()> {
 fn cmd_info(args: &[String], flags: &GlobalFlags) -> Result<()> {
     let name = args.first().ok_or_else(|| anyhow::anyhow!("Usage: hammer info <package>"))?;
     let arch  = flags.arch.as_ref()
-    .map(|a| userenv::normalise_arch(a)).transpose()?
-    .unwrap_or_else(detect_arch);
+        .map(|a| userenv::normalise_arch(a)).transpose()?
+        .unwrap_or_else(detect_arch);
     let db    = InstalledDb::open()?;
     let cache = PackageCache::load_for_arch(&arch)?;
 
@@ -347,21 +415,21 @@ fn cmd_list(args: &[String]) -> Result<()> {
     if installed_only || upgrades_only {
         for inst in db.list_all()? {
             let new_ver = cache.get(&inst.name)
-            .filter(|av| crate::package::version_cmp(&av.version, &inst.version)
-            == std::cmp::Ordering::Greater)
-            .map(|av| av.version.as_str());
+                .filter(|av| crate::package::version_cmp(&av.version, &inst.version)
+                    == std::cmp::Ordering::Greater)
+                .map(|av| av.version.as_str());
             if upgrades_only && new_ver.is_none() { continue; }
             let repo = cache.get(&inst.name)
-            .and_then(|p| p.repo_base_uri.as_deref())
-            .and_then(|u| u.split('/').last())
-            .unwrap_or("installed");
+                .and_then(|p| p.repo_base_uri.as_deref())
+                .and_then(|u| u.split('/').last())
+                .unwrap_or("installed");
             ui::print_list_entry(&inst.name, &inst.version, &inst.architecture, true, repo, new_ver);
         }
     } else {
         for pkg in cache.all_packages() {
             let inst = db.is_installed(&pkg.name);
             let repo = pkg.repo_base_uri.as_deref()
-            .and_then(|u| u.split('/').last()).unwrap_or("");
+                .and_then(|u| u.split('/').last()).unwrap_or("");
             ui::print_list_entry(&pkg.name, &pkg.version, &pkg.architecture, inst, repo, None);
         }
     }
@@ -379,6 +447,18 @@ fn cmd_status() -> Result<()> {
     if let Some(boot_gen) = grub::read_boot_gen() {
         println!("  {:<26} gen-{}", "Booted with:".bold(), boot_gen.to_string().cyan().bold());
     }
+
+    // Show HackerOS .hk tools
+    let tools = hk_tools::list_tools();
+    if !tools.is_empty() {
+        println!();
+        println!("  {}", "HackerOS tools:".bold());
+        for (name, ver, desc) in &tools {
+            let desc_short: String = desc.chars().take(40).collect();
+            println!("    {} {} {}  {}",
+                     "·".dimmed(), name.bold(), ver.cyan(), desc_short.dimmed());
+        }
+    }
     Ok(())
 }
 
@@ -394,12 +474,11 @@ fn cmd_history() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  diff  — fix: use slice indexing instead of .as_slice()
+//  diff
 // ─────────────────────────────────────────────────────────────
 
 fn cmd_diff(args: &[String]) -> Result<()> {
     let gens_db = GenerationsDb::load()?;
-
     let (a, b) = if args.is_empty() {
         let cur     = gens_db.current;
         let pending = gens_db.pending.ok_or_else(|| {
@@ -408,16 +487,15 @@ fn cmd_diff(args: &[String]) -> Result<()> {
         (cur, pending)
     } else if args.len() == 1 {
         let n: u32 = args[0].parse()
-        .map_err(|_| anyhow::anyhow!("'{}' is not a generation number", args[0]))?;
+            .map_err(|_| anyhow::anyhow!("'{}' is not a generation number", args[0]))?;
         (n, gens_db.current)
     } else {
         let na: u32 = args[0].parse()
-        .map_err(|_| anyhow::anyhow!("'{}' is not a generation number", args[0]))?;
+            .map_err(|_| anyhow::anyhow!("'{}' is not a generation number", args[0]))?;
         let nb: u32 = args[1].parse()
-        .map_err(|_| anyhow::anyhow!("'{}' is not a generation number", args[1]))?;
+            .map_err(|_| anyhow::anyhow!("'{}' is not a generation number", args[1]))?;
         (na, nb)
     };
-
     let diff = compute_diff(a, b, &gens_db)?;
     ui::print_diff(&diff);
     Ok(())
@@ -435,8 +513,8 @@ async fn cmd_gen(args: &[String]) -> Result<()> {
         }
         "switch" => {
             let n: u32 = args.get(1)
-            .ok_or_else(|| anyhow::anyhow!("Usage: hammer gen switch <N>"))?
-            .parse()?;
+                .ok_or_else(|| anyhow::anyhow!("Usage: hammer gen switch <N>"))?
+                .parse()?;
             cmd_gen_switch(n)?;
         }
         other => bail!("Unknown gen subcommand: '{}'. Try: list, switch", other),
@@ -447,7 +525,7 @@ async fn cmd_gen(args: &[String]) -> Result<()> {
 fn cmd_gen_switch(n: u32) -> Result<()> {
     let gens_db = GenerationsDb::load()?;
     let gen = gens_db.get(n)
-    .ok_or_else(|| anyhow::anyhow!("Generation {} not found.", n))?.clone();
+        .ok_or_else(|| anyhow::anyhow!("Generation {} not found.", n))?.clone();
     println!("  Switching to gen-{}…", n);
     profile::switch_active(&gen)?;
     let mut gens_db = GenerationsDb::load()?;
@@ -456,8 +534,7 @@ fn cmd_gen_switch(n: u32) -> Result<()> {
     clear_pending().ok();
     gens_db.save()?;
     let _ = grub::update_grub(&gens_db);
-    println!("  {} Now running gen-{}. ldconfig + alternatives updated.", "✔".bright_green(), n);
-    println!("  {} For full activation of systemd units, reboot.", "·".dimmed());
+    println!("  {} Now running gen-{}.", "✔".bright_green(), n);
     Ok(())
 }
 
@@ -467,20 +544,19 @@ fn cmd_gen_switch(n: u32) -> Result<()> {
 
 fn cmd_rollback() -> Result<()> {
     let gens_db = GenerationsDb::load()?;
-    let mut prev_gens: Vec<_> = gens_db.generations.iter()
-    .filter(|g| g.number < gens_db.current).collect();
-    prev_gens.sort_by(|a, b| b.number.cmp(&a.number));
-    let prev = prev_gens.first().ok_or_else(|| anyhow::anyhow!("No previous generation."))?;
-
-    println!("  Rolling back: gen-{} → gen-{}…", gens_db.current, prev.number);
-    profile::switch_active(prev)?;
+    let mut prev: Vec<_> = gens_db.generations.iter()
+        .filter(|g| g.number < gens_db.current).collect();
+    prev.sort_by(|a, b| b.number.cmp(&a.number));
+    let p = prev.first().ok_or_else(|| anyhow::anyhow!("No previous generation."))?;
+    println!("  Rolling back: gen-{} → gen-{}…", gens_db.current, p.number);
+    profile::switch_active(p)?;
     let mut gens_db = GenerationsDb::load()?;
-    gens_db.current = prev.number;
+    gens_db.current = p.number;
     gens_db.pending = None;
     clear_pending().ok();
     gens_db.save()?;
     let _ = grub::update_grub(&gens_db);
-    println!("  {} Rolled back to gen-{}.", "✔".bright_green(), prev.number);
+    println!("  {} Rolled back to gen-{}.", "✔".bright_green(), p.number);
     Ok(())
 }
 
@@ -496,8 +572,8 @@ fn cmd_pending(args: &[String]) -> Result<()> {
             match read_pending_gen() {
                 None => println!("  {} No pending changes.", "·".dimmed()),
                 Some(n) => {
-                    println!();
-                    println!("  {} Pending: {}", "⬡".bright_yellow().bold(),
+                    println!("\n  {} Pending: {}",
+                             "⬡".bright_yellow().bold(),
                              format!("gen-{}", n).bold().bright_yellow());
                     if let Some(gen) = gens_db.get(n) {
                         if let Some(ref note) = gen.note {
@@ -505,8 +581,7 @@ fn cmd_pending(args: &[String]) -> Result<()> {
                         }
                         println!("  Packages  : {}", gen.package_count());
                     }
-                    println!();
-                    println!("  Will activate on next reboot.");
+                    println!("\n  Will activate on next reboot.");
                     println!("  Diff:    {}", "hammer diff".cyan());
                     println!("  Cancel:  {}", "hammer pending cancel".cyan());
                 }
@@ -537,58 +612,47 @@ fn cmd_pending_apply_live() -> Result<()> {
         Some(n) => n,
         None => { println!("  {} No pending changes.", "·".dimmed()); return Ok(()); }
     };
-
     let gens_db = GenerationsDb::load()?;
     let gen = gens_db.get(pending_num)
-    .ok_or_else(|| anyhow::anyhow!("Pending gen not in DB"))?;
-
+        .ok_or_else(|| anyhow::anyhow!("Pending gen not in DB"))?;
     let current_pkgs: std::collections::HashSet<String> = gens_db.current_gen()
-    .map(|g| g.packages.iter().map(|p| p.name.clone()).collect())
-    .unwrap_or_default();
-
+        .map(|g| g.packages.iter().map(|p| p.name.clone()).collect())
+        .unwrap_or_default();
     let new_entries: Vec<crate::store::StoreEntry> = gen.packages.iter()
-    .filter(|p| !current_pkgs.contains(&p.name))
-    .filter_map(|p| {
-        let path = std::path::PathBuf::from(crate::store::STORE_DIR)
-        .join(format!("{}-{}-{}", p.name, p.version, p.store_hash));
-        if path.exists() {
-            Some(crate::store::StoreEntry {
-                name: p.name.clone(), version: p.version.clone(),
-                 hash: p.store_hash.clone(), path,
-            })
-        } else { None }
-    })
-    .collect();
+        .filter(|p| !current_pkgs.contains(&p.name))
+        .filter_map(|p| {
+            let path = std::path::PathBuf::from(crate::store::STORE_DIR)
+                .join(format!("{}-{}-{}", p.name, p.version, p.store_hash));
+            if path.exists() {
+                Some(crate::store::StoreEntry {
+                    name: p.name.clone(), version: p.version.clone(),
+                    hash: p.store_hash.clone(), path,
+                })
+            } else { None }
+        }).collect();
 
     let all_files = livepatch::collect_files(&new_entries);
     let analysis  = livepatch::analyse(&all_files);
-
     if !analysis.can_live_patch {
         println!("  {} Cannot apply live — reboot required.", "✗".red().bold());
         println!("  Reason(s): {}", analysis.reboot_reasons.join(", ").yellow());
         return Ok(());
     }
-
     let active = std::path::PathBuf::from(crate::store::ACTIVE_LINK);
     let result = livepatch::apply_live(&new_entries, &active)?;
-
     profile::switch_active(gen)?;
     let mut gens_db = GenerationsDb::load()?;
     gens_db.current = pending_num;
     gens_db.pending = None;
     gens_db.save()?;
     clear_pending()?;
-
     println!("  {} Live patch applied ({} files updated).",
              "✔".bright_green().bold(), result.updated_files.to_string().bold());
-    for e in &result.errors {
-        println!("    {} {}", "·".yellow(), e.as_str().dimmed());
-    }
     Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────
-//  export / import
+//  export / import (package store archives)
 // ─────────────────────────────────────────────────────────────
 
 fn cmd_export(args: &[String]) -> Result<()> {
@@ -598,14 +662,14 @@ fn cmd_export(args: &[String]) -> Result<()> {
     let gens_db = GenerationsDb::load()?;
     let gen_num = gens_db.current;
     let gen = gens_db.current_gen()
-    .ok_or_else(|| anyhow::anyhow!("No current generation to export"))?;
+        .ok_or_else(|| anyhow::anyhow!("No current generation to export"))?;
 
     let manifest = serde_json::json!({
         "hammer_version": env!("CARGO_PKG_VERSION"),
-                                     "exported_at":    chrono::Utc::now().to_rfc3339(),
-                                     "generation":     gen_num,
-                                     "packages":       gen.packages,
-                                     "note":           gen.note,
+        "exported_at":    chrono::Utc::now().to_rfc3339(),
+        "generation":     gen_num,
+        "packages":       gen.packages,
+        "note":           gen.note,
     });
     let manifest_str = serde_json::to_string_pretty(&manifest)?;
 
@@ -623,11 +687,11 @@ fn cmd_export(args: &[String]) -> Result<()> {
     let mut added = 0usize;
     for pkg in &gen.packages {
         let store_path = std::path::PathBuf::from(crate::store::STORE_DIR)
-        .join(format!("{}-{}-{}", pkg.name, pkg.version, pkg.store_hash));
+            .join(format!("{}-{}-{}", pkg.name, pkg.version, pkg.store_hash));
         if store_path.exists() {
             tar.append_dir_all(
                 format!("store/{}-{}-{}", pkg.name, pkg.version, pkg.store_hash),
-                    &store_path,
+                &store_path,
             )?;
             added += 1;
         }
@@ -638,10 +702,10 @@ fn cmd_export(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_import(args: &[String]) -> Result<()> {
+async fn cmd_import_pkg(args: &[String]) -> Result<()> {
     use std::io::Read;
     let input = args.first()
-    .ok_or_else(|| anyhow::anyhow!("Usage: hammer import <file.tar.gz>"))?;
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer import <file.tar.gz>"))?;
     println!("  {} Importing from {}…", "::".bold().cyan(), input.bold());
 
     let file    = std::fs::File::open(input)?;
@@ -667,7 +731,7 @@ async fn cmd_import(args: &[String]) -> Result<()> {
         let path      = entry.path()?.to_string_lossy().to_string();
         if path.starts_with("store/") {
             let dest = std::path::PathBuf::from(crate::store::STORE_DIR)
-            .join(path.trim_start_matches("store/").trim_start_matches('/'));
+                .join(path.trim_start_matches("store/").trim_start_matches('/'));
             if let Some(parent) = dest.parent() { std::fs::create_dir_all(parent)?; }
             entry.unpack(&dest).ok();
             extracted += 1;
@@ -702,26 +766,29 @@ async fn cmd_key(args: &[String]) -> Result<()> {
             println!("\n  {}", "Trusted GPG keys:".bold());
             println!("  {}", "─".repeat(70).dimmed());
             for key in &db.keys {
-                let fp_short = if key.fingerprint.len() >= 16 {
+                let fp = if key.fingerprint.len() >= 16 {
                     &key.fingerprint[key.fingerprint.len()-16..]
                 } else { &key.fingerprint };
-                println!("  {} {}", fp_short.cyan().bold(), key.name.bold());
+                println!("  {} {}", fp.cyan().bold(), key.name.bold());
                 if let Some(ref email) = key.email { println!("    {}", email.dimmed()); }
                 println!("    Added: {}  Source: {}", key.added_at.dimmed(), key.source.dimmed());
             }
             println!("  {}", "─".repeat(70).dimmed());
         }
         "add" => {
-            let source = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: hammer key add <url|/path/to/key.gpg>"))?;
+            let source = args.get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: hammer key add <url|/path/to/key.gpg>"))?;
             println!("  {} Importing key from {}…", "::".bold().cyan(), source.bold());
             let client = crate::download::HttpClient::new();
             let key    = crate::gpg::import_key(source, &client).await?;
-            let fp_short = if key.fingerprint.len() >= 16 { &key.fingerprint[key.fingerprint.len()-16..] }
-            else { &key.fingerprint };
-            println!("  {} Imported: {} ({})", "✔".bright_green(), key.name.bold(), fp_short.cyan());
+            let fp = if key.fingerprint.len() >= 16 {
+                &key.fingerprint[key.fingerprint.len()-16..]
+            } else { &key.fingerprint };
+            println!("  {} Imported: {} ({})", "✔".bright_green(), key.name.bold(), fp.cyan());
         }
         "remove" | "rm" => {
-            let fp = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: hammer key remove <fingerprint>"))?;
+            let fp = args.get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: hammer key remove <fingerprint>"))?;
             let mut db = crate::gpg::KeyringDb::load()?;
             if db.remove(fp) {
                 db.save()?;
@@ -742,15 +809,12 @@ async fn cmd_key(args: &[String]) -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  gc
+//  gc / clean / init / relink / store
 // ─────────────────────────────────────────────────────────────
 
 fn cmd_gc(args: &[String]) -> Result<()> {
-    let keep: u32 = args.iter()
-    .find(|a| a.starts_with("--keep"))
-    .and_then(|a| a.split('=').nth(1))
-    .and_then(|v| v.parse().ok())
-    .unwrap_or(3);
+    let keep: u32 = args.iter().find(|a| a.starts_with("--keep"))
+        .and_then(|a| a.split('=').nth(1)).and_then(|v| v.parse().ok()).unwrap_or(3);
     let yes = has_flag(args, "-y");
 
     let mut gens_db = GenerationsDb::load()?;
@@ -758,8 +822,8 @@ fn cmd_gc(args: &[String]) -> Result<()> {
     let pending     = read_pending_gen();
 
     let mut candidates: Vec<_> = gens_db.generations.iter()
-    .filter(|g| g.number != active && Some(g.number) != pending)
-    .cloned().collect();
+        .filter(|g| g.number != active && Some(g.number) != pending)
+        .cloned().collect();
     candidates.sort_by(|a, b| b.number.cmp(&a.number));
     let to_delete = candidates[keep.min(candidates.len() as u32) as usize..].to_vec();
 
@@ -776,18 +840,15 @@ fn cmd_gc(args: &[String]) -> Result<()> {
     gens_db.generations.retain(|g| !delete_nums.contains(&g.number));
 
     let referenced: std::collections::HashSet<String> = gens_db.generations.iter()
-    .flat_map(|g| g.packages.iter().map(|p| format!("{}-{}-{}", p.name, p.version, p.store_hash)))
-    .collect();
+        .flat_map(|g| g.packages.iter()
+            .map(|p| format!("{}-{}-{}", p.name, p.version, p.store_hash)))
+        .collect();
     Store::gc_unreferenced(&referenced)?;
     gens_db.save()?;
     let _ = grub::update_grub(&gens_db);
     println!("  {} Garbage collection complete.", "✔".bright_green());
     Ok(())
 }
-
-// ─────────────────────────────────────────────────────────────
-//  clean / init / _activate / relink / store
-// ─────────────────────────────────────────────────────────────
 
 fn cmd_clean() -> Result<()> {
     let removed = crate::download::clean_cache()?;
@@ -798,19 +859,16 @@ fn cmd_clean() -> Result<()> {
 fn cmd_init(args: &[String]) -> Result<()> {
     let user_mode = has_flag(args, "--user");
     let suite_arg = args.iter().find(|a| a.starts_with("--suite="))
-    .and_then(|a| a.strip_prefix("--suite=").map(|s| s.to_string()));
+        .and_then(|a| a.strip_prefix("--suite=").map(|s| s.to_string()));
     let suite = suite_arg.as_deref().unwrap_or("bookworm");
 
     if user_mode {
         let env      = UserEnv::current()?;
         env.init()?;
         let modified = userenv::install_shell_rc(&env)?;
-        println!("  {} User hammer environment initialised at {}",
-                 "✔".bright_green(), env.hammer_dir.display().to_string().cyan());
+        println!("  {} User hammer environment initialised.", "✔".bright_green());
         if !modified.is_empty() {
-            println!("  {} Shell integration added to:", "·".dimmed());
             for f in &modified { println!("       {}", f.as_str().dimmed()); }
-            println!("  Reload your shell or run:");
             println!("       {}", "source ~/.hammer/env.sh".cyan());
         }
         return Ok(());
@@ -824,12 +882,14 @@ fn cmd_init(args: &[String]) -> Result<()> {
     }
 
     for dir in &["/hammer/store", "/hammer/profiles", "/hammer/db", "/hammer/db/postinst",
-        "/etc/hammer", "/var/cache/hammer/archives", "/var/lib/hammer/lists", "/var/log"] {
-            std::fs::create_dir_all(dir)?;
-            println!("  {} {}", "·".dimmed(), dir.dimmed());
-        }
+                 "/etc/hammer", "/etc/hammer/HackerOS",
+                 "/var/cache/hammer/archives", "/var/lib/hammer/lists",
+                 "/usr/lib/hammer", "/usr/lib/HackerOS/hammer", "/var/log"] {
+        std::fs::create_dir_all(dir)?;
+        println!("  {} {}", "·".dimmed(), dir.dimmed());
+    }
 
-        let arch = detect_arch();
+    let arch = detect_arch();
     let sources_path = std::path::Path::new(crate::repo::SOURCES_HK);
     if !sources_path.exists() {
         crate::repo::SourcesList::write_default(&arch, suite)?;
@@ -844,7 +904,7 @@ fn cmd_init(args: &[String]) -> Result<()> {
 
     let gens_db = GenerationsDb::load()?;
     if let Err(e) = grub::update_grub(&gens_db) {
-        println!("  {} GRUB integration: {} (non-fatal)", "·".yellow(), e.to_string().dimmed());
+        println!("  {} GRUB: {} (non-fatal)", "·".yellow(), e.to_string().dimmed());
     } else {
         println!("  {} GRUB integration installed", "✔".green());
     }
@@ -855,9 +915,58 @@ fn cmd_init(args: &[String]) -> Result<()> {
     println!("    1. {} — add Debian archive key",
              "hammer key add https://ftp-master.debian.org/keys/archive-key-12.gpg".cyan());
     println!("    2. {} — refresh package index", "hammer sync".cyan());
-    println!("    3. {} — install packages",      "hammer install <pkg>".cyan());
+    println!("    3. {} — install packages", "hammer install <pkg>".cyan());
     Ok(())
 }
+
+fn cmd_relink() -> Result<()> {
+    let gens_db    = GenerationsDb::load()?;
+    let active_num = read_active_gen().unwrap_or(gens_db.current);
+    let gen = gens_db.get(active_num)
+        .ok_or_else(|| anyhow::anyhow!("Active generation {} not found", active_num))?.clone();
+
+    println!("  {} Relinking binaries for {}…",
+             "⬡".bright_cyan().bold(), format!("gen-{}", active_num).bold());
+
+    let profile_path = gen.profile_path();
+    if !profile_path.exists() {
+        anyhow::bail!("Profile path does not exist: {}\n  Try: hammer _activate",
+                      profile_path.display());
+    }
+
+    match crate::profile::relink_bins(&profile_path) {
+        Ok((linked, unlinked)) => {
+            println!("  {} Linked: {}  Removed: {}",
+                     "✔".bright_green().bold(),
+                     linked.to_string().bold(),
+                     unlinked.to_string().dimmed());
+            if linked == 0 {
+                println!("  {} No binaries to link.", "·".dimmed());
+            } else {
+                println!("  Packages are now available in PATH.");
+                println!("  If shell still can't find them: {}", "hash -r".cyan());
+            }
+        }
+        Err(e) => anyhow::bail!("relink failed: {}", e),
+    }
+    Ok(())
+}
+
+fn cmd_store() -> Result<()> {
+    let store_bin = "/usr/share/hammer/store";
+    if !std::path::Path::new(store_bin).exists() {
+        bail!("Hammer Store not installed.\n  Expected: {}\n  Install: {}",
+              store_bin.dimmed(), "hammer install hammer-store".cyan());
+    }
+    println!("  {} Launching Hammer Store…", "⬡".bright_cyan().bold());
+    let status = std::process::Command::new(store_bin).status()?;
+    if !status.success() { bail!("hammer-store exited: {}", status); }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  _activate  (boot-time, called by systemd)
+// ─────────────────────────────────────────────────────────────
 
 fn cmd_activate_internal() -> Result<()> {
     println!("hammer: boot activation starting…");
@@ -871,7 +980,6 @@ fn cmd_activate_internal() -> Result<()> {
             Ok(()) => {}
             Err(e) => {
                 eprintln!("hammer: BOOT INTEGRITY FAILED: {}", e);
-                eprintln!("hammer: refusing to activate potentially tampered generation");
                 std::process::exit(1);
             }
         }
@@ -880,58 +988,6 @@ fn cmd_activate_internal() -> Result<()> {
     ui::print_activation_result(&result);
     if !result.scripts_failed.is_empty() {
         eprintln!("hammer: WARNING: postinst failed for: {}", result.scripts_failed.join(", "));
-    }
-    Ok(())
-}
-
-fn cmd_relink() -> Result<()> {
-    let gens_db    = GenerationsDb::load()?;
-    let active_num = read_active_gen().unwrap_or(gens_db.current);
-    let gen = gens_db.get(active_num)
-    .ok_or_else(|| anyhow::anyhow!("Active generation {} not found in DB", active_num))?.clone();
-
-    println!("  {} Relinking binaries for {}…",
-             "⬡".bright_cyan().bold(), format!("gen-{}", active_num).bold());
-
-    let profile_path = gen.profile_path();
-    if !profile_path.exists() {
-        anyhow::bail!("Profile path does not exist: {}\n  Try: hammer _activate", profile_path.display());
-    }
-
-    match crate::profile::relink_bins(&profile_path) {
-        Ok((linked, unlinked)) => {
-            println!("  {} Linked:   {}", "✔".bright_green().bold(), linked.to_string().bold());
-            if unlinked > 0 {
-                println!("  {} Removed:  {} (stale symlinks cleaned)", "·".dimmed(), unlinked.to_string().dimmed());
-            }
-            if linked == 0 {
-                println!("  {} No binaries to link (profile may be empty).", "·".dimmed());
-            } else {
-                println!("  Installed packages are now available in PATH.");
-                println!("  If the shell still can't find them, run: {}", "hash -r".cyan());
-            }
-        }
-        Err(e) => anyhow::bail!("relink failed: {}", e),
-    }
-    Ok(())
-}
-
-/// `hammer store` — launches the graphical store (Vala app)
-fn cmd_store() -> Result<()> {
-    let store_bin = "/usr/share/hammer/store";
-    if !std::path::Path::new(store_bin).exists() {
-        bail!(
-            "Hammer Store is not installed.\n  \
-Expected: {}\n  \
-Install it with: {}",
-store_bin.dimmed(),
-              "hammer install hammer-store".cyan()
-        );
-    }
-    println!("  {} Launching Hammer Store…", "⬡".bright_cyan().bold());
-    let status = std::process::Command::new(store_bin).status()?;
-    if !status.success() {
-        bail!("hammer-store exited with status: {}", status);
     }
     Ok(())
 }
@@ -946,8 +1002,8 @@ async fn cmd_user_install(env: &UserEnv, args: &[String], flags: &GlobalFlags) -
     if names.is_empty() { bail!("Usage: hammer --user install <package...>"); }
 
     let arch   = flags.arch.as_ref()
-    .map(|a| userenv::normalise_arch(a)).transpose()?
-    .unwrap_or_else(detect_arch);
+        .map(|a| userenv::normalise_arch(a)).transpose()?
+        .unwrap_or_else(detect_arch);
     let cache  = PackageCache::load_for_arch(&arch)?;
     let db_path = env.db_path.to_string_lossy().to_string();
     let db     = InstalledDb::open_at(&db_path)?;
@@ -996,7 +1052,6 @@ async fn cmd_user_install(env: &UserEnv, args: &[String], flags: &GlobalFlags) -
 
     println!("  {} Installed {} package(s) to user profile.",
              "✔".bright_green(), store_entries.len().to_string().bold());
-    println!("  {} Activate in current shell:", "·".dimmed());
     println!("       {}", "source ~/.hammer/env.sh".cyan());
     Ok(())
 }
@@ -1028,7 +1083,6 @@ fn cmd_user_list(env: &UserEnv) -> Result<()> {
 fn cmd_user_status(env: &UserEnv) -> Result<()> {
     println!("  {}", "User hammer environment".bold());
     println!("  {:<26} {}", "Location:".bold(), env.hammer_dir.display());
-    println!("  {:<26} {}", "Active profile:".bold(), env.active_path().display());
     let active = env.active_link.exists() || env.active_link.symlink_metadata().is_ok();
     println!("  {:<26} {}", "Initialised:".bold(),
              if active { "yes".bright_green().to_string() }
@@ -1053,62 +1107,55 @@ fn cmd_user_shell_init(env: &UserEnv) -> Result<()> {
 
 fn print_help() {
     println!();
-    println!("  {} {}  {}", "⬡ hammer".bold().bright_cyan(),
-             format!("v{}", env!("CARGO_PKG_VERSION")).dimmed(), "Apache-2.0".dimmed());
-    println!("  Atomic Debian package manager — rpm-ostree model, changes after reboot.");
+    println!("  {} {}  {}",
+             "⬡ hammer".bold().bright_cyan(),
+             format!("v{}", env!("CARGO_PKG_VERSION")).dimmed(),
+             "Apache-2.0".dimmed());
+    println!("  Atomic Debian package manager — HackerOS");
     println!();
     println!("  {}", "Package management:".bold());
     println!("    {}  install <pkg...> [-y] [--arch=ARCH] [--no-recommends]", "install".cyan());
     println!("    {}   remove <pkg...> [-y]", "remove".cyan());
-    println!("    {}  upgrade [pkg...] [-y]", "upgrade".cyan());
+    println!("    {}  upgrade [pkg...] [-y]  (also updates .hk tools + checks self-update)", "upgrade".cyan());
     println!("    {}           remove unused auto-installed packages", "autoremove".cyan());
     println!("    {}               refresh package index", "sync".cyan());
+    println!("    {}         update hammer itself", "self-update".cyan());
     println!();
     println!("  {}", "Pending changes (applied at next reboot):".bold());
-    println!("    {}           show pending generation", "pending show".cyan());
-    println!("    {}         cancel pending changes", "pending cancel".cyan());
-    println!("    {}     apply live (binary-only changes)", "pending apply-live".cyan());
+    println!("    {}      show / cancel / apply-live", "pending".cyan());
     println!();
     println!("  {}", "Generations & diff:".bold());
-    println!("    {}            list all generations", "gen list".cyan());
-    println!("    {}        switch generation (immediate)", "gen switch <N>".cyan());
+    println!("    {}      list / switch <N>", "gen".cyan());
     println!("    {}              rollback to previous gen", "rollback".cyan());
     println!("    {}               diff current vs pending", "diff".cyan());
-    println!("    {}             diff two generations", "diff <A> <B>".cyan());
     println!();
     println!("  {}", "Export / import:".bold());
-    println!("    {}      export current gen to file", "export [file.tar.gz]".cyan());
-    println!("    {}        import store from file", "import <file.tar.gz>".cyan());
+    println!("    {}      export current gen to archive", "export [file]".cyan());
+    println!("    {}        import store from archive", "import <file>".cyan());
     println!();
-    println!("  {}", "GPG key management:".bold());
-    println!("    {}              list trusted keys", "key list".cyan());
-    println!("    {}  add key from URL or file", "key add <url|file>".cyan());
-    println!("    {}     remove key by fingerprint", "key remove <fp>".cyan());
+    println!("  {}", "GPG keys:".bold());
+    println!("    {}  list / add <url> / remove <fp>", "key".cyan());
     println!();
     println!("  {}", "Query / maintenance:".bold());
     println!("    {}       search <query> [--installed]", "search".cyan());
     println!("    {}         info <package>", "info".cyan());
     println!("    {}         list [--installed] [--upgrades]", "list".cyan());
-    println!("    {}           show system status + GRUB info", "status".cyan());
+    println!("    {}           show system status", "status".cyan());
     println!("    {}          show transaction history", "history".cyan());
     println!("    {}       gc [--keep N] [-y]", "gc".cyan());
     println!("    {}            clean download cache", "clean".cyan());
     println!("    {}     init [--suite=trixie] [--user]", "init".cyan());
-    println!("    {}        relink binaries to PATH (repair)", "relink".cyan());
+    println!("    {}        relink binaries to PATH", "relink".cyan());
     println!();
     println!("  {}", "Graphical store:".bold());
-    println!("    {}              open graphical package store", "store".cyan());
+    println!("    {}              open graphical package browser", "store".cyan());
     println!();
-    println!("  {}", "User packages (--user, activates immediately):".bold());
+    println!("  {}", "User packages (--user):".bold());
     println!("    {} {}  install to ~/.hammer/", "--user".yellow(), "install <pkg>".cyan());
-    println!("    {} {}     init user environment", "--user".yellow(), "init".cyan());
-    println!();
-    println!("  {}", "Cross-arch:".bold());
-    println!("    {} {}  install arm64 pkg on amd64 host", "--arch=arm64".yellow(), "install <pkg>".cyan());
     println!();
     println!("  {}", "Sources list:".bold());
-    println!("    Config: {}  (format: .hk)", crate::repo::SOURCES_HK.cyan());
-    println!("    Docs:   {}", "https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hk.html".dimmed());
+    println!("    Config: {}  (format: .hk)", SOURCES_HK.cyan());
+    println!("    Tools:  {}", "/etc/hammer/HackerOS/*.hk".cyan());
     println!();
 }
 
