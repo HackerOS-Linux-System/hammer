@@ -1,1 +1,5 @@
-
+[Hacker-Lang]
+-> releases    => https://github.com/HackerOS-Linux-System/Hacker-Lang/releases
+-> binary      => hl
+-> description => Simple and fast HackerOS programming language for scripting and automation.
+-> hidden      => false
