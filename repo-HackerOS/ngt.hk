@@ -1,1 +1,5 @@
-
+[ngt]
+-> releases    => https://github.com/HackerOS-Linux-System/ngt/releases
+-> binary      => ngt
+-> description => Cli night tool tui tool with cd, mkdir, touch, cp, mv, rm, hedit tools.
+-> hidden      => false
