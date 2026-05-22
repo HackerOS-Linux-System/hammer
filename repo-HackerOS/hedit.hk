@@ -1,1 +1,5 @@
-
+[hedit]
+-> releases    => https://github.com/HackerOS-Linux-System/hedit/releases
+-> binary      => hedit
+-> description => The hedit tool is inspired by nano.
+-> hidden      => false
