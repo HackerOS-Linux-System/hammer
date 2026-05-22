@@ -1,1 +1,5 @@
-
+[HackerOS-Package-Manager]
+-> releases    => https://github.com/HackerOS-Linux-System/HackerOS-Package-Manager/releases
+-> binary      => hpm
+-> description => Package manager for HackerOS (community repository).
+-> hidden      => false
