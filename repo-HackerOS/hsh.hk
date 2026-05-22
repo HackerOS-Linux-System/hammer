@@ -1,1 +1,5 @@
-
+[hsh]
+-> releases    => https://github.com/HackerOS-Linux-System/HackerOS-Shell/releases
+-> binary      => hsh
+-> description => HackerOS Shell.
+-> hidden      => false
