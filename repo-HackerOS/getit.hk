@@ -1,1 +1,5 @@
-
+[getit]
+-> releases    => https://github.com/HackerOS-Linux-System/getit/releases
+-> binary      => getit
+-> description => Download directories from github/gitlab.
+-> hidden      => false
