@@ -3,9 +3,9 @@ name        = "hammer"
 version     = "0.0.1"
 edition     = "2021"
 authors     = ["HackerOS Team <hackeros068@gmail.com>"]
-description = "Atomic Debian package manager — rpm-ostree model, changes after reboot"
+description = "Atomic Debian package manager — HackerOS"
 license     = "Apache-2.0"
-repository  = "https://github.com/HackerOS-Linux-System/hammer/"
+repository  = "https://github.com/HackerOS-Linux-System/hammer"
 
 [[bin]]
 name = "hammer"
@@ -14,7 +14,8 @@ path = "source-code/main.rs"
 [dependencies]
 anyhow          = "1"
 tokio           = { version = "1", features = ["full"] }
-reqwest         = { version = "0.11", default-features = false, features = ["json", "gzip", "deflate", "stream", "rustls-tls"] }
+reqwest         = { version = "0.11", default-features = false, features = [
+                    "json", "gzip", "deflate", "stream", "rustls-tls"] }
 serde           = { version = "1", features = ["derive"] }
 serde_json      = "1"
 toml            = "0.5"
