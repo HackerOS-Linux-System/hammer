@@ -1,1 +1,22 @@
+! HackerOS tool definition — format: .hk
+! Plik opisuje zewnętrzne narzędzie dystrybuowane przez GitHub Releases.
+! hammer automatycznie pobiera, aktualizuje i tworzy wrappersy.
+!
+! Wymagane klucze:
+!   releases   — URL do strony releases na GitHub
+!   binary     — nazwa pliku binarnego w release assets
+!              — można podać kilka: binaries => ["tool", "tool-helper"]
+!              — format z aliasem: "asset-name:wrapper-name"
+!
+! Opcjonalne klucze:
+!   description — krótki opis narzędzia
+!   hidden      — true = wrapper w /usr/lib/hammer/ (nie /usr/local/bin)
+!                 przydatne dla narzędzi deweloperskich / wewnętrznych
 
+! ─── Przykład 1: anvil (publiczne narzędzie) ─────────────────
+
+[anvil]
+-> releases    => https://github.com/org/repo/releases
+-> binary      => name of binary
+-> description => tool description
+-> hidden      => false
