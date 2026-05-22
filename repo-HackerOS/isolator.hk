@@ -1,1 +1,5 @@
-
+[isolator]
+-> releases    => https://github.com/HackerOS-Linux-System/Isolator/releases
+-> binary      => isolator
+-> description => Advanced container system.
+-> hidden      => false
