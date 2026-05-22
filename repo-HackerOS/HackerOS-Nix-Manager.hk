@@ -1,1 +1,5 @@
-
+[HackerOS-Nix-Manager]
+-> releases    => https://github.com/HackerOS-Linux-System/HackerOS-Nix-Manager/releases
+-> binary      => hnm
+-> description => Overlay for nix.
+-> hidden      => false
