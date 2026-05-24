@@ -1,4 +1,3 @@
-// ── pkg/ ──────────────────────────────────────────────────────
 #[path = "pkg/cache.rs"]       mod cache;
 #[path = "pkg/db.rs"]          mod db;
 #[path = "pkg/deb.rs"]         mod deb;
