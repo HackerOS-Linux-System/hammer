@@ -1,8 +1,3 @@
-// SPDX-License-Identifier: Apache-2.0
-// Copyright 2025 HackerOS Team
-//
-// tools/setup.rs — hammer _setup / _import  (live-build hooks only)
-
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use std::path::Path;
