@@ -1,5 +1,5 @@
 [hacker]
 -> releases    => https://github.com/HackerOS-Linux-System/Hacker-CLI-Tool/releases
--> binaries => ["hacker", "HackerOS-Updater", "update-system", "hacker-help", "hacker-docs", "]
+-> binaries => ["hacker", "HackerOS-Updater", "update-system", "hacker-help", "hacker-docs"]
 -> description => HackerOS favorite tool. Install packages, update system, play game, run hackeros apps/scripts.
 -> hidden      => true
