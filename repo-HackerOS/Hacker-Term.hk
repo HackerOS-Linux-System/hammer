@@ -1,1 +1,7 @@
-
+[Hacker-Term]
+-> releases    => https://github.com/HackerOS-Linux-System/Hacker-Term/releases
+-> binary      => Hacker-Term
+-> description => Fast and lightweight terminal emulator for HackerOS.
+-> hidden      => false
+-> is_gui      => true
+-> desktop_file => https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Updates/main/desktop-files/Hacker-Term.desktop
