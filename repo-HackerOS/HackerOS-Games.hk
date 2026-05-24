@@ -1,1 +1,8 @@
-
+[HackerOS-Games]
+-> releases    => https://github.com/HackerOS-Linux-System/HackerOS-Games/releases
+-> binaries    => ["the-racer", "cosmonaut.love", "bit-jump.love", "starblaster", "bark-squadron", "HackerOS-Games"]
+-> description => Collection of games for HackerOS.
+-> hidden      => false
+-> is_gui      => true
+-> desktop_file => https://raw.githubusercontent.com/HackerOS-Linux-System/HackerOS-Updates/main/desktop-files/HackerOS-Games.desktop
+-> dirs        => ["/usr/share/HackerOS/Scripts/HackerOS-Games/:the-racer", "/usr/share/HackerOS/Scripts/HackerOS-Games/:cosmonaut.love", "/usr/share/HackerOS/Scripts/HackerOS-Games/:starblaster", "/usr/share/HackerOS/Scripts/HackerOS-Games/:bit-jump.love", "/usr/share/HackerOS/Scripts/HackerOS-Games/:HackerOS-Games",]
