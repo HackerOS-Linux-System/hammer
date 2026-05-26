@@ -19,14 +19,14 @@ pub async fn cmd_import() -> Result<()> {
     if !dpkg_status.exists() {
         anyhow::bail!(
             "hammer _import: /var/lib/dpkg/status not found.\n\
-             This command is only usable in a live-build hook environment."
+This command is only usable in a live-build hook environment."
         );
     }
 
     println!("  {}  Importing dpkg database into hammer…", "⬡".bright_cyan().bold());
 
     let status_content = std::fs::read_to_string(dpkg_status)
-        .context("Reading /var/lib/dpkg/status")?;
+    .context("Reading /var/lib/dpkg/status")?;
 
     let packages: Vec<Package> = parse_dpkg_status(&status_content);
     println!("  {} Found {} installed packages in dpkg database.",
@@ -46,7 +46,7 @@ pub async fn cmd_import() -> Result<()> {
 
         let hash       = "import";
         let store_path = Path::new(crate::store::STORE_DIR)
-            .join(format!("{}-{}-{}", pkg.name, pkg.version, hash));
+        .join(format!("{}-{}-{}", pkg.name, pkg.version, hash));
 
         if !store_path.exists() {
             if let Err(e) = populate_stub_store(&store_path, &pkg.name) {
@@ -56,9 +56,9 @@ pub async fn cmd_import() -> Result<()> {
 
         store_entries.push(StoreEntry {
             name:    pkg.name.clone(),
-            version: pkg.version.clone(),
-            hash:    hash.to_string(),
-            path:    store_path,
+                           version: pkg.version.clone(),
+                           hash:    hash.to_string(),
+                           path:    store_path,
         });
 
         if let Err(e) = db.record_install(pkg, InstallReason::User, hash, 0) {
@@ -71,7 +71,7 @@ pub async fn cmd_import() -> Result<()> {
     println!("  {}  Composing generation 0 ({} packages)…", "·".dimmed(), imported);
 
     let gen = profile::compose_profile(0, &store_entries, Some("import from dpkg".to_string()))
-        .context("Composing gen-0")?;
+    .context("Composing gen-0")?;
 
     let mut gens_db = GenerationsDb::load()?;
     if gens_db.get(0).is_none() {
@@ -111,8 +111,8 @@ pub async fn cmd_setup() -> Result<()> {
     if !sources_path.exists() {
         anyhow::bail!(
             "hammer _setup: {} not found.\n\
-             Create /etc/hammer/sources-list.hk before running hammer _setup.",
-            crate::repo::SOURCES_HK
+Create /etc/hammer/sources-list.hk before running hammer _setup.",
+crate::repo::SOURCES_HK
         );
     }
     println!("  {} {} found.", "✔".green(), crate::repo::SOURCES_HK);
@@ -175,17 +175,17 @@ pub async fn cmd_setup() -> Result<()> {
 
 fn parse_dpkg_status(content: &str) -> Vec<Package> {
     content.split("\n\n")
-        .filter_map(|block| {
-            let block = block.trim();
-            if block.is_empty() { return None; }
-            let status_ok = block.lines().any(|l| {
-                let l = l.trim();
-                l.starts_with("Status:") && l.contains("install ok installed")
-            });
-            if !status_ok { return None; }
-            Package::parse_block(block)
-        })
-        .collect()
+    .filter_map(|block| {
+        let block = block.trim();
+        if block.is_empty() { return None; }
+        let status_ok = block.lines().any(|l| {
+            let l = l.trim();
+            l.starts_with("Status:") && l.contains("install ok installed")
+        });
+        if !status_ok { return None; }
+        Package::parse_block(block)
+    })
+    .collect()
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -250,10 +250,10 @@ fn remove_apt_dpkg() {
         );
         if std::fs::write(&stub_path, &stub).is_ok() {
             let mut perms = std::fs::metadata(&stub_path)
-                .map(|m| m.permissions())
-                .unwrap_or_else(|_| {
-                    std::os::unix::fs::PermissionsExt::from_mode(0o755)
-                });
+            .map(|m| m.permissions())
+            .unwrap_or_else(|_| {
+                std::os::unix::fs::PermissionsExt::from_mode(0o755)
+            });
             std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
             std::fs::set_permissions(&stub_path, perms).ok();
         }
