@@ -1,19 +1,12 @@
-use anyhow::{bail, Context, Result};
-use hk_parser::{load_hk_file, resolve_interpolations, HkValue};
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
-
-// ─────────────────────────────────────────────────────────────
-//  Paths — sources list uses .hk format
-// ─────────────────────────────────────────────────────────────
+use anyhow::{Context, Result};
+use hk_parser::{load_hk_file, resolve_interpolations};
+use serde::Deserialize;
+use std::path::Path;
 
 pub const SOURCES_HK: &str = "/etc/hammer/sources-list.hk";
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum EntryKind {
-    Deb,
-    DebSrc,
-}
+pub enum EntryKind { Deb, DebSrc }
 
 #[derive(Debug, Clone)]
 pub struct SourceEntry {
@@ -31,48 +24,25 @@ pub struct SourcesList {
     pub entries: Vec<SourceEntry>,
 }
 
-/// All known Debian suites for validation / completion
 pub const KNOWN_SUITES: &[&str] = &[
-    // Stable
-    "bookworm",
-"bookworm-updates",
-"bookworm-security",
-"bookworm-backports",
-// Testing
-"trixie",
-"trixie-updates",
-"trixie-security",
-"trixie-backports",
-// Unstable / experimental
-"sid",
-"unstable",
-"forky",
-"experimental",
-// Release aliases
-"stable",
-"stable-updates",
-"stable-security",
-"stable-backports",
-"testing",
-"testing-updates",
-"testing-security",
-"oldstable",
-"oldstable-security",
+    "bookworm", "bookworm-updates", "bookworm-security", "bookworm-backports",
+"trixie",   "trixie-updates",   "trixie-security",   "trixie-backports",
+"sid",      "unstable",         "forky",              "experimental",
+"stable",   "stable-updates",   "stable-security",    "stable-backports",
+"testing",  "testing-updates",  "testing-security",
+"oldstable","oldstable-security",
 ];
 
 // ─────────────────────────────────────────────────────────────
-//  SourcesList implementation
+//  SourcesList
 // ─────────────────────────────────────────────────────────────
 
 impl SourcesList {
-    /// Load sources from /etc/hammer/sources-list.hk (primary format).
-    /// Falls back to legacy TOML if .hk not found.
     pub fn load() -> Result<Self> {
         let hk_path = Path::new(SOURCES_HK);
         if hk_path.exists() {
             return Self::load_hk(hk_path);
         }
-
         // Legacy TOML fallback
         let toml_path = Path::new("/etc/hammer/repos.toml");
         if toml_path.exists() {
@@ -82,7 +52,6 @@ migrate to /etc/hammer/sources-list.hk"
             );
             return Self::load_legacy_toml(toml_path);
         }
-
         // Last resort: /etc/apt/sources.list
         let mut entries = Vec::new();
         let main = Path::new("/etc/apt/sources.list");
@@ -105,46 +74,25 @@ migrate to /etc/hammer/sources-list.hk"
 
         let mut entries = Vec::new();
 
-        // Each section in the .hk file is one repository block.
-        // Expected structure:
-        //
-        //   [debian-bookworm]
-        //   -> name      => debian-bookworm
-        //   -> baseurl   => http://deb.debian.org/debian
-        //   -> suite     => bookworm
-        //   -> components => ["main", "contrib", "non-free"]
-        //   -> arch      => ["amd64"]
-        //   -> enabled   => true
-        //   -> gpgkey    => https://...   (optional)
-        //   -> type      => deb           (optional, default deb)
-
         for (section_name, section_val) in &config {
-            // skip meta/comment sections
-            if section_name.starts_with('_') || section_name == "meta" {
-                continue;
-            }
+            if section_name.starts_with('_') || section_name == "meta" { continue; }
 
             let map = match section_val.as_map() {
-                Ok(m) => m,
+                Ok(m)  => m,
                 Err(_) => continue,
             };
 
-            let enabled = map
-            .get("enabled")
+            let enabled = map.get("enabled")
             .and_then(|v| v.as_bool().ok())
             .unwrap_or(true);
+            if !enabled { continue; }
 
-            if !enabled {
-                continue;
-            }
-
-            let kind = match map
-            .get("type")
+            let kind = match map.get("type")
             .and_then(|v| v.as_string().ok())
             .as_deref()
             {
                 Some("deb-src") => EntryKind::DebSrc,
-                _ => EntryKind::Deb,
+                _               => EntryKind::Deb,
             };
 
             let uri = match map.get("baseurl").and_then(|v| v.as_string().ok()) {
@@ -182,24 +130,15 @@ migrate to /etc/hammer/sources-list.hk"
             .unwrap_or_default();
 
             let signed_by = map.get("gpgkey").and_then(|v| v.as_string().ok());
-
-            let name = map
-            .get("name")
+            let name = map.get("name")
             .and_then(|v| v.as_string().ok())
             .or_else(|| Some(section_name.clone()));
 
             entries.push(SourceEntry {
-                kind,
-                uri,
-                suite,
-                components,
-                arches,
-                signed_by,
-                enabled: true,
-                name,
+                kind, uri, suite, components, arches, signed_by,
+                enabled: true, name,
             });
         }
-
         Ok(SourcesList { entries })
     }
 
@@ -207,9 +146,7 @@ migrate to /etc/hammer/sources-list.hk"
 
     fn load_legacy_toml(path: &Path) -> Result<Self> {
         #[derive(Deserialize)]
-        struct ReposFile {
-            repo: Vec<HammerRepo>,
-        }
+        struct ReposFile { repo: Vec<HammerRepo> }
         #[derive(Deserialize)]
         struct HammerRepo {
             name:       String,
@@ -222,17 +159,11 @@ migrate to /etc/hammer/sources-list.hk"
             enabled:    bool,
             gpgkey:     Option<String>,
         }
-        fn bool_true() -> bool {
-            true
-        }
+        fn bool_true() -> bool { true }
 
         let txt = std::fs::read_to_string(path)?;
         let file: ReposFile = toml::from_str(&txt)?;
-        let entries = file
-        .repo
-        .into_iter()
-        .filter(|r| r.enabled)
-        .map(|r| SourceEntry {
+        let entries = file.repo.into_iter().filter(|r| r.enabled).map(|r| SourceEntry {
             kind:       EntryKind::Deb,
             uri:        r.baseurl,
             suite:      r.suite,
@@ -241,8 +172,7 @@ migrate to /etc/hammer/sources-list.hk"
             signed_by:  r.gpgkey,
             enabled:    true,
             name:       Some(r.name),
-        })
-        .collect();
+        }).collect();
         Ok(SourcesList { entries })
     }
 
@@ -251,9 +181,7 @@ migrate to /etc/hammer/sources-list.hk"
     pub fn index_urls(&self, arch: &str) -> Vec<IndexUrl> {
         let mut out = Vec::new();
         for entry in &self.entries {
-            if !entry.enabled || entry.kind != EntryKind::Deb {
-                continue;
-            }
+            if !entry.enabled || entry.kind != EntryKind::Deb { continue; }
             let arch_list: Vec<&str> = if entry.arches.is_empty() {
                 vec![arch]
             } else {
@@ -262,25 +190,17 @@ migrate to /etc/hammer/sources-list.hk"
             for a in &arch_list {
                 for comp in &entry.components {
                     let base = entry.uri.trim_end_matches('/');
-                    let url = format!(
-                        "{}/dists/{}/{}/binary-{}/Packages",
-                        base, entry.suite, comp, a
-                    );
+                    let url  = format!("{}/dists/{}/{}/binary-{}/Packages",
+                                       base, entry.suite, comp, a);
                     out.push(IndexUrl {
                         url,
-                        inrelease_url: format!(
-                            "{}/dists/{}/InRelease",
-                            base, entry.suite
-                        ),
-                        base_uri:  entry.uri.clone(),
+                        inrelease_url: format!("{}/dists/{}/InRelease", base, entry.suite),
+                             base_uri:  entry.uri.clone(),
                              suite:     entry.suite.clone(),
                              component: comp.clone(),
                              arch:      a.to_string(),
                              signed_by: entry.signed_by.clone(),
-                             name:      entry
-                             .name
-                             .clone()
-                             .unwrap_or_else(|| entry.suite.clone()),
+                             name:      entry.name.clone().unwrap_or_else(|| entry.suite.clone()),
                     });
                 }
             }
@@ -288,7 +208,7 @@ migrate to /etc/hammer/sources-list.hk"
         out
     }
 
-    // ── write default .hk file ────────────────────────────────
+    // ── write default .hk ─────────────────────────────────────
 
     pub fn write_default(arch: &str, suite: &str) -> Result<()> {
         std::fs::create_dir_all("/etc/hammer")?;
@@ -303,74 +223,57 @@ migrate to /etc/hammer/sources-list.hk"
             String::new()
         } else {
             format!(
-                r#"
-                [debian-{suite}-security]
-                -> name       => debian-{suite}-security
-                -> baseurl    => http://security.debian.org/debian-security
-                -> suite      => {security_suite}
-                -> components => ["main", "contrib", "non-free"]
-                -> arch       => ["{arch}"]
-                -> enabled    => true
-                "#,
-                suite = suite,
-                security_suite = security_suite,
-                arch = arch
+                "\n[debian-{suite}-security]\n\
+-> name       => debian-{suite}-security\n\
+-> baseurl    => http://security.debian.org/debian-security\n\
+-> suite      => {security_suite}\n\
+-> components => [\"main\", \"contrib\", \"non-free\"]\n\
+-> arch       => [\"{arch}\"]\n\
+-> enabled    => true\n",
+suite = suite, security_suite = security_suite, arch = arch
             )
         };
 
         let backports_block =
         if matches!(suite, "bookworm" | "trixie" | "stable" | "testing") {
             format!(
-                r#"
-                [debian-{suite}-backports]
-                -> name       => debian-{suite}-backports
-                -> baseurl    => http://deb.debian.org/debian
-                -> suite      => {suite}-backports
-                -> components => ["main", "contrib", "non-free"]
-                -> arch       => ["{arch}"]
-                -> enabled    => false
-                "#,
-                suite = suite,
-                arch = arch
+                "\n[debian-{suite}-backports]\n\
+-> name       => debian-{suite}-backports\n\
+-> baseurl    => http://deb.debian.org/debian\n\
+-> suite      => {suite}-backports\n\
+-> components => [\"main\", \"contrib\", \"non-free\"]\n\
+-> arch       => [\"{arch}\"]\n\
+-> enabled    => false\n",
+suite = suite, arch = arch
             )
         } else {
             String::new()
         };
 
         let content = format!(
-            r#"! Hammer sources list — format: .hk
-            ! Edit this file to add/remove repositories.
-            ! Run: hammer sync   — to refresh the package index
-            !
-            ! Syntax:
-            !   [section-name]      — one repository per section
-            !   -> key => value     — key/value pairs
-            !   ! comment           — lines starting with ! are ignored
-
-            [debian-{suite}]
-            -> name       => debian-{suite}
-            -> baseurl    => http://deb.debian.org/debian
-            -> suite      => {suite}
-            -> components => ["main", "contrib", "non-free", "non-free-firmware"]
-            -> arch       => ["{arch}"]
-            -> enabled    => true
-
-            [debian-{suite}-updates]
-            -> name       => debian-{suite}-updates
-            -> baseurl    => http://deb.debian.org/debian
-            -> suite      => {suite}-updates
-            -> components => ["main", "contrib", "non-free"]
-            -> arch       => ["{arch}"]
-            -> enabled    => true
-            {security_block}{backports_block}"#,
-            suite = suite,
-            arch = arch,
-            security_block = security_block,
-            backports_block = backports_block
+            "! Hammer sources list — format: .hk\n\
+! Edit then run: hammer sync\n\n\
+[debian-{suite}]\n\
+-> name       => debian-{suite}\n\
+-> baseurl    => http://deb.debian.org/debian\n\
+-> suite      => {suite}\n\
+-> components => [\"main\", \"contrib\", \"non-free\", \"non-free-firmware\"]\n\
+-> arch       => [\"{arch}\"]\n\
+-> enabled    => true\n\n\
+[debian-{suite}-updates]\n\
+-> name       => debian-{suite}-updates\n\
+-> baseurl    => http://deb.debian.org/debian\n\
+-> suite      => {suite}-updates\n\
+-> components => [\"main\", \"contrib\", \"non-free\"]\n\
+-> arch       => [\"{arch}\"]\n\
+-> enabled    => true\n\
+{security_block}{backports_block}",
+suite = suite, arch = arch,
+security_block = security_block,
+backports_block = backports_block
         );
 
-        let dest = Path::new(SOURCES_HK);
-        std::fs::write(dest, content)?;
+        std::fs::write(Path::new(SOURCES_HK), content)?;
         crate::log::info(&format!("repo: wrote {}", SOURCES_HK));
         Ok(())
     }
@@ -381,16 +284,11 @@ migrate to /etc/hammer/sources-list.hk"
 // ─────────────────────────────────────────────────────────────
 
 fn parse_apt_sources_list(content: &str) -> Vec<SourceEntry> {
-    content
-    .lines()
-    .filter_map(|l| {
+    content.lines().filter_map(|l| {
         let l = l.trim();
-        if l.is_empty() || l.starts_with('#') {
-            return None;
-        }
+        if l.is_empty() || l.starts_with('#') { return None; }
         parse_apt_deb822_line(l)
-    })
-    .collect()
+    }).collect()
 }
 
 fn parse_apt_deb822_line(line: &str) -> Option<SourceEntry> {
@@ -398,30 +296,17 @@ fn parse_apt_deb822_line(line: &str) -> Option<SourceEntry> {
         (EntryKind::DebSrc, line["deb-src".len()..].trim_start())
     } else if line.starts_with("deb") {
         (EntryKind::Deb, line["deb".len()..].trim_start())
-    } else {
-        return None;
-    };
+    } else { return None; };
     let (options, rest) = if rest.starts_with('[') {
         let end = rest.find(']')?;
-        (Some(&rest[1..end]), rest[end + 1..].trim_start())
-    } else {
-        (None, rest)
-    };
-    let mut tokens = rest.split_whitespace();
-    let uri = tokens.next()?.to_owned();
-    let suite = tokens.next()?.to_owned();
+        (Some(&rest[1..end]), rest[end+1..].trim_start())
+    } else { (None, rest) };
+    let mut tokens     = rest.split_whitespace();
+    let uri            = tokens.next()?.to_owned();
+    let suite          = tokens.next()?.to_owned();
     let components: Vec<String> = tokens.map(|s| s.to_owned()).collect();
     let (arches, signed_by) = parse_apt_options(options);
-    Some(SourceEntry {
-        kind,
-         uri,
-         suite,
-         components,
-         arches,
-         signed_by,
-         enabled: true,
-         name: None,
-    })
+    Some(SourceEntry { kind, uri, suite, components, arches, signed_by, enabled: true, name: None })
 }
 
 fn parse_apt_options(opts: Option<&str>) -> (Vec<String>, Option<String>) {
