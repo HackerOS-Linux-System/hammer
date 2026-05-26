@@ -19,7 +19,7 @@ const RETRY_DELAY:    u64   = 2;
 
 const USER_AGENT: &str = concat!(
     "hammer/", env!("CARGO_PKG_VERSION"),
-    " (https://github.com/HackerOS-Linux-System/hammer)"
+                                 " (https://github.com/HackerOS-Linux-System/hammer)"
 );
 
 // Progress bar characters — filled / empty blocks (▰ ▱)
@@ -39,21 +39,21 @@ pub struct HttpClient {
 impl HttpClient {
     pub fn new() -> Self {
         let inner = Client::builder()
-            .user_agent(USER_AGENT)
-            .timeout(Duration::from_secs(300))
-            .connect_timeout(Duration::from_secs(20))
-            .tcp_keepalive(Duration::from_secs(30))
-            .pool_max_idle_per_host(4)
-            .gzip(true)
-            .deflate(true)
-            .build()
-            .expect("Failed to build HTTP client");
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(300))
+        .connect_timeout(Duration::from_secs(20))
+        .tcp_keepalive(Duration::from_secs(30))
+        .pool_max_idle_per_host(4)
+        .gzip(true)
+        .deflate(true)
+        .build()
+        .expect("Failed to build HTTP client");
         HttpClient { inner }
     }
 
     pub async fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
         let resp = self.inner.get(url).send().await
-            .with_context(|| format!("GET {}", url))?;
+        .with_context(|| format!("GET {}", url))?;
         if !resp.status().is_success() {
             bail!("HTTP {} for {}", resp.status(), url);
         }
@@ -108,7 +108,7 @@ fn overall_style() -> ProgressStyle {
     .unwrap()
     .with_key("wide_bar", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
         let pct = if state.len().unwrap_or(1) == 0 { 0.0 }
-                  else { state.pos() as f64 / state.len().unwrap() as f64 };
+        else { state.pos() as f64 / state.len().unwrap() as f64 };
         let width: usize = 38;
         let filled = (pct * width as f64).round() as usize;
         let empty  = width.saturating_sub(filled);
@@ -126,7 +126,7 @@ fn pkg_style() -> ProgressStyle {
     .unwrap()
     .with_key("wide_bar", |state: &indicatif::ProgressState, w: &mut dyn std::fmt::Write| {
         let pct = if state.len().unwrap_or(1) == 0 { 0.0 }
-                  else { state.pos() as f64 / state.len().unwrap() as f64 };
+        else { state.pos() as f64 / state.len().unwrap() as f64 };
         let width: usize = 28;
         let filled = (pct * width as f64).round() as usize;
         let empty  = width.saturating_sub(filled);
@@ -190,20 +190,20 @@ pub async fn download_packages(
         let sem_c     = Arc::clone(&sem);
 
         let handle: tokio::task::JoinHandle<Result<DownloadResult>> =
-            tokio::spawn(async move {
-                let _permit = sem_c.acquire().await.expect("semaphore closed");
-                let res = download_with_retry(&client_c, &url, &dest, &pb, &overall_c).await;
-                match &res {
-                    Ok(()) => {
-                        let sz = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
-                        pb.finish_with_message(crate::ui::human_size(sz).green().to_string());
-                    }
-                    Err(e) => {
-                        pb.finish_with_message(format!("\x1b[31m✗\x1b[0m {}", e));
-                    }
+        tokio::spawn(async move {
+            let _permit = sem_c.acquire().await.expect("semaphore closed");
+            let res = download_with_retry(&client_c, &url, &dest, &pb, &overall_c).await;
+            match &res {
+                Ok(()) => {
+                    let sz = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
+                    pb.finish_with_message(crate::ui::human_size(sz).green().to_string());
                 }
-                res.map(|_| DownloadResult { package: pkg_c, path: dest })
-            });
+                Err(e) => {
+                    pb.finish_with_message(format!("\x1b[31m✗\x1b[0m {}", e));
+                }
+            }
+            res.map(|_| DownloadResult { package: pkg_c, path: dest })
+        });
         handles.push(handle);
     }
 
@@ -275,7 +275,7 @@ async fn download_one(
     overall: &ProgressBar,
 ) -> Result<()> {
     let resp = client.inner.get(url).send().await
-        .with_context(|| format!("GET {}", url))?;
+    .with_context(|| format!("GET {}", url))?;
     if resp.status() == StatusCode::NOT_FOUND { bail!("404 Not Found: {}", url); }
     if !resp.status().is_success() { bail!("HTTP {} for {}", resp.status(), url); }
 
@@ -284,7 +284,7 @@ async fn download_one(
     let tmp = dest.with_extension("part");
     let _ = tokio::fs::remove_file(&tmp).await;
     let mut file = tokio::fs::File::create(&tmp).await
-        .with_context(|| format!("Cannot create {:?}", tmp))?;
+    .with_context(|| format!("Cannot create {:?}", tmp))?;
 
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -297,7 +297,7 @@ async fn download_one(
     file.flush().await?;
     drop(file);
     tokio::fs::rename(&tmp, dest).await
-        .with_context(|| format!("Cannot rename {:?} → {:?}", tmp, dest))?;
+    .with_context(|| format!("Cannot rename {:?} → {:?}", tmp, dest))?;
     Ok(())
 }
 
@@ -335,8 +335,8 @@ impl UnpackSpinner {
         let pb = mp.add(ProgressBar::new_spinner());
         pb.set_style(
             ProgressStyle::with_template("  {spinner:.cyan}  {prefix:.bold}  {wide_msg}")
-                .unwrap()
-                .tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","·"]),
+            .unwrap()
+            .tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","·"]),
         );
         pb.set_prefix("unpacking");
         pb.set_message(label.to_string());
