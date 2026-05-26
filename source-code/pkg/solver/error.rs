@@ -1,41 +1,12 @@
 use std::fmt;
 
-// ─────────────────────────────────────────────────────────────
-//  SolverProblem  — one reason why resolution failed
-// ─────────────────────────────────────────────────────────────
-
 #[derive(Debug, Clone)]
 pub enum SolverProblem {
-    /// Package not found in any repository
-    NotFound {
-        name:     String,
-        similar:  Vec<String>,
-    },
-    /// Dependency cannot be satisfied
-    UnsatisfiedDep {
-        package:    String,
-        dep:        String,
-        constraint: Option<String>,
-    },
-    /// Hard conflict between packages
-    Conflict {
-        pkg_a:   String,
-        pkg_b:   String,
-        detail:  String,
-    },
-    /// Version constraint not satisfiable
-    VersionConflict {
-        package:    String,
-        required:   String,
-        available:  String,
-    },
-    /// Architecture mismatch
-    ArchMismatch {
-        package:  String,
-        pkg_arch: String,
-        sys_arch: String,
-    },
-    /// Generic / SAT solver explanation
+    NotFound          { name: String, similar: Vec<String> },
+    UnsatisfiedDep    { package: String, dep: String, constraint: Option<String> },
+    Conflict          { pkg_a: String, pkg_b: String, detail: String },
+    VersionConflict   { package: String, required: String, available: String },
+    ArchMismatch      { package: String, pkg_arch: String, sys_arch: String },
     Generic(String),
 }
 
@@ -52,29 +23,19 @@ impl fmt::Display for SolverProblem {
             SolverProblem::UnsatisfiedDep { package, dep, constraint } => {
                 write!(f, "Package '{}' depends on '{}'{} which is not available",
                        package, dep,
-                       constraint.as_ref()
-                       .map(|c| format!(" ({})", c))
-                       .unwrap_or_default())
+                       constraint.as_ref().map(|c| format!(" ({})", c)).unwrap_or_default())
             }
-            SolverProblem::Conflict { pkg_a, pkg_b, detail } => {
-                write!(f, "Conflict between '{}' and '{}': {}", pkg_a, pkg_b, detail)
-            }
-            SolverProblem::VersionConflict { package, required, available } => {
-                write!(f, "Package '{}' requires {} but only {} is available",
-                       package, required, available)
-            }
-            SolverProblem::ArchMismatch { package, pkg_arch, sys_arch } => {
-                write!(f, "Package '{}' is for {} but system is {}",
-                       package, pkg_arch, sys_arch)
-            }
-            SolverProblem::Generic(msg) => write!(f, "{}", msg),
+            SolverProblem::Conflict { pkg_a, pkg_b, detail } =>
+            write!(f, "Conflict between '{}' and '{}': {}", pkg_a, pkg_b, detail),
+            SolverProblem::VersionConflict { package, required, available } =>
+            write!(f, "Package '{}' requires {} but only {} is available",
+                   package, required, available),
+                   SolverProblem::ArchMismatch { package, pkg_arch, sys_arch } =>
+                   write!(f, "Package '{}' is for {} but system is {}", package, pkg_arch, sys_arch),
+                   SolverProblem::Generic(msg) => write!(f, "{}", msg),
         }
     }
 }
-
-// ─────────────────────────────────────────────────────────────
-//  SolverError  — collection of problems with formatted output
-// ─────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
 pub struct SolverError {
@@ -82,13 +43,8 @@ pub struct SolverError {
 }
 
 impl SolverError {
-    pub fn new(problems: Vec<SolverProblem>) -> Self {
-        SolverError { problems }
-    }
-
-    pub fn single(p: SolverProblem) -> Self {
-        SolverError { problems: vec![p] }
-    }
+    pub fn new(problems: Vec<SolverProblem>) -> Self { SolverError { problems } }
+    pub fn single(p: SolverProblem)         -> Self { SolverError { problems: vec![p] } }
 }
 
 impl fmt::Display for SolverError {
@@ -105,10 +61,5 @@ impl fmt::Display for SolverError {
     }
 }
 
+// Just implement std::error::Error — anyhow's blanket From<E: Error> handles the rest.
 impl std::error::Error for SolverError {}
-
-impl From<SolverError> for anyhow::Error {
-    fn from(e: SolverError) -> Self {
-        anyhow::anyhow!("{}", e)
-    }
-}
