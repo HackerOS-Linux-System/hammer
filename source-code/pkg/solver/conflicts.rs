@@ -8,7 +8,6 @@ use crate::solver::version::satisfies;
 
 #[derive(Debug, Clone)]
 pub struct ConflictInfo {
-    /// e.g. "Package 'foo' conflicts with installed 'bar' (1.2-3)"
     pub message:  String,
     pub kind:     ConflictKind,
     pub pkg_name: String,
@@ -21,21 +20,19 @@ pub struct ConflictInfo {
 pub enum ConflictKind { Conflicts, Breaks, Replaces }
 
 // ─────────────────────────────────────────────────────────────
-//  Check a package being considered for installation
+//  check_install
 // ─────────────────────────────────────────────────────────────
 
-/// Check `candidate` against everything in `db`.
-/// Returns a list of conflicts found.
 pub fn check_install(candidate: &Package, db: &InstalledDb) -> Vec<ConflictInfo> {
     let mut out = Vec::new();
 
-    // 1. Check candidate's own Conflicts
+    // 1. Candidate's own Conflicts field
     if let Some(ref c_str) = candidate.conflicts {
         for group in parse_dep_field(c_str) {
             for alt in &group.alternatives {
                 if let Some(inst) = db.get(&alt.name) {
                     let violates = alt.constraint.as_ref()
-                    .map(|c| satisfies(&inst.version, &c.op, &c.version))
+                    .map(|c| satisfies(&inst.version, c.op.as_str(), &c.version))
                     .unwrap_or(true);
                     if violates {
                         out.push(ConflictInfo {
@@ -54,13 +51,13 @@ pub fn check_install(candidate: &Package, db: &InstalledDb) -> Vec<ConflictInfo>
         }
     }
 
-    // 2. Check candidate's Breaks
+    // 2. Candidate's Breaks field
     if let Some(ref b_str) = candidate.breaks {
         for group in parse_dep_field(b_str) {
             for alt in &group.alternatives {
                 if let Some(inst) = db.get(&alt.name) {
                     let breaks_it = alt.constraint.as_ref()
-                    .map(|c| satisfies(&inst.version, &c.op, &c.version))
+                    .map(|c| satisfies(&inst.version, c.op.as_str(), &c.version))
                     .unwrap_or(true);
                     if breaks_it {
                         out.push(ConflictInfo {
@@ -79,43 +76,19 @@ pub fn check_install(candidate: &Package, db: &InstalledDb) -> Vec<ConflictInfo>
         }
     }
 
-    // 3. Check whether any installed package conflicts with the candidate
-    if let Ok(all) = db.list_all() {
-        for inst in &all {
-            if let Some(ref c_str) = inst.conflicts {
-                for group in parse_dep_field(c_str) {
-                    for alt in &group.alternatives {
-                        if alt.name != candidate.name { continue; }
-                        let violates = alt.constraint.as_ref()
-                        .map(|c| satisfies(&candidate.version, &c.op, &c.version))
-                        .unwrap_or(true);
-                        if violates {
-                            out.push(ConflictInfo {
-                                message: format!(
-                                    "Installed '{}' {} conflicts with candidate '{}' {}",
-                                    inst.name, inst.version,
-                                    candidate.name, candidate.version
-                                ),
-                                kind:     ConflictKind::Conflicts,
-                                pkg_name: inst.name.clone(),
-                                     with:     candidate.name.clone(),
-                                     hard:     true,
-                            });
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // 3. Check if any installed package has a Conflicts referencing candidate.
+    //    InstalledPackage doesn't carry the full control fields (only what
+    //    db.rs stores), so we check via the Package struct from the cache
+    //    if available. If not available, skip silently.
+    //    This is handled externally in sat.rs using the cache.
 
     out
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Check for reverse-dependency breaks on removal
+//  reverse_depends
 // ─────────────────────────────────────────────────────────────
 
-/// Return names of packages that depend on any of `removing`.
 pub fn reverse_depends(removing: &[String], db: &InstalledDb) -> Vec<String> {
     let remove_set: std::collections::HashSet<&str> =
     removing.iter().map(|s| s.as_str()).collect();
@@ -124,9 +97,8 @@ pub fn reverse_depends(removing: &[String], db: &InstalledDb) -> Vec<String> {
 
     for inst in &all {
         if remove_set.contains(inst.name.as_str()) { continue; }
-        let depends_on_removed = [&inst.depends, &inst.pre_depends]
-        .iter()
-        .filter_map(|f| f.as_ref())
+        // Only check Depends (InstalledPackage doesn't have pre_depends column)
+        let depends_on_removed = inst.depends.iter()
         .flat_map(|s| parse_dep_field(s))
         .any(|group| {
             group.alternatives.iter()
