@@ -1,6 +1,6 @@
 [package]
 name        = "hammer"
-version     = "0.0.1"
+version     = "0.1.0"
 edition     = "2021"
 authors     = ["HackerOS Team <hackeros068@gmail.com>"]
 description = "Atomic Debian package manager — HackerOS"
@@ -37,7 +37,10 @@ sha1            = "0.10"
 hex             = "0.4"
 walkdir         = "2"
 nix             = { version = "0.27", features = ["user"] }
-axum            = "0.7"
-tower           = "0.4"
-tower-http      = { version = "0.5", features = ["cors"] }
 hk-parser       = "0.3.0"
+# FIX: needed for HkValue maps in hk_tools.rs
+indexmap        = { version = "2", features = ["serde"] }
+# SAT-based dependency solver (resolvo)
+resolvo         = "0.4"
+# File locking — prevents concurrent hammer instances corrupting state
+fslock          = "0.2"
