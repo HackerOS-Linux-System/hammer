@@ -1,278 +1,259 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::cmp::Ordering;
 
 // ─────────────────────────────────────────────────────────────
-//  Package
+//  VersionOp
 // ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Package {
-    pub name:              String,
-    pub version:           String,
-    pub architecture:      String,
-    pub description_short: Option<String>,
-    pub description_long:  Option<String>,
-    pub section:           Option<String>,
-    pub priority:          Option<String>,
-    pub maintainer:        Option<String>,
-    pub installed_size_kb: Option<u64>,
-    pub download_size:     Option<u64>,
-    pub filename:          Option<String>,
-    pub sha256:            Option<String>,
-    pub md5sum:            Option<String>,
-    pub depends:           Option<String>,
-    pub pre_depends:       Option<String>,
-    pub recommends:        Option<String>,
-    pub suggests:          Option<String>,
-    pub conflicts:         Option<String>,
-    pub replaces:          Option<String>,
-    pub breaks:            Option<String>,
-    pub provides:          Option<String>,
-    pub homepage:          Option<String>,
-    pub source:            Option<String>,
-    pub repo_base_uri:     Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VersionOp {
+    Eq,  // =
+    Lt,  // <<
+    Le,  // <=
+    Gt,  // >>
+    Ge,  // >=
 }
 
-impl Package {
-    pub fn parse_index(content: &str) -> Vec<Package> {
-        content
-        .split("\n\n")
-        .filter_map(|block| {
-            let b = block.trim();
-            if b.is_empty() { None } else { Package::parse_block(b) }
-        })
-        .collect()
-    }
-
-    pub fn parse_block(block: &str) -> Option<Package> {
-        let mut map: HashMap<String, String> = HashMap::new();
-        let mut cur_key = String::new();
-        let mut cur_val = String::new();
-
-        for line in block.lines() {
-            if line.starts_with(' ') || line.starts_with('\t') {
-                if !cur_key.is_empty() {
-                    cur_val.push('\n');
-                    cur_val.push_str(line.trim_start());
-                }
-            } else if let Some(idx) = line.find(':') {
-                if !cur_key.is_empty() {
-                    map.insert(cur_key.to_lowercase(), cur_val.trim().to_owned());
-                }
-                cur_key = line[..idx].trim().to_owned();
-                cur_val = line[idx + 1..].trim().to_owned();
-            }
-        }
-        if !cur_key.is_empty() {
-            map.insert(cur_key.to_lowercase(), cur_val.trim().to_owned());
-        }
-
-        let name    = map.remove("package")?;
-        let version = map.remove("version")?;
-        let arch    = map.remove("architecture").unwrap_or_else(|| "all".into());
-        let (desc_short, desc_long) = split_description(map.remove("description"));
-
-        Some(Package {
-            name,
-            version,
-            architecture:      arch,
-            description_short: desc_short,
-            description_long:  desc_long,
-            section:           map.remove("section"),
-             priority:          map.remove("priority"),
-             maintainer:        map.remove("maintainer"),
-             installed_size_kb: map.remove("installed-size").and_then(|v| v.parse().ok()),
-             download_size:     map.remove("size").and_then(|v| v.parse().ok()),
-             filename:          map.remove("filename"),
-             sha256:            map.remove("sha256"),
-             md5sum:            map.remove("md5sum"),
-             depends:           map.remove("depends"),
-             pre_depends:       map.remove("pre-depends"),
-             recommends:        map.remove("recommends"),
-             suggests:          map.remove("suggests"),
-             conflicts:         map.remove("conflicts"),
-             replaces:          map.remove("replaces"),
-             breaks:            map.remove("breaks"),
-             provides:          map.remove("provides"),
-             homepage:          map.remove("homepage"),
-             source:            map.remove("source"),
-             repo_base_uri:     None,
-        })
-    }
-}
-
-fn split_description(raw: Option<String>) -> (Option<String>, Option<String>) {
-    match raw {
-        None => (None, None),
-        Some(s) => {
-            let mut lines = s.lines();
-            let short = lines.next().map(|l| l.trim().to_owned()).filter(|l| !l.is_empty());
-            let long: Vec<&str> = lines.collect();
-            let long_str = long.join("\n");
-            (short, if long_str.trim().is_empty() { None } else { Some(long_str) })
+impl VersionOp {
+    /// Convert to the string form expected by version::satisfies()
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VersionOp::Eq => "=",
+            VersionOp::Lt => "<<",
+            VersionOp::Le => "<=",
+            VersionOp::Gt => ">>",
+            VersionOp::Ge => ">=",
         }
     }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Dependency structures
-// ─────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone)]
-pub struct DepGroup {
-    pub alternatives: Vec<SingleDep>,
+impl std::fmt::Display for VersionOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
 }
 
-#[derive(Debug, Clone)]
-pub struct SingleDep {
-    pub name:       String,
-    pub constraint: Option<VersionConstraint>,
-    pub arch_qual:  Option<String>,
-}
+// ─────────────────────────────────────────────────────────────
+//  VersionConstraint
+// ─────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VersionConstraint {
     pub op:      VersionOp,
     pub version: String,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub enum VersionOp { Eq, Lt, Le, Gt, Ge }
+impl std::fmt::Display for VersionConstraint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} {}", self.op, self.version)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  DepAlternative  — one side of "foo | bar"
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct DepAlternative {
+    pub name:       String,
+    pub constraint: Option<VersionConstraint>,
+    /// Optional architecture qualifier: foo:amd64
+    pub arch:       Option<String>,
+}
+
+/// A dependency group is a list of alternatives (OR).
+/// The outer Vec<DepGroup> is the AND list.
+#[derive(Debug, Clone)]
+pub struct DepGroup {
+    pub alternatives: Vec<DepAlternative>,
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Package  — available package from the index
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Package {
+    pub name:             String,
+    pub version:          String,
+    pub architecture:     String,
+
+    // Control fields
+    pub depends:          Option<String>,
+    pub pre_depends:      Option<String>,
+    pub recommends:       Option<String>,
+    pub suggests:         Option<String>,
+    pub conflicts:        Option<String>,
+    pub breaks:           Option<String>,
+    pub provides:         Option<String>,
+    pub replaces:         Option<String>,
+    pub enhances:         Option<String>,
+
+    // Metadata
+    pub section:          Option<String>,
+    pub priority:         Option<String>,
+    pub maintainer:       Option<String>,
+    pub homepage:         Option<String>,
+    pub description_short:Option<String>,
+    pub description_long: Option<String>,
+
+    // Size info
+    pub installed_size_kb: Option<u64>,
+    pub download_size:     Option<u64>,
+
+    // Repository info
+    pub repo_base_uri:    Option<String>,
+    pub filename:         Option<String>,
+    pub sha256:           Option<String>,
+
+    // Parsed from Provides
+    pub provides_list:    Vec<String>,
+}
+
+impl Package {
+    /// Parse a raw Debian control stanza (one package block from Packages file).
+    pub fn parse_block(block: &str) -> Option<Self> {
+        let mut p = Package {
+            name: String::new(), version: String::new(),
+            architecture: String::new(),
+            depends: None, pre_depends: None, recommends: None, suggests: None,
+            conflicts: None, breaks: None, provides: None, replaces: None, enhances: None,
+            section: None, priority: None, maintainer: None, homepage: None,
+            description_short: None, description_long: None,
+            installed_size_kb: None, download_size: None,
+            repo_base_uri: None, filename: None, sha256: None,
+            provides_list: Vec::new(),
+        };
+
+        let mut lines = block.lines().peekable();
+        let mut cur_field = String::new();
+        let mut cur_value = String::new();
+
+        macro_rules! flush {
+            () => {
+                if !cur_field.is_empty() {
+                    p.set_field(&cur_field, &cur_value);
+                    cur_field.clear(); cur_value.clear();
+                }
+            };
+        }
+
+        while let Some(line) = lines.next() {
+            if line.starts_with(' ') || line.starts_with('\t') {
+                cur_value.push('\n');
+                cur_value.push_str(line.trim_start());
+            } else if let Some(colon) = line.find(':') {
+                flush!();
+                cur_field = line[..colon].trim().to_lowercase();
+                cur_value = line[colon+1..].trim().to_string();
+            }
+        }
+        flush!();
+
+        if p.name.is_empty() || p.version.is_empty() { return None; }
+        Some(p)
+    }
+
+    fn set_field(&mut self, field: &str, value: &str) {
+        let v = value.trim().to_string();
+        match field {
+            "package"          => self.name          = v,
+            "version"          => self.version        = v,
+            "architecture"     => self.architecture   = v,
+            "depends"          => self.depends         = Some(v),
+            "pre-depends"      => self.pre_depends     = Some(v),
+            "recommends"       => self.recommends      = Some(v),
+            "suggests"         => self.suggests        = Some(v),
+            "conflicts"        => self.conflicts       = Some(v),
+            "breaks"           => self.breaks          = Some(v),
+            "provides"         => self.provides        = Some(v),
+            "replaces"         => self.replaces        = Some(v),
+            "enhances"         => self.enhances        = Some(v),
+            "section"          => self.section         = Some(v),
+            "priority"         => self.priority        = Some(v),
+            "maintainer"       => self.maintainer      = Some(v),
+            "homepage"         => self.homepage        = Some(v),
+            "filename"         => self.filename        = Some(v),
+            "sha256"           => self.sha256          = Some(v),
+            "installed-size"   => self.installed_size_kb = v.parse().ok(),
+            "size"             => self.download_size    = v.parse().ok(),
+            "description"      => {
+                let mut parts = v.splitn(2, '\n');
+                self.description_short = Some(parts.next().unwrap_or("").trim().to_string());
+                self.description_long  = parts.next().map(|s| s.to_string());
+            }
+            _ => {}
+        }
+    }
+
+    /// Parse all packages from a Packages index file.
+    pub fn parse_index(content: &str) -> Vec<Self> {
+        content.split("\n\n")
+        .filter_map(|block| {
+            let b = block.trim();
+            if b.is_empty() { None } else { Self::parse_block(b) }
+        })
+        .collect()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Dependency parser
+// ─────────────────────────────────────────────────────────────
 
 pub fn parse_dep_field(s: &str) -> Vec<DepGroup> {
     s.split(',')
-    .filter_map(|chunk| {
-        let chunk = chunk.trim();
-        if chunk.is_empty() { return None; }
-        let alts: Vec<SingleDep> = chunk
-        .split('|')
-        .filter_map(|alt| parse_single_dep(alt.trim()))
-        .collect();
-        if alts.is_empty() { None } else { Some(DepGroup { alternatives: alts }) }
+    .map(|group| {
+        let alternatives = group.split('|').map(|alt| parse_dep_alt(alt.trim())).collect();
+        DepGroup { alternatives }
     })
     .collect()
 }
 
-fn parse_single_dep(s: &str) -> Option<SingleDep> {
-    let s = s.trim();
-    if s.is_empty() { return None; }
-    if let Some(paren) = s.find('(') {
-        let (raw_name, rest) = s.split_at(paren);
-        let name_part = raw_name.trim();
-        let (name, arch_qual) = split_arch_qual(name_part);
-        let inner = rest.trim_start_matches('(').trim_end_matches(')').trim();
-        let constraint = parse_constraint(inner);
-        Some(SingleDep { name, arch_qual, constraint })
-    } else {
-        let (name, arch_qual) = split_arch_qual(s);
-        Some(SingleDep { name, arch_qual, constraint: None })
-    }
-}
-
-fn split_arch_qual(s: &str) -> (String, Option<String>) {
-    if let Some(colon) = s.find(':') {
-        (s[..colon].trim().to_owned(), Some(s[colon..].to_owned()))
-    } else {
-        (s.trim().to_owned(), None)
-    }
-}
-
-fn parse_constraint(s: &str) -> Option<VersionConstraint> {
-    let (op, ver) = if s.starts_with(">=") {
-        (VersionOp::Ge, s[2..].trim())
-    } else if s.starts_with("<=") {
-        (VersionOp::Le, s[2..].trim())
-    } else if s.starts_with(">>") {
-        (VersionOp::Gt, s[2..].trim())
-    } else if s.starts_with("<<") {
-        (VersionOp::Lt, s[2..].trim())
-    } else if s.starts_with('=') {
-        (VersionOp::Eq, s[1..].trim())
-    } else {
-        return None;
+fn parse_dep_alt(s: &str) -> DepAlternative {
+    // Format: name (>= version) [arch]
+    let (name_part, rest) = match s.find('(') {
+        Some(i) => (&s[..i], Some(&s[i..])),
+        None    => (s, None),
     };
-    Some(VersionConstraint { op, version: ver.to_owned() })
+
+    let (pkg_name, arch) = if let Some(colon) = name_part.find(':') {
+        (name_part[..colon].trim().to_string(), Some(name_part[colon+1..].trim().to_string()))
+    } else {
+        (name_part.trim().to_string(), None)
+    };
+
+    let constraint = rest.and_then(|r| {
+        let inner = r.trim_start_matches('(').split(')').next()?;
+        let mut parts = inner.splitn(2, ' ');
+        let op_str = parts.next()?.trim();
+        let ver    = parts.next()?.trim().to_string();
+        let op = parse_version_op(op_str)?;
+        Some(VersionConstraint { op, version: ver })
+    });
+
+    DepAlternative { name: pkg_name, constraint, arch }
+}
+
+fn parse_version_op(s: &str) -> Option<VersionOp> {
+    match s {
+        "="  | "==" => Some(VersionOp::Eq),
+        "<<" | "<"  => Some(VersionOp::Lt),
+        "<=" | "=<" => Some(VersionOp::Le),
+        ">>" | ">"  => Some(VersionOp::Gt),
+        ">=" | "=>" => Some(VersionOp::Ge),
+        _           => None,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Version comparison (Debian algorithm)
+//  Version comparison (forward to solver::version)
 // ─────────────────────────────────────────────────────────────
 
-pub fn version_cmp(a: &str, b: &str) -> std::cmp::Ordering {
-    let (ae, a_rest) = split_epoch(a);
-    let (be, b_rest) = split_epoch(b);
-    if ae != be { return ae.cmp(&be); }
-    let (au, ar) = split_revision(a_rest);
-    let (bu, br) = split_revision(b_rest);
-    let uc = compare_upstream(au, bu);
-    if uc != std::cmp::Ordering::Equal { return uc; }
-    compare_upstream(ar, br)
+pub fn version_cmp(a: &str, b: &str) -> Ordering {
+    crate::solver::version::compare(a, b)
 }
 
-fn split_epoch(v: &str) -> (u32, &str) {
-    if let Some(c) = v.find(':') {
-        if let Ok(e) = v[..c].parse::<u32>() {
-            return (e, &v[c + 1..]);
-        }
-    }
-    (0, v)
-}
-
-fn split_revision(v: &str) -> (&str, &str) {
-    if let Some(d) = v.rfind('-') {
-        (&v[..d], &v[d + 1..])
-    } else {
-        (v, "0")
-    }
-}
-
-fn compare_upstream(a: &str, b: &str) -> std::cmp::Ordering {
-    let mut ai = a.chars().peekable();
-    let mut bi = b.chars().peekable();
-    loop {
-        let a_str: String = ai.by_ref().take_while(|c| !c.is_ascii_digit()).collect();
-        let b_str: String = bi.by_ref().take_while(|c| !c.is_ascii_digit()).collect();
-        let sc = compare_non_digit(&a_str, &b_str);
-        if sc != std::cmp::Ordering::Equal { return sc; }
-        let a_num: String = ai.by_ref().take_while(|c| c.is_ascii_digit()).collect();
-        let b_num: String = bi.by_ref().take_while(|c| c.is_ascii_digit()).collect();
-        if a_num.is_empty() && b_num.is_empty() { break; }
-        let an: u64 = a_num.parse().unwrap_or(0);
-        let bn: u64 = b_num.parse().unwrap_or(0);
-        let nc = an.cmp(&bn);
-        if nc != std::cmp::Ordering::Equal { return nc; }
-    }
-    std::cmp::Ordering::Equal
-}
-
-fn compare_non_digit(a: &str, b: &str) -> std::cmp::Ordering {
-    let order = |c: char| -> i32 {
-        if c == '~' { -1 }
-        else if c.is_ascii_alphabetic() { c as i32 }
-        else { c as i32 + 256 }
-    };
-    let mut ai = a.chars();
-    let mut bi = b.chars();
-    loop {
-        match (ai.next(), bi.next()) {
-            (None, None)       => return std::cmp::Ordering::Equal,
-            (None, Some(bc))   => return if bc == '~' { std::cmp::Ordering::Greater } else { std::cmp::Ordering::Less },
-            (Some(ac), None)   => return if ac == '~' { std::cmp::Ordering::Less } else { std::cmp::Ordering::Greater },
-            (Some(ac), Some(bc)) => {
-                let cmp = order(ac).cmp(&order(bc));
-                if cmp != std::cmp::Ordering::Equal { return cmp; }
-            }
-        }
-    }
-}
-
-pub fn version_satisfies(installed: &str, op: &VersionOp, required: &str) -> bool {
-    let c = version_cmp(installed, required);
-    match op {
-        VersionOp::Eq => c == std::cmp::Ordering::Equal,
-        VersionOp::Ge => c != std::cmp::Ordering::Less,
-        VersionOp::Le => c != std::cmp::Ordering::Greater,
-        VersionOp::Gt => c == std::cmp::Ordering::Greater,
-        VersionOp::Lt => c == std::cmp::Ordering::Less,
-    }
+pub fn version_satisfies(installed: &str, op: &str, required: &str) -> bool {
+    crate::solver::version::satisfies(installed, op, required)
 }
