@@ -1033,9 +1033,10 @@ async fn cmd_user_remove(env: &UserEnv, args: &[String]) -> Result<()> {
     };
     gdb.generations.push(gen); gdb.current = gen_num; gdb.save_to(&env.gens_file)?;
 
-    // Remove wrappers
+    // Remove wrappers from env.hammer_dir/bin
+    let bin_dir = env.hammer_dir.join("bin");
     for name in &names {
-        let w = env.bin_dir.join(name);
+        let w = bin_dir.join(name);
         if w.symlink_metadata().is_ok() { std::fs::remove_file(&w).ok(); }
     }
     println!("  {} Removed {} package(s) from user profile.", "✔".bright_green(), names.len().to_string().bold());
