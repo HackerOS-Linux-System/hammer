@@ -1,16 +1,15 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque};
 use anyhow::Result;
 
-use crate::cache::PackageCache;
-use crate::db::InstalledDb;
 use crate::package::{parse_dep_field, Package};
 use crate::solver::conflicts::{self, ConflictInfo};
 use crate::solver::error::{SolverError, SolverProblem};
 use crate::solver::version::{compare, satisfies};
+use crate::solver::provides::ProvidesMap;
 use super::{Solver, TransactionPlan};
 
 // ─────────────────────────────────────────────────────────────
-//  Architecture helpers
+//  Architecture helper
 // ─────────────────────────────────────────────────────────────
 
 pub(crate) fn arch_matches(pkg_arch: &str, sys_arch: &str) -> bool {
@@ -18,18 +17,18 @@ pub(crate) fn arch_matches(pkg_arch: &str, sys_arch: &str) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Internal pool (package lookup helpers)
+//  Pool — internal package lookup
 // ─────────────────────────────────────────────────────────────
 
 struct Pool<'a> {
-    cache:    &'a PackageCache,
-    db:       &'a InstalledDb,
-    provides: crate::solver::provides::ProvidesMap,
+    cache:    &'a crate::cache::PackageCache,
+    db:       &'a crate::db::InstalledDb,
+    provides: ProvidesMap,
     arch:     String,
 }
 
 impl<'a> Pool<'a> {
-    fn new(cache: &'a PackageCache, db: &'a InstalledDb) -> Self {
+    fn new(cache: &'a crate::cache::PackageCache, db: &'a crate::db::InstalledDb) -> Self {
         let arch     = crate::cache::detect_arch();
         let provides = crate::solver::provides::build(cache);
         Pool { cache, db, provides, arch }
@@ -37,8 +36,7 @@ impl<'a> Pool<'a> {
 
     fn best(&self, name: &str) -> Option<&Package> {
         let real = self.provides.resolve(name);
-        self.cache.all_packages()
-        .into_iter()
+        self.cache.all_packages().into_iter()
         .filter(|p| p.name == real && arch_matches(&p.architecture, &self.arch))
         .max_by(|a, b| compare(&a.version, &b.version))
     }
@@ -88,9 +86,7 @@ pub(super) fn resolve_install(
         let pkg = match pool.best(&real) {
             Some(p) => p.clone(),
             None    => {
-                plan.warnings.push(format!(
-                    "dependency '{}' not found in package index — skipped", real
-                ));
+                plan.warnings.push(format!("dependency '{}' not found — skipped", real));
                 continue;
             }
         };
@@ -114,11 +110,9 @@ pub(super) fn resolve_install(
             continue;
         }
 
-        // FIX E0502: collect conflicts first into a local Vec,
-        // then extend plan — no simultaneous borrow of plan.
-        let found_conflicts: Vec<ConflictInfo> =
-        conflicts::check_install(&pkg, solver.db);
-        for c in &found_conflicts {
+        // FIX E0502: collect conflicts into local Vec first, then extend plan
+        let found: Vec<ConflictInfo> = conflicts::check_install(&pkg, solver.db);
+        for c in &found {
             if c.hard { plan.conflicts.push(c.message.clone()); }
             else      { plan.warnings.push(c.message.clone()); }
         }
@@ -154,15 +148,10 @@ pub(super) fn resolve_reinstall(solver: &Solver<'_>, names: &[String]) -> Result
                 continue;
             }
         };
-
         if !arch_matches(&pkg.architecture, &pool.arch) {
-            plan.conflicts.push(format!(
-                "Package '{}' is for {} but system is {}",
-                pkg.name, pkg.architecture, pool.arch
-            ));
+            plan.conflicts.push(format!("Package '{}' arch mismatch: {} vs {}", pkg.name, pkg.architecture, pool.arch));
             continue;
         }
-
         if let Some(inst) = solver.db.get(name) {
             plan.upgrade_from.insert(name.clone(), inst.version.clone());
             plan.to_upgrade.push(pkg.clone());
@@ -173,9 +162,7 @@ pub(super) fn resolve_reinstall(solver: &Solver<'_>, names: &[String]) -> Result
         plan.install_bytes  += pkg.installed_size_kb.unwrap_or(0) * 1024;
     }
 
-    if !problems.is_empty() {
-        return Err(SolverError::new(problems).into());
-    }
+    if !problems.is_empty() { return Err(SolverError::new(problems).into()); }
     Ok(plan)
 }
 
@@ -193,22 +180,15 @@ pub(super) fn resolve_remove(solver: &Solver<'_>, names: &[String]) -> Result<Tr
                 plan.freed_bytes += inst.installed_size_kb * 1024;
                 plan.to_remove.push(name.clone());
             }
-            None => {
-                problems.push(SolverProblem::Generic(
-                    format!("Package '{}' is not installed.", name)
-                ));
-            }
+            None => problems.push(SolverProblem::Generic(format!("Package '{}' is not installed.", name))),
         }
     }
 
-    if !problems.is_empty() {
-        return Err(SolverError::new(problems).into());
-    }
+    if !problems.is_empty() { return Err(SolverError::new(problems).into()); }
 
-    let rdeps = conflicts::reverse_depends(names, solver.db);
-    for rdep in &rdeps {
+    for rdep in conflicts::reverse_depends(names, solver.db) {
         plan.warnings.push(format!(
-            "Removing '{}' may break installed package '{}' which depends on it",
+            "Removing '{}' may break '{}' which depends on it",
             names.join(", "), rdep
         ));
     }
@@ -244,14 +224,10 @@ pub(super) fn resolve_upgrade(solver: &Solver<'_>) -> Result<TransactionPlan> {
 pub(super) fn resolve_dist_upgrade(solver: &Solver<'_>) -> Result<TransactionPlan> {
     let pool  = Pool::new(solver.cache, solver.db);
     let mut plan = resolve_upgrade(solver)?;
-
     let mut queue: VecDeque<(String, bool)> = VecDeque::new();
-    let mut seen: HashSet<String> = plan.to_upgrade.iter()
-    .map(|p| p.name.clone()).collect();
+    let mut seen: HashSet<String> = plan.to_upgrade.iter().map(|p| p.name.clone()).collect();
 
-    for pkg in &plan.to_upgrade.clone() {
-        enqueue_deps(pkg, false, &pool, &mut queue);
-    }
+    for pkg in &plan.to_upgrade.clone() { enqueue_deps(pkg, false, &pool, &mut queue); }
 
     while let Some((name, _)) = queue.pop_front() {
         if seen.contains(&name) { continue; }
@@ -267,9 +243,7 @@ pub(super) fn resolve_dist_upgrade(solver: &Solver<'_>) -> Result<TransactionPla
     }
 
     plan.to_install.sort_by(|a, b| a.name.cmp(&b.name));
-    plan.warnings.push(
-        "dist-upgrade: aggressive upgrade — review the package list carefully.".to_string()
-    );
+    plan.warnings.push("dist-upgrade: aggressive upgrade — review the package list carefully.".to_string());
     Ok(plan)
 }
 
@@ -287,13 +261,9 @@ pub(super) fn resolve_autoremove(solver: &Solver<'_>) -> Result<TransactionPlan>
         if let Some(pkg) = solver.db.get(&name) {
             if let Some(ref dep_str) = pkg.depends {
                 for group in parse_dep_field(dep_str) {
-                    if let Some(dep) = group.alternatives.iter()
-                        .find(|a| solver.db.is_installed(&a.name))
-                        {
-                            if needed.insert(dep.name.clone()) {
-                                queue.push_back(dep.name.clone());
-                            }
-                        }
+                    if let Some(dep) = group.alternatives.iter().find(|a| solver.db.is_installed(&a.name)) {
+                        if needed.insert(dep.name.clone()) { queue.push_back(dep.name.clone()); }
+                    }
                 }
             }
         }
@@ -301,7 +271,7 @@ pub(super) fn resolve_autoremove(solver: &Solver<'_>) -> Result<TransactionPlan>
 
     for pkg in solver.db.list_all()? {
         if !needed.contains(&pkg.name) {
-            plan.freed_bytes   += pkg.installed_size_kb * 1024;
+            plan.freed_bytes += pkg.installed_size_kb * 1024;
             plan.to_autoremove.push(pkg.name.clone());
         }
     }
@@ -324,25 +294,23 @@ pub(super) fn resolve_fix_broken(solver: &Solver<'_>) -> Result<TransactionPlan>
             for group in parse_dep_field(dep_str) {
                 let satisfied = group.alternatives.iter().any(|alt| {
                     if let Some(i) = solver.db.get(&alt.name) {
-                        if let Some(ref c) = alt.constraint {
-                            return satisfies(&i.version, c.op.as_str(), &c.version);
-                        }
-                        return true;
-                    }
-                    false
+                        alt.constraint.as_ref()
+                        .map(|c| satisfies(&i.version, c.op.as_str(), &c.version))
+                        .unwrap_or(true)
+                    } else { false }
                 });
                 if !satisfied {
-                    let found = group.alternatives.iter()
-                    .find(|a| pool.best(&a.name).map_or(false, |p| arch_matches(&p.architecture, &pool.arch)));
-                    if let Some(dep) = found {
-                        to_install.insert(dep.name.clone());
-                    } else {
-                        broken.push(format!(
-                            "{}: cannot satisfy '{}'",
-                            inst.name,
-                            group.alternatives.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(" | ")
-                        ));
-                    }
+                    if let Some(dep) = group.alternatives.iter()
+                        .find(|a| pool.best(&a.name).map_or(false, |p| arch_matches(&p.architecture, &pool.arch)))
+                        {
+                            to_install.insert(dep.name.clone());
+                        } else {
+                            broken.push(format!(
+                                "{}: cannot satisfy '{}'",
+                                inst.name,
+                                group.alternatives.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(" | ")
+                            ));
+                        }
                 }
             }
         }
@@ -357,25 +325,18 @@ pub(super) fn resolve_fix_broken(solver: &Solver<'_>) -> Result<TransactionPlan>
     }
 
     for msg in broken { plan.warnings.push(msg); }
-
     if plan.is_empty() && plan.warnings.is_empty() {
         plan.warnings.push("No broken dependencies found.".to_string());
     }
-
     plan.to_install.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(plan)
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Helpers
+//  enqueue_deps helper
 // ─────────────────────────────────────────────────────────────
 
-fn enqueue_deps(
-    pkg:           &Package,
-    no_recommends: bool,
-    pool:          &Pool<'_>,
-    queue:         &mut VecDeque<(String, bool)>,
-) {
+fn enqueue_deps(pkg: &Package, no_recommends: bool, pool: &Pool<'_>, queue: &mut VecDeque<(String, bool)>) {
     let fields: &[Option<&str>] = &[
         pkg.pre_depends.as_deref(),
         pkg.depends.as_deref(),
@@ -385,20 +346,15 @@ fn enqueue_deps(
         for group in parse_dep_field(field) {
             let chosen = group.alternatives.iter().find(|alt| {
                 if let Some(inst) = pool.db.get(&alt.name) {
-                    if let Some(ref c) = alt.constraint {
-                        return satisfies(&inst.version, c.op.as_str(), &c.version);
-                    }
-                    return true;
-                }
-                false
-            }).or_else(|| {
-                group.alternatives.iter().find(|alt| pool.best(&alt.name).is_some())
-            });
+                    alt.constraint.as_ref()
+                    .map(|c| satisfies(&inst.version, c.op.as_str(), &c.version))
+                    .unwrap_or(true)
+                } else { false }
+            }).or_else(|| group.alternatives.iter().find(|alt| pool.best(&alt.name).is_some()));
 
             if let Some(dep) = chosen {
                 let bare = dep.name.split(':').next().unwrap_or(&dep.name);
-                let real = pool.resolve(bare);
-                queue.push_back((real, false));
+                queue.push_back((pool.resolve(bare), false));
             }
         }
     }
