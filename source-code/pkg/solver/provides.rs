@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use crate::cache::PackageCache;
-use crate::package::parse_dep_field;
+use crate::package::{parse_dep_field, VersionOp};
 
 #[derive(Debug, Default)]
 pub struct ProvidesMap {
@@ -38,9 +38,9 @@ pub fn build(cache: &PackageCache) -> ProvidesMap {
         if let Some(ref provides_str) = pkg.provides {
             for group in parse_dep_field(provides_str) {
                 for alt in &group.alternatives {
-                    // FIX: c.op is VersionOp — compare via as_str()
+                    // FIX: compare enum variant, not string
                     let prov_ver = alt.constraint.as_ref()
-                    .filter(|c| c.op.as_str() == "=")
+                    .filter(|c| c.op == VersionOp::Eq)
                     .map(|c| c.version.clone());
 
                     inner.entry(alt.name.clone())
