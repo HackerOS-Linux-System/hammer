@@ -16,6 +16,14 @@ pub struct DebPackage {
     pub data_bytes:       Vec<u8>,
     pub data_compression: Compression,
     pub file_list:        Vec<String>,
+    /// Content of the postinst maintainer script (if present)
+    pub postinst:         Option<String>,
+    /// Content of the preinst maintainer script (if present)
+    pub preinst:          Option<String>,
+    /// Content of the postrm maintainer script (if present)
+    pub postrm:           Option<String>,
+    /// Content of the prerm maintainer script (if present)
+    pub prerm:            Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -74,28 +82,27 @@ impl DebPackage {
         let control   = Package::parse_block(&control_raw).context("Parsing control")?;
         let file_list = list_regular_files(&data_bytes, data_comp).unwrap_or_default();
 
+        // Extract maintainer scripts from control.tar
+        let control_tar_decompressed = decompress(&control_tar, control_comp)
+        .unwrap_or_default();
+        let postinst = extract_script_from_tar(&control_tar_decompressed, "postinst");
+        let preinst  = extract_script_from_tar(&control_tar_decompressed, "preinst");
+        let postrm   = extract_script_from_tar(&control_tar_decompressed, "postrm");
+        let prerm    = extract_script_from_tar(&control_tar_decompressed, "prerm");
+
         Ok(DebPackage {
             control, control_raw,
             control_tar, control_comp,
             data_bytes, data_compression: data_comp,
             file_list,
+            postinst, preinst, postrm, prerm,
         })
     }
 
+    /// Extract a named maintainer script from the control.tar.
     pub fn extract_script(&self, name: &str) -> Option<String> {
         let tar = decompress(&self.control_tar, self.control_comp).ok()?;
-        let mut archive = tar::Archive::new(Cursor::new(tar));
-        for entry in archive.entries().ok()? {
-            let mut entry  = entry.ok()?;
-            let path       = entry.path().ok()?;
-            let entry_name = path.to_string_lossy();
-            if entry_name == format!("./{}", name) || entry_name == name {
-                let mut s = String::new();
-                entry.read_to_string(&mut s).ok()?;
-                return Some(s);
-            }
-        }
-        None
+        extract_script_from_tar(&tar, name)
     }
 
     /// Extract data.tar into `root`.
@@ -155,8 +162,25 @@ fn extract_control_file(tar_bytes: &[u8]) -> Result<String> {
     bail!("./control not found in control.tar")
 }
 
+fn extract_script_from_tar(tar_bytes: &[u8], script_name: &str) -> Option<String> {
+    if tar_bytes.is_empty() { return None; }
+    let mut archive = tar::Archive::new(Cursor::new(tar_bytes));
+    let entries = archive.entries().ok()?;
+    for entry in entries {
+        let mut entry = entry.ok()?;
+        let path      = entry.path().ok()?;
+        let name      = path.to_string_lossy();
+        if name == format!("./{}", script_name) || name == script_name {
+            let mut s = String::new();
+            entry.read_to_string(&mut s).ok()?;
+            return Some(s);
+        }
+    }
+    None
+}
+
 fn list_regular_files(bytes: &[u8], comp: Compression) -> Result<Vec<String>> {
-    let tar     = decompress(bytes, comp)?;
+    let tar         = decompress(bytes, comp)?;
     let mut archive = tar::Archive::new(Cursor::new(tar));
     let mut files   = Vec::new();
     for entry in archive.entries()? {
