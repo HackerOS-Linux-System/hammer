@@ -1,85 +1,65 @@
+use anyhow::Result;
+use crate::package::Package;
 use crate::profile::GenerationsDb;
 
 // ─────────────────────────────────────────────────────────────
-//  Types
+//  GenDiff
 // ─────────────────────────────────────────────────────────────
 
-#[derive(Debug)]
 pub struct GenDiff {
-    pub gen_a:     u32,
-    pub gen_b:     u32,
-    pub added:     Vec<DiffEntry>,
-    pub removed:   Vec<DiffEntry>,
-    pub upgraded:  Vec<DiffUpgrade>,
-    pub unchanged: usize,
+    pub from:     u32,
+    pub to:       u32,
+    pub added:    Vec<Package>,
+    pub removed:  Vec<String>,
+    pub upgraded: Vec<(Package, String)>, // (new_pkg, old_version)
 }
 
-#[derive(Debug)]
-pub struct DiffEntry {
-    pub name:    String,
-    pub version: String,
-}
+pub fn compute_diff(from: u32, to: u32, gdb: &GenerationsDb) -> Result<GenDiff> {
+    let gen_from = gdb.get(from);
+    let gen_to   = gdb.get(to);
 
-#[derive(Debug)]
-pub struct DiffUpgrade {
-    pub name:        String,
-    pub version_old: String,
-    pub version_new: String,
-}
+    let pkgs_from: std::collections::HashMap<&str, &str> = gen_from
+    .map(|g| g.packages.iter().map(|p| (p.name.as_str(), p.version.as_str())).collect())
+    .unwrap_or_default();
 
-impl GenDiff {
-    pub fn is_empty(&self) -> bool {
-        self.added.is_empty() && self.removed.is_empty() && self.upgraded.is_empty()
-    }
-    pub fn total_changes(&self) -> usize {
-        self.added.len() + self.removed.len() + self.upgraded.len()
-    }
-}
-
-// ─────────────────────────────────────────────────────────────
-//  compute_diff
-// ─────────────────────────────────────────────────────────────
-
-pub fn compute_diff(a: u32, b: u32, gens_db: &GenerationsDb) -> anyhow::Result<GenDiff> {
-    let gen_a = gens_db.get(a)
-    .ok_or_else(|| anyhow::anyhow!("Generation {} not found", a))?;
-    let gen_b = gens_db.get(b)
-    .ok_or_else(|| anyhow::anyhow!("Generation {} not found", b))?;
-
-    let map_a: std::collections::HashMap<&str, &str> = gen_a.packages.iter()
-    .map(|p| (p.name.as_str(), p.version.as_str())).collect();
-    let map_b: std::collections::HashMap<&str, &str> = gen_b.packages.iter()
-    .map(|p| (p.name.as_str(), p.version.as_str())).collect();
+    let pkgs_to: std::collections::HashMap<&str, &str> = gen_to
+    .map(|g| g.packages.iter().map(|p| (p.name.as_str(), p.version.as_str())).collect())
+    .unwrap_or_default();
 
     let mut added    = Vec::new();
     let mut removed  = Vec::new();
     let mut upgraded = Vec::new();
-    let mut unchanged = 0usize;
 
-    for (name, ver) in &map_b {
-        match map_a.get(name) {
-            None => added.push(DiffEntry { name: name.to_string(), version: ver.to_string() }),
-            Some(old_ver) => {
-                if *old_ver != *ver {
-                    upgraded.push(DiffUpgrade {
-                        name:        name.to_string(),
-                                  version_old: old_ver.to_string(),
-                                  version_new: ver.to_string(),
-                    });
-                } else {
-                    unchanged += 1;
-                }
+    for (name, new_ver) in &pkgs_to {
+        if let Some(old_ver) = pkgs_from.get(name) {
+            if old_ver != new_ver {
+                // Use Package::default() with struct update syntax
+                let pkg = Package {
+                    name:    name.to_string(),
+                    version: new_ver.to_string(),
+                    ..Package::default()
+                };
+                upgraded.push((pkg, old_ver.to_string()));
             }
+        } else {
+            let pkg = Package {
+                name:    name.to_string(),
+                version: new_ver.to_string(),
+                ..Package::default()
+            };
+            added.push(pkg);
         }
     }
-    for (name, ver) in &map_a {
-        if !map_b.contains_key(name) {
-            removed.push(DiffEntry { name: name.to_string(), version: ver.to_string() });
+
+    for name in pkgs_from.keys() {
+        if !pkgs_to.contains_key(name) {
+            removed.push(name.to_string());
         }
     }
 
     added.sort_by(|a, b| a.name.cmp(&b.name));
-    removed.sort_by(|a, b| a.name.cmp(&b.name));
-    upgraded.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(GenDiff { gen_a: a, gen_b: b, added, removed, upgraded, unchanged })
+    removed.sort();
+    upgraded.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+
+    Ok(GenDiff { from, to, added, removed, upgraded })
 }
