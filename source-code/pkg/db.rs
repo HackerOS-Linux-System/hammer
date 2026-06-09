@@ -23,7 +23,6 @@ pub struct InstalledPackage {
     pub description_short: Option<String>,
     pub installed_at:      DateTime<Utc>,
     pub reason:            InstallReason,
-    /// Store hash for this package (links to /hammer/store/<name>-<ver>-<hash>/)
     pub store_hash:        String,
     pub depends:           Option<String>,
     pub recommends:        Option<String>,
@@ -43,15 +42,20 @@ impl InstallReason {
 
 // ─────────────────────────────────────────────────────────────
 //  HistoryEntry
+//
+//  Field names used in ui.rs:
+//    e.action, e.package, e.old_ver, e.new_ver, e.generation, e.timestamp
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct HistoryEntry {
     pub id:         i64,
+    /// "install" | "remove" | "upgrade"
     pub action:     String,
     pub package:    String,
     pub old_ver:    Option<String>,
     pub new_ver:    Option<String>,
+    /// Generation number when this action occurred
     pub generation: u32,
     pub timestamp:  DateTime<Utc>,
 }
@@ -73,6 +77,16 @@ impl InstalledDb {
         }
         let conn = Connection::open(path)
         .with_context(|| format!("Cannot open database {}", DB_PATH))?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
+        let db = InstalledDb { conn };
+        db.migrate()?;
+        Ok(db)
+    }
+
+    pub fn open_at(path: &str) -> Result<Self> {
+        let p = std::path::Path::new(path);
+        if let Some(parent) = p.parent() { std::fs::create_dir_all(parent)?; }
+        let conn = rusqlite::Connection::open(p)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let db = InstalledDb { conn };
         db.migrate()?;
@@ -111,9 +125,7 @@ impl InstalledDb {
         Ok(())
     }
 
-    // ──────────────────────────────────────────────────────────
-    //  Queries
-    // ──────────────────────────────────────────────────────────
+    // ── Queries ───────────────────────────────────────────────
 
     pub fn is_installed(&self, name: &str) -> bool {
         self.conn.query_row(
@@ -156,9 +168,7 @@ impl InstalledDb {
         .unwrap_or(0) as usize
     }
 
-    // ──────────────────────────────────────────────────────────
-    //  Mutations
-    // ──────────────────────────────────────────────────────────
+    // ── Mutations ─────────────────────────────────────────────
 
     pub fn record_install(
         &self,
@@ -265,16 +275,4 @@ fn row_to_installed(row: &rusqlite::Row) -> rusqlite::Result<InstalledPackage> {
        depends:           row.get(10)?,
        recommends:        row.get(11)?,
     })
-}
-
-impl InstalledDb {
-    pub fn open_at(path: &str) -> anyhow::Result<Self> {
-        let p = std::path::Path::new(path);
-        if let Some(parent) = p.parent() { std::fs::create_dir_all(parent)?; }
-        let conn = rusqlite::Connection::open(p)?;
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let db = InstalledDb { conn };
-        db.migrate()?;
-        Ok(db)
-    }
 }
