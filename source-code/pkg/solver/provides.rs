@@ -22,7 +22,11 @@ impl ProvidesMap {
     }
 
     pub fn is_virtual(&self, name: &str) -> bool {
-        self.inner.contains_key(name)
+        // Virtual = exists in map but has no package with that exact name
+        match self.inner.get(name) {
+            None => false,
+            Some(providers) => providers.iter().all(|(real, _)| real != name),
+        }
     }
 }
 
@@ -38,11 +42,9 @@ pub fn build(cache: &PackageCache) -> ProvidesMap {
         if let Some(ref provides_str) = pkg.provides {
             for group in parse_dep_field(provides_str) {
                 for alt in &group.alternatives {
-                    // FIX: compare enum variant, not string
                     let prov_ver = alt.constraint.as_ref()
                     .filter(|c| c.op == VersionOp::Eq)
                     .map(|c| c.version.clone());
-
                     inner.entry(alt.name.clone())
                     .or_default()
                     .push((pkg.name.clone(), prov_ver));
@@ -51,7 +53,7 @@ pub fn build(cache: &PackageCache) -> ProvidesMap {
         }
     }
 
-    // Sort: exact name matches first
+    // Sort: exact name matches first, then dedup
     for (key, providers) in inner.iter_mut() {
         providers.sort_by(|(a, _), (b, _)| {
             let a_exact = a == key;
