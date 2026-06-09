@@ -1,85 +1,140 @@
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use anyhow::Result;
 use owo_colors::OwoColorize;
 use std::io::{self, Write};
-use std::time::Duration;
 
-use crate::db::HistoryEntry;
+use crate::db::{HistoryEntry, InstalledDb};
+use crate::diff::GenDiff;
 use crate::package::Package;
 use crate::profile::{ActivationResult, GenerationsDb};
 use crate::solver::TransactionPlan;
-use crate::store::Store;
 
 // ─────────────────────────────────────────────────────────────
-//  Terminal helpers
-// ─────────────────────────────────────────────────────────────
-
-pub fn term_width() -> usize {
-    terminal_size::terminal_size()
-    .map(|(w, _)| w.0 as usize)
-    .unwrap_or(80)
-    .min(120)
-}
-
-fn rule(ch: char) -> String { ch.to_string().repeat(term_width()) }
-fn thin()  -> String { rule('─') }
-fn thick() -> String { rule('━') }
-
-// ─────────────────────────────────────────────────────────────
-//  Header
+//  Header / fatal / helpers
 // ─────────────────────────────────────────────────────────────
 
 pub fn print_header() {
     println!();
-    println!("  {}  {}", "⬡ hammer".bold().bright_cyan(),
+    println!("  {} {}",
+             "⬡ hammer".bright_cyan().bold(),
              format!("v{}", env!("CARGO_PKG_VERSION")).dimmed());
-    println!("  {}", thin().dimmed());
-    println!();
+    println!("  {}", "─".repeat(60).dimmed());
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Section / step markers
-// ─────────────────────────────────────────────────────────────
-
-pub fn section(title: &str) {
-    println!("  {} {}", "::".bold().cyan(), title.bold());
+pub fn fatal(msg: &str) {
+    eprintln!();
+    eprintln!("  {} {}", "✗ error:".red().bold(), msg);
+    eprintln!();
 }
 
-pub fn step_minor(action: &str, name: &str, version: &str) {
-    if version.is_empty() {
-        println!("  {} {:<18} {}", "→".dimmed(), action.bold(), name.cyan());
+pub fn nothing_to_do() {
+    println!("  {} Nothing to do.", "·".dimmed());
+}
+
+pub fn deps_resolved() {
+    println!("  {} Dependencies resolved.", "✔".bright_green());
+}
+
+pub fn confirm(prompt: &str) -> Result<bool> {
+    print!("\n  {} [Y/n] ", prompt.bold());
+    io::stdout().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    let t = line.trim().to_lowercase();
+    Ok(t.is_empty() || t == "y" || t == "yes")
+}
+
+pub fn human_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.1} MiB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1_024 {
+        format!("{:.0} KiB", bytes as f64 / 1_024.0)
+    } else if bytes > 0 {
+        format!("{} B", bytes)
     } else {
-        println!("  {} {:<18} {} {}", "→".dimmed(), action.bold(), name.cyan(), version.dimmed());
+        String::new()
     }
 }
 
-pub fn step_pending(old: u32, new: u32) {
-    println!("  {} Staging     {} {} {}",
-             "⬡".yellow().bold(), format!("gen-{}", old).dimmed(), "→".bold(),
-             format!("gen-{}", new).bright_yellow().bold());
-}
-
-pub fn step_switch(old: u32, new: u32) {
-    println!("  {} Switching   {} {} {}",
-             "⬡".bright_cyan().bold(), format!("gen-{}", old).dimmed(), "→".bold(),
-             format!("gen-{}", new).bright_cyan().bold());
-}
-
 // ─────────────────────────────────────────────────────────────
-//  Pending notice
+//  Transaction table
 // ─────────────────────────────────────────────────────────────
 
-pub fn print_pending_notice(gen_number: u32) {
+pub fn print_transaction_table(plan: &TransactionPlan, _arch: &str) {
+    let col_w = 36usize;
+
+    if !plan.to_install.is_empty() {
+        println!();
+        println!("  {}", "Packages to install:".bold());
+        println!("  {}", "─".repeat(80).dimmed());
+        for pkg in &plan.to_install {
+            let sz = human_size(pkg.download_size.unwrap_or(0));
+            println!("  {:<width$} {:<16} {:<10} {}",
+                     pkg.name.bright_green().bold(),
+                     pkg.version.cyan(),
+                     pkg.architecture.dimmed(),
+                     sz.dimmed(),
+                     width = col_w);
+        }
+    }
+
+    if !plan.to_upgrade.is_empty() {
+        println!();
+        println!("  {}", "Packages to upgrade:".bold());
+        println!("  {}", "─".repeat(80).dimmed());
+        for pkg in &plan.to_upgrade {
+            let old = plan.upgrade_from.get(&pkg.name).map(|v| v.as_str()).unwrap_or("?");
+            let sz  = human_size(pkg.download_size.unwrap_or(0));
+            println!("  {:<width$} {} → {} {}",
+                     pkg.name.yellow().bold(),
+                     old.dimmed(), pkg.version.bright_yellow(),
+                     sz.dimmed(), width = col_w);
+        }
+    }
+
+    if !plan.to_remove.is_empty() {
+        println!();
+        println!("  {}", "Packages to remove:".bold());
+        println!("  {}", "─".repeat(80).dimmed());
+        for name in &plan.to_remove {
+            println!("  {}", name.red().bold());
+        }
+    }
+
+    if !plan.to_autoremove.is_empty() {
+        println!();
+        println!("  {}", "Auto-remove (no longer needed):".bold());
+        println!("  {}", "─".repeat(80).dimmed());
+        println!("  {}", plan.to_autoremove.iter()
+        .map(|s| s.dimmed().to_string()).collect::<Vec<_>>().join("  "));
+    }
+}
+
+pub fn print_transaction_summary(plan: &TransactionPlan) {
     println!();
-    println!("  {}", thick().dimmed());
-    println!("  {}  Generation {} has been staged.",
-             "⬡".bright_yellow().bold(), format!("gen-{}", gen_number).bold());
+    println!("  {}", "─".repeat(60).dimmed());
+    let install = plan.to_install.len() + plan.to_upgrade.len();
+    let remove  = plan.to_remove.len()  + plan.to_autoremove.len();
+    if install > 0 { println!("  {:<28} {}", "Install/upgrade:".bold(), install.to_string().bright_green()); }
+    if remove  > 0 { println!("  {:<28} {}", "Remove:".bold(),          remove.to_string().red()); }
+    if plan.download_bytes > 0 { println!("  {:<28} {}", "Download:".bold(),       human_size(plan.download_bytes).cyan()); }
+    if plan.install_bytes  > 0 { println!("  {:<28} {}", "Installed size:".bold(), human_size(plan.install_bytes).cyan()); }
+    if plan.freed_bytes    > 0 { println!("  {:<28} {}", "Freed:".bold(),          human_size(plan.freed_bytes).green()); }
+    for w in &plan.warnings { println!("  {} {}", "warn:".yellow().bold(), w.yellow()); }
     println!();
-    println!("  Changes will take effect {}", "after the next reboot.".bold());
+}
+
+pub fn print_pending_notice(gen_num: u32) {
     println!();
-    println!("  {:<28} {}", "See what's staged:".dimmed(), "hammer status".cyan());
-    println!("  {:<28} {}", "Cancel pending changes:".dimmed(), "hammer pending cancel".cyan());
-    println!("  {:<28} {}", "Rollback after reboot:".dimmed(), "hammer rollback".cyan());
-    println!("  {}", thick().dimmed());
+    println!("  {}", "─".repeat(60).dimmed());
+    println!("  {}  Changes staged as {}",
+             "⬡".bright_yellow().bold(),
+             format!("gen-{}", gen_num).bold().bright_yellow());
+    println!("  {}  Reboot to activate, or:", "·".dimmed());
+    println!("    {}    show what changed",     "hammer diff".cyan());
+    println!("    {}   cancel pending changes", "hammer pending cancel".cyan());
+    println!("    {}  apply without reboot",    "hammer pending apply-live".cyan());
     println!();
 }
 
@@ -88,49 +143,98 @@ pub fn print_pending_notice(gen_number: u32) {
 // ─────────────────────────────────────────────────────────────
 
 pub fn print_activation_result(r: &ActivationResult) {
-    if r.nothing_to_do {
-        println!("  {} hammer: no pending generation, nothing to activate.", "·".dimmed());
-        return;
+    println!();
+    println!("  {}  Boot activation complete", "⬡".bright_cyan().bold());
+    println!("  {}", "─".repeat(60).dimmed());
+
+    if r.already_active {
+        println!("  {}  gen-{} already active — relinking binaries", "·".dimmed(), r.gen_number);
+    } else {
+        println!("  {:<28} gen-{}",
+                 "Activated generation:".bold(),
+                 r.gen_number.to_string().bright_green().bold());
+    }
+
+    if r.packages_linked > 0 {
+        println!("  {:<28} {}", "Binaries linked to PATH:".bold(),
+                 r.packages_linked.to_string().bright_green());
+    } else {
+        println!("  {:<28} {}",
+                 "Binaries linked to PATH:".bold(),
+                 "0 — run `hammer relink` if commands are missing".yellow());
+    }
+
+    if !r.scripts_failed.is_empty() {
+        println!();
+        println!("  {} {} postinst script(s) failed:", "!".yellow().bold(), r.scripts_failed.len());
+        for pkg in &r.scripts_failed {
+            println!("    {} {}", "·".yellow(), pkg.yellow());
+        }
+        println!("  Try: {}", "hammer fix-broken".cyan());
     }
     println!();
-    println!("  {} hammer: activated {}", "✔".bright_green().bold(),
-             format!("gen-{}", r.generation).bold());
-    if r.etc_merged > 0 {
-        println!("  {:<30} {}", "config files installed:", r.etc_merged.to_string().cyan());
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Search results
+// ─────────────────────────────────────────────────────────────
+
+pub fn print_search_header(query: &str, count: usize) {
+    println!();
+    if count == 0 {
+        println!("  {} No packages found matching '{}'.", "·".dimmed(), query.bold());
+        println!("  Run {} to refresh the index.", "hammer sync".cyan());
+    } else {
+        println!("  {} {} package{} matching '{}'",
+                 "✔".bright_green(), count.to_string().bold(),
+                 if count == 1 { "" } else { "s" }, query.bold());
     }
-    if !r.etc_conflicts.is_empty() {
-        println!("  {:<30} {} (saved as *.hammer-new)",
-                 "config conflicts:".yellow(), r.etc_conflicts.len().to_string().yellow());
-        for path in &r.etc_conflicts { println!("    {} {}", "·".yellow(), path.dimmed()); }
+    println!("  {}", "─".repeat(70).dimmed());
+}
+
+pub fn print_search_result(pkg: &Package, installed: bool) {
+    let inst_mark = if installed { "✔".bright_green().to_string() } else { "·".dimmed().to_string() };
+    let name_col  = if installed { pkg.name.bright_green().bold().to_string() } else { pkg.name.bold().to_string() };
+    let desc = pkg.description_short.as_deref().unwrap_or("").chars().take(52).collect::<String>();
+    println!("  {} {:<36} {:<16}  {}", inst_mark, name_col, pkg.version.cyan(), desc.dimmed());
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Package info
+// ─────────────────────────────────────────────────────────────
+
+pub fn print_package_info(pkg: &Package, installed: bool, installed_version: Option<&str>) {
+    println!();
+    println!("  {} {}", pkg.name.bold().bright_cyan(), pkg.version.cyan());
+    println!("  {}", "─".repeat(60).dimmed());
+
+    let status = if installed {
+        if installed_version.map_or(true, |v| v == pkg.version) {
+            "installed (up to date)".bright_green().to_string()
+        } else {
+            format!("installed ({}) — upgrade available", installed_version.unwrap_or("?")).yellow().to_string()
+        }
+    } else {
+        "not installed".dimmed().to_string()
+    };
+
+    println!("  {:<20} {}", "Status:".bold(), status);
+    println!("  {:<20} {}", "Architecture:".bold(), pkg.architecture.dimmed());
+    if let Some(ref s) = pkg.section    { println!("  {:<20} {}", "Section:".bold(), s.dimmed()); }
+    if let Some(ref m) = pkg.maintainer { println!("  {:<20} {}", "Maintainer:".bold(), m.dimmed()); }
+    if let Some(sz) = pkg.installed_size_kb {
+        println!("  {:<20} {}", "Installed size:".bold(), human_size(sz * 1024).cyan());
     }
-    if r.ldconfig_ran  { println!("  {:<30} {}", "shared libraries:", "updated".green()); }
-    if !r.units_installed.is_empty() {
-        println!("  {:<30} {}", "systemd units:", r.units_installed.join(", ").cyan());
+    if let Some(ref d) = pkg.description_short {
+        println!(); println!("  {}", d.bold());
     }
-    if !r.scripts_ran.is_empty() {
-        println!("  {:<30} {}", "postinst scripts ok:", r.scripts_ran.join(", ").green());
-    }
-    if !r.scripts_failed.is_empty() {
-        println!("  {:<30} {}", "postinst FAILED:".red().bold(),
-                 r.scripts_failed.join(", ").red());
-    }
-    if !r.users_created.is_empty() {
-        println!("  {:<30} {}", "users created:", r.users_created.join(", ").cyan());
-    }
-    if r.alternatives_updated > 0 {
-        println!("  {:<30} {}", "alternatives updated:", r.alternatives_updated.to_string().cyan());
-    }
-    if r.bins_linked > 0 {
-        println!("  {:<30} {} linked, {} removed", "binaries in PATH:".bold(),
-                 r.bins_linked.to_string().bright_green(), r.bins_unlinked.to_string().dimmed());
-    }
-    if r.bins_linked == 0 && !r.nothing_to_do {
-        println!("  {} No binaries were linked to PATH — check /usr/local/bin",
-                 "warn:".yellow().bold());
-    }
-    if !r.warnings.is_empty() {
+    if let Some(ref d) = pkg.description_long {
         println!();
-        for w in &r.warnings { println!("  {} {}", "warn:".yellow().bold(), w.yellow()); }
+        for line in d.lines().take(8) { println!("  {}", line.trim().dimmed()); }
+    }
+    if let Some(ref deps) = pkg.depends {
+        println!(); println!("  {}", "Depends:".bold());
+        println!("  {}", deps.dimmed());
     }
     println!();
 }
@@ -139,381 +243,140 @@ pub fn print_activation_result(r: &ActivationResult) {
 //  Status
 // ─────────────────────────────────────────────────────────────
 
-pub fn print_status(db: &crate::db::InstalledDb) {
-    use crate::profile::{read_active_gen, read_pending_gen};
-
-    print_header();
-    let gens_db = GenerationsDb::load().unwrap_or_default();
-    let active  = read_active_gen().unwrap_or(gens_db.current);
-    let pending = read_pending_gen();
-    let pkg_cnt = db.count();
-    let store_b = Store::disk_usage();
-    let gen_cnt = gens_db.generations.len();
-
-    println!("  {:<26} {}", "Active generation:".bold(),
-             format!("gen-{}", active).bright_cyan().bold());
-    if let Some(gen) = gens_db.current_gen() {
-        println!("  {:<26} {}", "Since:".bold(),
-                 gen.timestamp.format("%Y-%m-%d %H:%M UTC").to_string().dimmed());
-        if let Some(ref note) = gen.note {
-            println!("  {:<26} {}", "Last operation:".bold(), note.dimmed());
+pub fn print_status(db: &InstalledDb) {
+    println!();
+    println!("  {}  hammer status", "⬡".bright_cyan().bold());
+    println!("  {}", "─".repeat(60).dimmed());
+    let count = db.list_all().map(|v| v.len()).unwrap_or(0);
+    println!("  {:<26} {}", "Installed packages:".bold(), count.to_string().cyan().bold());
+    if let Ok(gdb) = crate::profile::GenerationsDb::load() {
+        println!("  {:<26} gen-{}", "Current generation:".bold(),
+                 gdb.current.to_string().bright_green());
+        if let Some(n) = gdb.pending {
+            println!("  {:<26} gen-{} {}",
+                     "Pending (on reboot):".bold(),
+                     n.to_string().yellow(),
+                     "(run `hammer diff` to see changes)".dimmed());
         }
-    }
-
-    if let Some(pnum) = pending {
-        println!();
-        println!("  {}", thin().dimmed());
-        println!("  {}  {} {} {}", "⬡".bright_yellow().bold(), "Pending:".bold().yellow(),
-                 format!("gen-{}", pnum).bold().bright_yellow(),
-                     "— will activate on next reboot".dimmed());
-        if let Some(gen) = gens_db.get(pnum) {
-            if let Some(ref note) = gen.note {
-                println!("  {:<26} {}", "  Staged operation:".bold(), note.cyan());
-            }
-            println!("  {:<26} {}", "  Staged packages:".bold(),
-                     gen.package_count().to_string().bold());
-        }
-        println!();
-        println!("  {:<26} {}", "  Cancel pending:".dimmed(), "hammer pending cancel".cyan());
-        println!("  {}", thin().dimmed());
-    } else {
-        println!("  {:<26} {}", "Pending:".bold(), "none".dimmed());
-    }
-
-    println!();
-    println!("  {:<26} {}", "Packages installed:".bold(), pkg_cnt.to_string().bold());
-    println!("  {:<26} {}", "Store usage:".bold(), human_size(store_b).yellow().bold().to_string());
-    println!("  {:<26} {}", "Generations:".bold(), gen_cnt.to_string().bold());
-
-    if let Ok(log) = std::fs::read_to_string(crate::profile::ACTIVATION_LOG) {
-        if let Some(line) = log.lines().filter(|l| l.contains("activated")).last() {
-            println!("  {:<26} {}", "Last activation:".bold(), line.trim().dimmed());
-        }
-    }
-    println!();
-
-    let conflicts = find_hammer_new_files();
-    if !conflicts.is_empty() {
-        println!("  {}", thin().dimmed());
-        println!("  {} {} config file conflict(s) need review:",
-                 "!".yellow().bold(), conflicts.len().to_string().yellow().bold());
-        for p in &conflicts { println!("    {} {}", "·".yellow(), p.dimmed()); }
-        println!("  Review:  original is saved as {}", "*.hammer-new".cyan());
-        println!("  {}", thin().dimmed());
-        println!();
+        println!("  {:<26} {}", "Total generations:".bold(),
+                 gdb.generations.len().to_string().dimmed());
     }
 }
 
-fn find_hammer_new_files() -> Vec<String> {
-    let mut out = Vec::new();
-    fn walk(dir: &std::path::Path, out: &mut Vec<String>) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return; };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.is_dir() { walk(&p, out); }
-            else if p.to_string_lossy().ends_with(".hammer-new") {
-                out.push(p.to_string_lossy().to_string());
-            }
-        }
-    }
-    walk(std::path::Path::new("/etc"), &mut out);
-    out
-}
-
 // ─────────────────────────────────────────────────────────────
-//  Transaction table
+//  History
+//
+//  HistoryEntry fields: id, action, package, old_ver, new_ver,
+//                       generation, timestamp
 // ─────────────────────────────────────────────────────────────
-
-pub fn print_transaction_table(plan: &TransactionPlan, _arch: &str) {
-    let name_w = 30usize; let ver_w = 22usize; let arch_w = 8usize; let repo_w = 18usize;
-    println!();
-    println!("  {}", thick().dimmed());
-    println!("  {:<name_w$} {:<ver_w$} {:<arch_w$} {:<repo_w$} {}",
-             "Package".bold(), "Version".bold(), "Arch".bold(), "Repository".bold(), "Size".bold());
-    println!("  {}", thick().dimmed());
-
-    if !plan.to_install.is_empty() {
-        println!("{}", "  Installing:".bold().bright_green());
-        for pkg in &plan.to_install { print_pkg_row(pkg, '+', name_w, ver_w, arch_w, repo_w); }
-    }
-    if !plan.to_upgrade.is_empty() {
-        println!("{}", "  Upgrading:".bold().yellow());
-        for pkg in &plan.to_upgrade {
-            let old = plan.upgrade_from.get(&pkg.name).map(|s| s.as_str()).unwrap_or("?");
-            print_upgrade_row(pkg, old, name_w, ver_w, arch_w, repo_w);
-        }
-    }
-    if !plan.to_remove.is_empty() {
-        println!("{}", "  Removing:".bold().red());
-        for name in &plan.to_remove { println!("  {} {}", "-".red().bold(), name.red()); }
-    }
-    if !plan.to_autoremove.is_empty() {
-        println!("{}", "  Autoremove:".bold().red());
-        for name in &plan.to_autoremove {
-            println!("  {} {}", "-".red().dimmed(), name.red().dimmed());
-        }
-    }
-    println!("  {}", thin().dimmed());
-}
-
-fn repo_short(pkg: &Package) -> &str {
-    pkg.repo_base_uri.as_deref().unwrap_or("unknown")
-    .trim_end_matches('/').split('/').last().unwrap_or("unknown")
-}
-
-fn print_pkg_row(pkg: &Package, prefix: char, nw: usize, vw: usize, aw: usize, rw: usize) {
-    let repo     = repo_short(pkg);
-    let size_str = pkg.download_size.map(human_size).unwrap_or_else(|| "?".to_string());
-    println!("  {} {:<nw$} {:<vw$} {:<aw$} {:<rw$} {}",
-             prefix.to_string().bright_green().bold(), pkg.name.bold(),
-             pkg.version.bright_white(), pkg.architecture.dimmed(), repo.dimmed(), size_str.yellow());
-}
-
-fn print_upgrade_row(pkg: &Package, old: &str, nw: usize, vw: usize, aw: usize, rw: usize) {
-    let repo     = repo_short(pkg);
-    let size_str = pkg.download_size.map(human_size).unwrap_or_else(|| "?".to_string());
-    let ver_disp = format!("{} → {}", old.dimmed(), pkg.version.bright_white());
-    println!("  {} {:<nw$} {:<vw$} {:<aw$} {:<rw$} {}",
-             "↑".yellow().bold(), pkg.name.yellow().bold(), ver_disp,
-             pkg.architecture.dimmed(), repo.dimmed(), size_str.yellow());
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Transaction summary
-// ─────────────────────────────────────────────────────────────
-
-pub fn print_transaction_summary(plan: &TransactionPlan) {
-    println!();
-    println!("  {}", "Transaction Summary".bold());
-    println!("  {}", thin().dimmed());
-    if !plan.to_install.is_empty()    { println!("  {:<14} {}", "Install:".bright_green().bold(),    plan.to_install.len().to_string().bold()); }
-    if !plan.to_upgrade.is_empty()    { println!("  {:<14} {}", "Upgrade:".yellow().bold(),          plan.to_upgrade.len().to_string().bold()); }
-    if !plan.to_remove.is_empty()     { println!("  {:<14} {}", "Remove:".red().bold(),              plan.to_remove.len().to_string().bold()); }
-    if !plan.to_autoremove.is_empty() { println!("  {:<14} {}", "Autoremove:".red().bold(),          plan.to_autoremove.len().to_string().bold()); }
-    println!();
-    if plan.download_bytes > 0 { println!("  {:<26} {}", "Total download:", human_size(plan.download_bytes).yellow().bold()); }
-    if plan.install_bytes > 0  { println!("  {:<26} {}", "After install:",  human_size(plan.install_bytes).yellow().bold()); }
-    if plan.freed_bytes > 0    { println!("  {:<26} {}", "Freed:",          human_size(plan.freed_bytes).green().bold()); }
-    if !plan.warnings.is_empty() { println!(); for w in &plan.warnings { warn(w); } }
-    println!();
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Confirm / misc
-// ─────────────────────────────────────────────────────────────
-
-pub fn confirm(prompt: &str) -> io::Result<bool> {
-    print!("  {} [{}]: ", prompt.bold(), "Y/n".bold().cyan());
-    io::stdout().flush()?;
-    let mut s = String::new();
-    io::stdin().read_line(&mut s)?;
-    let t = s.trim().to_lowercase();
-    Ok(t.is_empty() || t == "y" || t == "yes")
-}
-
-pub fn nothing_to_do() { println!("  {} Nothing to do.", "·".dimmed()); }
-pub fn deps_resolved()  { println!("  {} Dependencies resolved.", "✔".green()); }
-pub fn warn(msg: &str)  { eprintln!("  {} {}", "Warning:".yellow().bold(), msg.yellow()); }
-pub fn fatal(msg: &str) { eprintln!("  {} {}", "Error:".red().bold(), msg.bold()); }
-
-// ─────────────────────────────────────────────────────────────
-//  Generations list
-// ─────────────────────────────────────────────────────────────
-
-pub fn print_generations(gens_db: &GenerationsDb) {
-    use crate::profile::{read_active_gen, read_pending_gen};
-    let active  = read_active_gen().unwrap_or(gens_db.current);
-    let pending = read_pending_gen();
-
-    print_header();
-    println!("  {}", "Generation History".bold());
-    println!("  {}", thick().dimmed());
-    println!("  {:<6} {:<14} {:<24} {:<8} {}",
-             "#".bold(), "State".bold(), "Date".bold(), "Pkgs".bold(), "Note".bold());
-    println!("  {}", thin().dimmed());
-
-    let mut gens: Vec<_> = gens_db.generations.iter().collect();
-    gens.sort_by(|a, b| b.number.cmp(&a.number));
-
-    for gen in &gens {
-        let state_str = if Some(gen.number) == pending {
-            "⬡ pending".bright_yellow().bold().to_string()
-        } else if gen.number == active {
-            "● active ".bright_cyan().bold().to_string()
-        } else {
-            "  old    ".dimmed().to_string()
-        };
-        let date = gen.timestamp.format("%Y-%m-%d %H:%M").to_string();
-        let note = gen.note.as_deref().unwrap_or("").chars().take(36).collect::<String>();
-        println!("  {:<6} {:<22} {:<24} {:<8} {}",
-                 format!("#{}", gen.number).bold(), state_str, date.dimmed(),
-                     gen.package_count().to_string().bold(), note.dimmed());
-    }
-    println!("  {}", thin().dimmed());
-    println!("  Rollback: {}   Switch: {}   Cancel pending: {}",
-             "hammer rollback".cyan(), "hammer gen switch <N>".cyan(), "hammer pending cancel".cyan());
-    println!();
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Search
-// ─────────────────────────────────────────────────────────────
-
-pub fn print_search_header(query: &str, count: usize) {
-    println!();
-    println!("  {} results for {}:", count.to_string().bold().cyan(), query.bold());
-    println!("  {}", thin().dimmed());
-    println!("  {:<40} {:<22} {:<18} {}", "Name".bold(), "Version".bold(), "Repository".bold(), "Description".bold());
-    println!("  {}", thin().dimmed());
-}
-
-pub fn print_search_result(pkg: &Package, is_installed: bool) {
-    let mark = if is_installed { "  ✔".bright_green().bold().to_string() } else { "   ".to_string() };
-    let desc = pkg.description_short.as_deref().unwrap_or("").chars().take(36).collect::<String>();
-    let repo = repo_short(pkg);
-    let name = if is_installed { pkg.name.bold().bright_white().to_string() } else { pkg.name.clone() };
-    println!("{} {:<40} {:<22} {:<18} {}",
-             mark, format!("{}.{}", name, pkg.architecture.dimmed()),
-             pkg.version.cyan(), repo.dimmed(), desc.dimmed());
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Package info
-// ─────────────────────────────────────────────────────────────
-
-pub fn print_package_info(pkg: &Package, is_installed: bool, installed_ver: Option<&str>) {
-    println!();
-    println!("  {}", thick().dimmed());
-    let field = |label: &str, value: &str| {
-        println!("  {:<22} {}", format!("{}:", label).bold(), value);
-    };
-    field("Name", &pkg.name);
-    field("Version", &pkg.version);
-    field("Architecture", &pkg.architecture);
-    let status = if is_installed {
-        if installed_ver.map(|v| v != pkg.version).unwrap_or(false) {
-            format!("{} (installed: {})", "Upgrade available".yellow().bold(),
-                installed_ver.unwrap_or("?").dimmed())
-        } else { "Installed".bright_green().bold().to_string() }
-    } else { "Available".dimmed().to_string() };
-    field("Status", &status);
-    if let Some(s) = pkg.section.as_deref()    { field("Section",    s); }
-    if let Some(m) = pkg.maintainer.as_deref() { field("Maintainer", m); }
-    if let Some(sz) = pkg.installed_size_kb    { field("Size",     &human_size(sz * 1024)); }
-    if let Some(sz) = pkg.download_size        { field("Download", &human_size(sz)); }
-    if let Some(h) = pkg.homepage.as_deref()   { field("Homepage",   h); }
-    field("Repository", repo_short(pkg));
-    if let Some(d) = pkg.depends.as_deref()    { field("Requires",   d); }
-    if let Some(r) = pkg.recommends.as_deref() { field("Recommends", r); }
-    if let Some(c) = pkg.conflicts.as_deref()  { field("Conflicts",  c); }
-    println!("  {}", thin().dimmed());
-    if let Some(d) = pkg.description_short.as_deref() { field("Summary", d); }
-    if let Some(ref d_owned) = pkg.description_long {
-        println!("  {:<22}", "Description:".bold());
-        for line in d_owned.lines() {
-            let l = line.trim();
-            if l == "." { println!(); } else { println!("    {}", l.dimmed()); }
-        }
-    }
-    println!("  {}", thick().dimmed());
-    println!();
-}
-
-// ─────────────────────────────────────────────────────────────
-//  List / History
-// ─────────────────────────────────────────────────────────────
-
-pub fn print_list_entry(name: &str, version: &str, arch: &str, is_inst: bool, repo: &str, new_version: Option<&str>) {
-    let status = if is_inst {
-        if let Some(nv) = new_version { format!("  ↑ {}", nv.yellow()) }
-        else { "  ✔".bright_green().to_string() }
-    } else { "   ".to_string() };
-    println!("{} {:<38} {:<22} {}", status,
-             format!("{}.{}", name.bold(), arch.dimmed()), version.cyan(), repo.dimmed());
-}
 
 pub fn print_history(entries: &[HistoryEntry]) {
     println!();
-    println!("  {}", "Transaction History".bold());
-    println!("  {}", thick().dimmed());
-    println!("  {:<6} {:<12} {:<10} {:<30} {}",
-             "ID".bold(), "Action".bold(), "Gen".bold(), "Package".bold(), "Date".bold());
-    println!("  {}", thin().dimmed());
-    for e in entries {
-        let action_str = match e.action.as_str() {
-            "install" => format!("{:<10}", "install".bright_green().bold()),
-            "remove"  => format!("{:<10}", "remove".red().bold()),
-            "upgrade" => format!("{:<10}", "upgrade".yellow().bold()),
-            other     => format!("{:<10}", other),
-        };
-        let pkg_ver = match (&e.old_ver, &e.new_ver) {
-            (None, Some(nv))     => nv.clone(),
-            (Some(ov), None)     => ov.clone(),
-            (Some(ov), Some(nv)) => format!("{} → {}", ov.dimmed(), nv.bright_cyan()),
-            _                    => String::new(),
-        };
-        println!("  {:<6} {} {:<10} {:<30} {}",
-                 e.id.to_string().dimmed(), action_str,
-                 format!("gen-{}", e.generation).cyan().dimmed(),
-                     format!("{} {}", e.package.bold(), pkg_ver),
-                         e.timestamp.format("%Y-%m-%d %H:%M").to_string().dimmed());
-    }
-    println!("  {}", thick().dimmed());
-    println!();
-}
-
-// ─────────────────────────────────────────────────────────────
-//  Repo spinner / diff
-// ─────────────────────────────────────────────────────────────
-
-pub fn make_repo_spinner(label: &str, mp: &MultiProgress) -> ProgressBar {
-    let pb = mp.add(ProgressBar::new_spinner());
-    pb.set_style(
-        ProgressStyle::with_template("  {spinner:.cyan}  {prefix:<40.bold}  {wide_msg}")
-        .unwrap()
-        .tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"]),
-    );
-    pb.set_prefix(label.to_owned());
-    pb.enable_steady_tick(Duration::from_millis(80));
-    pb
-}
-
-pub fn print_diff(diff: &crate::diff::GenDiff) {
-    println!();
-    println!("  {} diff {} → {}", "⬡".cyan().bold(),
-             format!("gen-{}", diff.gen_a).dimmed(), format!("gen-{}", diff.gen_b).bold());
-    println!("  {}", "─".repeat(60).dimmed());
-    if diff.is_empty() {
-        println!("  {} No changes between gen-{} and gen-{}.", "·".dimmed(), diff.gen_a, diff.gen_b);
+    println!("  {}  Transaction history", "⬡".bright_cyan().bold());
+    println!("  {}", "─".repeat(70).dimmed());
+    if entries.is_empty() {
+        println!("  {} No transaction history.", "·".dimmed());
         return;
     }
-    if !diff.added.is_empty() {
-        println!("  {} Added ({}):", "+".bright_green().bold(), diff.added.len());
-        for e in &diff.added { println!("    {} {}  {}", "+".green(), e.name.bold(), e.version.cyan()); }
+    for e in entries {
+        let ts = e.timestamp.format("%Y-%m-%d %H:%M").to_string();
+        let op_col = match e.action.as_str() {
+            "install" => e.action.bright_green().to_string(),
+            "remove"  => e.action.red().to_string(),
+            "upgrade" => e.action.yellow().to_string(),
+            other     => other.cyan().to_string(),
+        };
+        // FIX: use e.generation (not e.gen_number which doesn't exist)
+        println!("  {}  {:<12} {:<36} gen-{}",
+                 ts.dimmed(),
+                 op_col,
+                 e.package.bold(),
+                 e.generation.to_string().cyan());
     }
-    if !diff.removed.is_empty() {
-        println!("  {} Removed ({}):", "-".red().bold(), diff.removed.len());
-        for e in &diff.removed { println!("    {} {}  {}", "-".red(), e.name.bold(), e.version.dimmed()); }
-    }
-    if !diff.upgraded.is_empty() {
-        println!("  {} Upgraded ({}):", "↑".yellow().bold(), diff.upgraded.len());
-        for e in &diff.upgraded {
-            println!("    {} {}  {} → {}", "↑".yellow(), e.name.bold(),
-                     e.version_old.as_str().dimmed(), e.version_new.as_str().bright_cyan());
-        }
-    }
-    println!("  {}", "─".repeat(60).dimmed());
-    println!("  Total: {} change(s)", diff.total_changes().to_string().bold());
-    println!();
 }
 
 // ─────────────────────────────────────────────────────────────
-//  human_size — pub so download.rs can use it
+//  Generations
 // ─────────────────────────────────────────────────────────────
 
-pub fn human_size(bytes: u64) -> String {
-    if bytes >= 1_073_741_824 { format!("{:.1} GiB", bytes as f64 / 1_073_741_824.0) }
-    else if bytes >= 1_048_576 { format!("{:.1} MiB", bytes as f64 / 1_048_576.0) }
-    else if bytes >= 1_024     { format!("{:.0} KiB", bytes as f64 / 1_024.0) }
-    else                       { format!("{} B", bytes) }
+pub fn print_generations(gdb: &GenerationsDb) {
+    println!();
+    println!("  {}  Generations", "⬡".bright_cyan().bold());
+    println!("  {}", "─".repeat(70).dimmed());
+    println!("  {:<8} {:<22} {:<8} {}", "Gen".bold(), "Date".bold(), "Pkgs".bold(), "Note".bold());
+    println!("  {}", "─".repeat(70).dimmed());
+    let mut gens = gdb.generations.clone();
+    gens.sort_by(|a, b| b.number.cmp(&a.number));
+    for gen in &gens {
+        let active  = gen.number == gdb.current;
+        let pending = gdb.pending == Some(gen.number);
+        let marker = if active        { " ← active".bright_green().to_string() }
+        else if pending  { " ← pending".yellow().to_string() }
+        else             { String::new() };
+        let ts   = gen.timestamp.format("%Y-%m-%d %H:%M").to_string();
+        let note = gen.note.as_deref().unwrap_or("").chars().take(36).collect::<String>();
+        let gen_str = if active {
+            format!("gen-{}", gen.number).bright_green().bold().to_string()
+        } else {
+            format!("gen-{}", gen.number).dimmed().to_string()
+        };
+        println!("  {:<8} {:<22} {:<8} {}{}",
+                 gen_str, ts.dimmed(), gen.packages.len().to_string().cyan(),
+                 note.dimmed(), marker);
+    }
+    println!("  {}", "─".repeat(70).dimmed());
+    println!();
+    println!("  Rollback: {}     Switch: {}",
+             "hammer rollback".cyan(), "hammer gen switch <N>".cyan());
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Diff
+// ─────────────────────────────────────────────────────────────
+
+pub fn print_diff(diff: &GenDiff) {
+    println!();
+    println!("  {}  Diff: gen-{} → gen-{}",
+             "⬡".bright_cyan().bold(), diff.from, diff.to);
+    println!("  {}", "─".repeat(60).dimmed());
+
+    if diff.added.is_empty() && diff.removed.is_empty() && diff.upgraded.is_empty() {
+        println!("  {} No differences.", "·".dimmed());
+        return;
+    }
+
+    for pkg in &diff.added {
+        println!("  {} {} {}", "+".bright_green().bold(), pkg.name.bright_green(), pkg.version.cyan());
+    }
+    for (pkg, old_ver) in &diff.upgraded {
+        println!("  {} {} {} → {}", "↑".yellow().bold(), pkg.name.yellow(), old_ver.dimmed(), pkg.version.cyan());
+    }
+    for name in &diff.removed {
+        println!("  {} {}", "-".red().bold(), name.red());
+    }
+
+    println!();
+    println!("  {} added  {} upgraded  {} removed",
+             diff.added.len().to_string().bright_green(),
+             diff.upgraded.len().to_string().yellow(),
+             diff.removed.len().to_string().red());
+}
+
+// ─────────────────────────────────────────────────────────────
+//  List entry
+// ─────────────────────────────────────────────────────────────
+
+pub fn print_list_entry(
+    name:      &str,
+    version:   &str,
+    arch:      &str,
+    installed: bool,
+    repo:      &str,
+    new_ver:   Option<&str>,
+) {
+    let inst_mark = if installed { "✔".bright_green().to_string() } else { "·".dimmed().to_string() };
+    let name_col  = if installed { name.bright_green().bold().to_string() } else { name.to_string() };
+    let upgrade   = new_ver.map_or(String::new(), |v| format!(" → {}", v.bright_cyan()));
+    println!("  {} {:<36} {:<20} {:<10} {}{}",
+             inst_mark, name_col, version.cyan(), arch.dimmed(), repo.dimmed(), upgrade);
 }
