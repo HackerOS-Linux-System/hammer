@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use crate::repo::{IndexUrl, SourcesList};
 use crate::download::HttpClient;
+use crate::gpg_verify::{self, InRelease};
 use crate::package::Package;
 
 pub const LISTS_DIR: &str = "/var/lib/hammer/lists";
@@ -44,9 +45,11 @@ impl PackageCache {
             if path.extension().map_or(false, |e| e == "pkgs") {
                 if let Ok(content) = std::fs::read_to_string(&path) {
                     let base_uri = extract_base_uri_comment(&content);
-                    let pkgs = Package::parse_index(&content);
+                    let pkgs     = Package::parse_index(&content);
                     for mut pkg in pkgs {
-                        if pkg.repo_base_uri.is_none() { pkg.repo_base_uri = base_uri.clone(); }
+                        if pkg.repo_base_uri.is_none() {
+                            pkg.repo_base_uri = base_uri.clone();
+                        }
                         cache.ingest(pkg);
                     }
                 }
@@ -55,17 +58,21 @@ impl PackageCache {
         Ok(cache)
     }
 
+    pub fn load_for_arch(_arch: &str) -> Result<Self> { Self::load() }
+
     fn ingest(&mut self, pkg: Package) {
-        let all_key = format!("{}:{}:{}", pkg.name, pkg.architecture, pkg.version);
-        self.all.insert(all_key, pkg.clone());
+        let key = format!("{}:{}:{}", pkg.name, pkg.architecture, pkg.version);
+        self.all.insert(key, pkg.clone());
         let existing_newer = self.by_name.get(&pkg.name).map_or(false, |ex| {
             crate::package::version_cmp(&ex.version, &pkg.version) == std::cmp::Ordering::Greater
         });
-        if !existing_newer { self.by_name.insert(pkg.name.clone(), pkg); }
+        if !existing_newer {
+            self.by_name.insert(pkg.name.clone(), pkg);
+        }
     }
 
     // ─────────────────────────────────────────────────────────
-    //  update — yarn-style multi-spinner
+    //  update — with GPG+SHA256 verification
     // ─────────────────────────────────────────────────────────
 
     pub async fn update(sources: &SourcesList, client: &HttpClient) -> Result<()> {
@@ -84,8 +91,7 @@ impl PackageCache {
         let header = mp.add(ProgressBar::new_spinner());
         header.set_style(
             ProgressStyle::with_template("  {prefix:.bold.cyan}  {wide_msg}")
-            .unwrap()
-            .tick_strings(&["·","·"]),
+            .unwrap().tick_strings(&["·","·"]),
         );
         header.set_prefix("hammer sync");
         header.set_message(format!(
@@ -104,10 +110,10 @@ impl PackageCache {
             pb.set_message("connecting…".dimmed().to_string());
             pb.enable_steady_tick(Duration::from_millis(80));
 
-            let client   = client.clone();
-            let base_uri = url_info.base_uri.clone();
-            let handle   = tokio::spawn(async move {
-                let result = fetch_index(&client, &url_info).await;
+            let client_c  = client.clone();
+            let base_uri  = url_info.base_uri.clone();
+            let handle    = tokio::spawn(async move {
+                let result = fetch_and_verify_index(&client_c, &url_info).await;
                 (url_info, base_uri, pb, result)
             });
             handles.push(handle);
@@ -116,49 +122,59 @@ impl PackageCache {
         let mut ok_count   = 0usize;
         let mut err_count  = 0usize;
         let mut total_pkgs = 0usize;
+        let mut gpg_failed = 0usize;
 
         for handle in handles {
             let (url_info, base_uri, pb, result) = handle.await?;
             match result {
-                Ok(content) => {
+                Ok(FetchResult { content, gpg_ok, sha256_ok }) => {
+                    // Show verification status
+                    let sig_icon = if gpg_ok { "🔒".to_string() } else { "⚠".yellow().to_string() };
+
                     let stored = format!("# hammer-base-uri: {}\n{}", base_uri, content);
                     let fname  = url_to_cache_name(&url_info.url);
                     let dest   = PathBuf::from(LISTS_DIR).join(format!("{}.pkgs", fname));
                     std::fs::write(&dest, &stored)?;
+
                     let count = Package::parse_index(&content).len();
                     total_pkgs += count;
+
+                    let sha_note = if sha256_ok { "" } else { " ⚠sha256" };
                     pb.finish_with_message(format!(
-                        "{}  {} packages",
-                        "✔".bright_green().bold(), count.to_string().cyan()
+                        "{}  {} packages{}  {}",
+                        sig_icon,
+                        count.to_string().cyan(),
+                                                   sha_note,
+                                                   if !gpg_ok { "(no signature)".yellow().to_string() } else { String::new() }
                     ));
+
+                    if !gpg_ok { gpg_failed += 1; }
                     ok_count += 1;
                 }
                 Err(e) => {
-                    pb.finish_with_message(format!(
-                        "{}  {}", "✗".red().bold(), e.to_string().dimmed()
-                    ));
+                    pb.finish_with_message(format!("{}  {}", "✗".red().bold(), e.to_string().dimmed()));
                     err_count += 1;
                 }
             }
         }
 
         header.finish_with_message(format!(
-            "Synced {}, {} failed — {} packages indexed.",
-            format!("{} source{}", ok_count, if ok_count == 1 { "" } else { "s" })
-                .green().bold(),
-                                           err_count.to_string().red(),
-                                           total_pkgs.to_string().cyan().bold()
+            "Synced {} {}{} — {} packages indexed.",
+            format!("{} source{}", ok_count, if ok_count == 1 { "" } else { "s" }).green().bold(),
+                if err_count > 0 { format!(", {} failed", err_count).red().to_string() } else { String::new() },
+                    if gpg_failed > 0 { format!(", {} unverified", gpg_failed).yellow().to_string() } else { String::new() },
+                        total_pkgs.to_string().cyan().bold()
         ));
         mp.clear().ok();
 
-        if err_count > 0 {
-            println!(
-                "  {}  {} synced, {} failed.",
-                "⬡".cyan().bold(),
-                     ok_count.to_string().green().bold(),
-                     err_count.to_string().red().bold()
-            );
+        if gpg_failed > 0 {
+            println!();
+            println!("  {} {} source(s) could not be verified by GPG.",
+                     "!".yellow().bold(), gpg_failed.to_string().yellow().bold());
+            println!("  Add trusted keys with: {}",
+                     "hammer key add <url>".cyan());
         }
+
         Ok(())
     }
 
@@ -197,12 +213,82 @@ impl PackageCache {
     }
 
     pub fn len(&self) -> usize { self.by_name.len() }
+}
 
-    pub fn all_for_arch(&self, _arch: &str) -> Vec<&Package> { self.all_packages() }
+// ─────────────────────────────────────────────────────────────
+//  fetch_and_verify_index  — 0.3 core: GPG + SHA256
+// ─────────────────────────────────────────────────────────────
 
-    /// Load cache for a specific architecture.
-    /// Currently loads all packages; caller filters by arch field for cross-arch.
-    pub fn load_for_arch(_arch: &str) -> anyhow::Result<Self> { Self::load() }
+struct FetchResult {
+    content:   String,
+    gpg_ok:    bool,
+    sha256_ok: bool,
+}
+
+async fn fetch_and_verify_index(client: &HttpClient, info: &IndexUrl) -> Result<FetchResult> {
+    let keyring_dir = std::path::Path::new(gpg_verify::KEYRING_DIR);
+    let mut gpg_ok    = false;
+    let mut sha256_ok = false;
+    let mut inrelease: Option<InRelease> = None;
+
+    // ── Step 1: Fetch and verify InRelease ────────────────────
+    match client.get_bytes(&info.inrelease_url).await {
+        Ok(bytes) => {
+            let content = String::from_utf8_lossy(&bytes).to_string();
+            // Verify GPG signature
+            match gpg_verify::verify_inrelease(&content, keyring_dir) {
+                Ok(()) => gpg_ok = true,
+                Err(e) => crate::log::warn(&format!(
+                    "cache: GPG verification failed for {}: {}", info.inrelease_url, e
+                )),
+            }
+            // Parse the InRelease
+            match InRelease::parse(&content) {
+                Ok(ir) => { inrelease = Some(ir); }
+                Err(e) => crate::log::warn(&format!("cache: cannot parse InRelease: {}", e)),
+            }
+        }
+        Err(e) => {
+            crate::log::warn(&format!("cache: cannot fetch InRelease for {}: {}", info.suite, e));
+        }
+    }
+
+    // ── Step 2: Fetch Packages index ─────────────────────────
+    let (content, bytes_used, rel_path_used) = fetch_packages_file(client, info).await?;
+
+    // ── Step 3: Verify SHA256 against InRelease ───────────────
+    if let Some(ref ir) = inrelease {
+        match ir.verify_file(&rel_path_used, &bytes_used) {
+            Ok(()) => { sha256_ok = true; }
+            Err(e) => {
+                crate::log::warn(&format!("cache: SHA256 mismatch for {}: {}", rel_path_used, e));
+            }
+        }
+    }
+
+    Ok(FetchResult { content, gpg_ok, sha256_ok })
+}
+
+/// Try Packages.xz → .gz → plain → return (text, raw_bytes, rel_path)
+async fn fetch_packages_file(
+    client: &HttpClient,
+    info:   &IndexUrl,
+) -> Result<(String, Vec<u8>, String)> {
+    let base_rel = format!("{}/binary-{}/Packages", info.component, info.arch);
+
+    for (suffix, rel_suffix) in &[(".xz", ".xz"), (".gz", ".gz"), (".bz2", ".bz2"), ("", "")] {
+        let url      = format!("{}{}", info.url, suffix);
+        let rel_path = format!("{}{}", base_rel, rel_suffix);
+        match client.get_bytes(&url).await {
+            Ok(bytes) => {
+                let text = decompress(&bytes, suffix)
+                .with_context(|| format!("Decompression failed for {}", url))?;
+                return Ok((text, bytes, rel_path));
+            }
+            Err(_) => continue,
+        }
+    }
+    anyhow::bail!("All variants failed for {}", info.url)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -216,23 +302,8 @@ pub async fn sync_all() -> Result<()> {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Helpers
+//  Decompression
 // ─────────────────────────────────────────────────────────────
-
-async fn fetch_index(client: &HttpClient, info: &IndexUrl) -> Result<String> {
-    for suffix in &[".xz", ".gz", ".bz2", ""] {
-        let url = format!("{}{}", info.url, suffix);
-        match client.get_bytes(&url).await {
-            Ok(bytes) => {
-                let text = decompress(&bytes, suffix)
-                .with_context(|| format!("Decompression failed for {}", url))?;
-                return Ok(text);
-            }
-            Err(_) => continue,
-        }
-    }
-    anyhow::bail!("All variants failed for {}", info.url)
-}
 
 fn decompress(bytes: &[u8], suffix: &str) -> Result<String> {
     match suffix {
@@ -242,6 +313,10 @@ fn decompress(bytes: &[u8], suffix: &str) -> Result<String> {
         _      => Ok(String::from_utf8_lossy(bytes).to_string()),
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────────────────────────
 
 fn url_to_cache_name(url: &str) -> String {
     url.chars()
@@ -261,12 +336,12 @@ pub fn detect_arch() -> String {
         if out.status.success() {
             let m = String::from_utf8_lossy(&out.stdout).trim().to_owned();
             return match m.as_str() {
-                "x86_64"              => "amd64",
-                "aarch64" | "arm64"   => "arm64",
-                "armv7l"              => "armhf",
-                "i686" | "i386"       => "i386",
-                "riscv64"             => "riscv64",
-                other                 => other,
+                "x86_64"            => "amd64",
+                "aarch64" | "arm64" => "arm64",
+                "armv7l"            => "armhf",
+                "i686" | "i386"     => "i386",
+                "riscv64"           => "riscv64",
+                other               => other,
             }.to_owned();
         }
     }
