@@ -4,6 +4,9 @@ pub(crate) mod provides;
 pub(crate) mod sat;
 pub(crate) mod version;
 
+// ── SAT engine ────────────────────────────────────────────────
+pub(crate) mod dpll;
+
 use anyhow::Result;
 use crate::cache::PackageCache;
 use crate::db::InstalledDb;
@@ -39,17 +42,34 @@ pub struct Solver<'a> {
 }
 
 impl<'a> Solver<'a> {
-    pub fn new(cache: &'a PackageCache, db: &'a InstalledDb) -> Self { Solver { cache, db } }
+    pub fn new(cache: &'a PackageCache, db: &'a InstalledDb) -> Self {
+        Solver { cache, db }
+    }
 
-    pub fn resolve_install(&self, names: &[String], no_recommends: bool) -> Result<TransactionPlan> { sat::resolve_install(self, names, no_recommends) }
-    pub fn resolve_reinstall(&self, names: &[String]) -> Result<TransactionPlan>                    { sat::resolve_reinstall(self, names) }
-    pub fn resolve_remove(&self, names: &[String]) -> Result<TransactionPlan>                       { sat::resolve_remove(self, names) }
-    pub fn resolve_upgrade(&self) -> Result<TransactionPlan>                                        { sat::resolve_upgrade(self) }
-    pub fn resolve_dist_upgrade(&self) -> Result<TransactionPlan>                                   { sat::resolve_dist_upgrade(self) }
-    pub fn resolve_autoremove(&self) -> Result<TransactionPlan>                                     { sat::resolve_autoremove(self) }
-    pub fn resolve_fix_broken(&self) -> Result<TransactionPlan>                                     { sat::resolve_fix_broken(self) }
+    pub fn resolve_install(&self, names: &[String], no_recommends: bool) -> Result<TransactionPlan> {
+        sat::resolve_install(self, names, no_recommends)
+    }
+    pub fn resolve_reinstall(&self, names: &[String]) -> Result<TransactionPlan> {
+        sat::resolve_reinstall(self, names)
+    }
+    pub fn resolve_remove(&self, names: &[String]) -> Result<TransactionPlan> {
+        sat::resolve_remove(self, names)
+    }
+    pub fn resolve_upgrade(&self) -> Result<TransactionPlan> {
+        sat::resolve_upgrade(self)
+    }
+    pub fn resolve_dist_upgrade(&self) -> Result<TransactionPlan> {
+        sat::resolve_dist_upgrade(self)
+    }
+    pub fn resolve_autoremove(&self) -> Result<TransactionPlan> {
+        sat::resolve_autoremove(self)
+    }
+    pub fn resolve_fix_broken(&self) -> Result<TransactionPlan> {
+        sat::resolve_fix_broken(self)
+    }
 
     pub(crate) fn find_similar(&self, name: &str) -> Vec<String> {
-        self.cache.search(&name.to_lowercase()).iter().take(6).map(|p| p.name.clone()).collect()
+        self.cache.search(&name.to_lowercase())
+        .iter().take(6).map(|p| p.name.clone()).collect()
     }
 }
