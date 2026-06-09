@@ -2,11 +2,11 @@ use std::fmt;
 
 #[derive(Debug, Clone)]
 pub enum SolverProblem {
-    NotFound          { name: String, similar: Vec<String> },
-    UnsatisfiedDep    { package: String, dep: String, constraint: Option<String> },
-    Conflict          { pkg_a: String, pkg_b: String, detail: String },
-    VersionConflict   { package: String, required: String, available: String },
-    ArchMismatch      { package: String, pkg_arch: String, sys_arch: String },
+    NotFound        { name: String, similar: Vec<String> },
+    UnsatisfiedDep  { package: String, dep: String, constraint: Option<String> },
+    Conflict        { pkg_a: String, pkg_b: String, detail: String },
+    VersionConflict { package: String, required: String, available: String },
+    ArchMismatch    { package: String, pkg_arch: String, sys_arch: String },
     Generic(String),
 }
 
@@ -20,19 +20,18 @@ impl fmt::Display for SolverProblem {
                 }
                 write!(f, "\n  Hint: run `hammer sync` to refresh the package index.")
             }
-            SolverProblem::UnsatisfiedDep { package, dep, constraint } => {
-                write!(f, "Package '{}' depends on '{}'{} which is not available",
-                       package, dep,
-                       constraint.as_ref().map(|c| format!(" ({})", c)).unwrap_or_default())
-            }
-            SolverProblem::Conflict { pkg_a, pkg_b, detail } =>
-            write!(f, "Conflict between '{}' and '{}': {}", pkg_a, pkg_b, detail),
-            SolverProblem::VersionConflict { package, required, available } =>
-            write!(f, "Package '{}' requires {} but only {} is available",
-                   package, required, available),
-                   SolverProblem::ArchMismatch { package, pkg_arch, sys_arch } =>
-                   write!(f, "Package '{}' is for {} but system is {}", package, pkg_arch, sys_arch),
-                   SolverProblem::Generic(msg) => write!(f, "{}", msg),
+            SolverProblem::UnsatisfiedDep { package, dep, constraint } =>
+            write!(f, "Package '{}' depends on '{}'{} which is not available",
+                   package, dep,
+                   constraint.as_ref().map(|c| format!(" ({})", c)).unwrap_or_default()),
+                   SolverProblem::Conflict { pkg_a, pkg_b, detail } =>
+                   write!(f, "Conflict between '{}' and '{}': {}", pkg_a, pkg_b, detail),
+                   SolverProblem::VersionConflict { package, required, available } =>
+                   write!(f, "Package '{}' requires {} but only {} is available",
+                          package, required, available),
+                          SolverProblem::ArchMismatch { package, pkg_arch, sys_arch } =>
+                          write!(f, "Package '{}' is for {} but system is {}", package, pkg_arch, sys_arch),
+                          SolverProblem::Generic(msg) => write!(f, "{}", msg),
         }
     }
 }
@@ -61,5 +60,4 @@ impl fmt::Display for SolverError {
     }
 }
 
-// Just implement std::error::Error — anyhow's blanket From<E: Error> handles the rest.
 impl std::error::Error for SolverError {}
