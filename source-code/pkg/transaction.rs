@@ -1,29 +1,26 @@
 use anyhow::{Context, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
-use std::path::PathBuf;
-use std::time::Duration;
+use std::path::{Path, PathBuf};
 
+use crate::cache::detect_arch;
 use crate::db::{InstalledDb, InstallReason};
 use crate::deb::DebPackage;
-use crate::download::{self, HttpClient, UnpackSpinner};
+use crate::download::{download_packages, HttpClient};
 use crate::log;
 use crate::package::Package;
-use crate::profile::{self, GenerationsDb, remove_postinst};
+use crate::profile::{self, compose_profile, GenerationsDb};
 use crate::solver::TransactionPlan;
-use crate::store::{Store, StoreEntry};
+use crate::store::Store;
 
 // ─────────────────────────────────────────────────────────────
 //  TransactionContext
 // ─────────────────────────────────────────────────────────────
 
 pub struct TransactionContext<'a> {
-    pub plan:           &'a TransactionPlan,
-    pub db:             &'a InstalledDb,
-    pub explicit:       &'a [String],
-    pub is_upgrade:     bool,
-    pub user_mode:      bool,
-    pub store_override: Option<PathBuf>,
+    pub plan:       &'a TransactionPlan,
+    pub db:         &'a InstalledDb,
+    pub explicit:   &'a [String],
+    pub is_upgrade: bool,
 }
 
 impl<'a> TransactionContext<'a> {
@@ -33,15 +30,7 @@ impl<'a> TransactionContext<'a> {
         explicit:   &'a [String],
         is_upgrade: bool,
     ) -> Self {
-        Self { plan, db, explicit, is_upgrade, user_mode: false, store_override: None }
-    }
-
-    pub fn user(plan: &'a TransactionPlan, db: &'a InstalledDb, explicit: &'a [String]) -> Self {
-        let user_env = crate::userenv::UserEnv::for_current_user().ok();
-        Self {
-            plan, db, explicit, is_upgrade: false, user_mode: true,
-            store_override: user_env.map(|e| e.store_dir),
-        }
+        TransactionContext { plan, db, explicit, is_upgrade }
     }
 }
 
@@ -50,201 +39,144 @@ impl<'a> TransactionContext<'a> {
 // ─────────────────────────────────────────────────────────────
 
 pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Result<u32> {
-    let plan = ctx.plan;
-    let db   = ctx.db;
+    let client    = HttpClient::new();
+    let plan      = ctx.plan;
+    let db        = ctx.db;
+    let _sys_arch = detect_arch();
 
-    let effective_store_dir = ctx.store_override.as_deref()
-    .unwrap_or_else(|| std::path::Path::new(crate::store::STORE_DIR));
+    // 1. Build list of packages to download
+    let mut to_install: Vec<Package> = plan.to_install.clone();
+    to_install.extend(plan.to_upgrade.clone());
 
-    // ── 1. Download ───────────────────────────────────────────
+    // 2. Download .deb files
+    if !to_install.is_empty() {
+        println!("  {}  Downloading {} package{}…",
+                 "⬡".bright_cyan().bold(),
+                 to_install.len(),
+                 if to_install.len() == 1 { "" } else { "s" });
+    }
 
-    let all_pkgs: Vec<Package> = plan.to_install.iter()
-    .chain(plan.to_upgrade.iter())
-    .cloned().collect();
-
-    let dl_results = if !all_pkgs.is_empty() {
-        println!();
-        println!(
-            "  {}  {}",
-            "⬡".bright_cyan().bold(),
-                 format!(
-                     "Fetching {} package{}…",
-                     all_pkgs.len(),
-                         if all_pkgs.len() == 1 { "" } else { "s" }
-                 ).bold()
-        );
-        let client = HttpClient::new();
-        download::download_packages(&client, &all_pkgs).await?
+    let downloads = if !to_install.is_empty() {
+        download_packages(&client, &to_install).await
+        .context("Download failed")?
     } else {
         vec![]
     };
 
-    // ── 2. Unpack ─────────────────────────────────────────────
+    // 3. Unpack into store
+    println!("  {}  Unpacking packages…", "⬡".bright_cyan().bold());
 
-    if !dl_results.is_empty() {
-        println!();
-        println!("  {}  {}", "⬡".bright_cyan().bold(), "Unpacking…".bold());
-    }
+    let mut store_entries = Vec::new();
 
-    let mp = MultiProgress::new();
-    let mut store_entries: Vec<StoreEntry> = Vec::new();
-
-    for dl in &dl_results {
-        let label   = format!("{} {}", dl.package.name, dl.package.version);
-        let spinner = UnpackSpinner::new(&mp, &label);
-
+    for dl in &downloads {
         let deb_bytes = std::fs::read(&dl.path)
-        .with_context(|| format!("Cannot read {}", dl.path.display()))?;
+        .with_context(|| format!("Reading {}", dl.path.display()))?;
+
         let deb = DebPackage::parse(&deb_bytes)
         .with_context(|| format!("Parsing .deb for {}", dl.package.name))?;
 
-        let entry = Store::install_deb_to(&dl.package, &deb, effective_store_dir)?;
+        // FIX: deb.postinst is now a field (Option<String>), not a method.
+        // Save postinst script for boot-time execution.
+        if let Some(ref script) = deb.postinst {
+            if let Err(e) = save_postinst_script(&dl.package.name, script) {
+                log::warn(&format!("transaction: could not save postinst for {}: {}", dl.package.name, e));
+            } else {
+                log::info(&format!("transaction: saved postinst for {}", dl.package.name));
+            }
+        }
+
+        let entry = Store::install_deb(&dl.package, &deb)
+        .with_context(|| format!("Installing {} to store", dl.package.name))?;
+
         store_entries.push(entry);
-
-        // Save maintainer scripts
-        if let Some(script) = deb.extract_script("postinst") {
-            let script: String = script;
-            if !script.trim().is_empty() {
-                let postinst_dir: PathBuf = if ctx.user_mode {
-                    crate::userenv::UserEnv::for_current_user()
-                    .map(|e| e.postinst_dir)
-                    .unwrap_or_else(|_| PathBuf::from("/hammer/db/postinst"))
-                } else {
-                    PathBuf::from("/hammer/db/postinst")
-                };
-                std::fs::create_dir_all(&postinst_dir).ok();
-                std::fs::write(
-                    postinst_dir.join(format!("{}.postinst", dl.package.name)),
-                               &script,
-                ).ok();
-            }
-        }
-
-        spinner.finish_ok(&label);
+        println!("  {} {} {}", "·".dimmed(), dl.package.name.bold(), dl.package.version.dimmed());
     }
 
-    for name in &plan.to_remove { remove_postinst(name); }
-
-    // ── 3. Compose generation ─────────────────────────────────
-
-    println!();
-    let compose_pb = {
-        let pb = mp.add(ProgressBar::new_spinner());
-        pb.set_style(
-            ProgressStyle::with_template("  {spinner:.cyan}  {prefix:.bold}  {wide_msg}")
-            .unwrap()
-            .tick_strings(&["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏","·"]),
-        );
-        pb.enable_steady_tick(Duration::from_millis(80));
-        pb
-    };
-
-    let mut gens_db = GenerationsDb::load()?;
-    let gen_number  = gens_db.next_number();
-
-    compose_pb.set_prefix("composing");
-    compose_pb.set_message(
-        format!("gen-{} from {} packages…", gen_number, store_entries.len())
-            .dimmed().to_string(),
-    );
-
-    let mut new_packages: Vec<StoreEntry> = {
-        let all_installed = db.list_all()?;
-        let mut entries   = Vec::new();
-        for inst in all_installed {
-            let being_removed  = plan.to_remove.contains(&inst.name);
-            let being_upgraded = plan.to_upgrade.iter().any(|p| p.name == inst.name);
-            if being_removed || being_upgraded { continue; }
-            let store_path = effective_store_dir
-            .join(format!("{}-{}-{}", inst.name, inst.version, inst.store_hash));
-            if store_path.exists() {
-                entries.push(StoreEntry {
-                    name: inst.name, version: inst.version,
-                    hash: inst.store_hash, path: store_path,
-                });
-            }
-        }
-        entries
-    };
-    new_packages.extend(store_entries.iter().cloned());
-
-    let gen = profile::compose_profile(gen_number, &new_packages, Some(note.to_string()))?;
-
-    compose_pb.finish_with_message(format!(
-        "{}  gen-{} ready ({} packages)",
-                                           "✔".bright_green(), gen_number, new_packages.len()
-    ));
-
-    // ── 4. Live-patch or stage as pending ─────────────────────
-
-    let all_new_files = crate::livepatch::collect_files(&store_entries);
-    let analysis      = crate::livepatch::analyse(&all_new_files);
-    let applied_live  = ctx.user_mode || (analysis.can_live_patch && !store_entries.is_empty());
-
-    if applied_live {
-        profile::switch_active(&gen)?;
-        if ctx.user_mode {
-            if let Ok(env) = crate::userenv::UserEnv::current() {
-                env.apply_pending().ok();
-            }
-        }
-        gens_db.generations.push(gen);
-        gens_db.current = gen_number;
-        gens_db.pending = None;
-        gens_db.save()?;
-    } else {
-        profile::set_pending(&gen)
-        .with_context(|| format!("Setting gen-{} as pending", gen_number))?;
-        gens_db.generations.push(gen);
-        gens_db.pending = Some(gen_number);
-        gens_db.save()?;
-
-        if !ctx.user_mode {
-            if let Err(e) = crate::grub::update_grub(
-                &GenerationsDb::load().unwrap_or_default(),
-            ) {
-                log::warn(&format!("grub update failed: {}", e));
+    // 4. Handle removals
+    if !plan.to_remove.is_empty() {
+        let gdb = GenerationsDb::load()?;
+        for name in &plan.to_remove {
+            if let Some(inst) = db.get(name) {
+                db.record_remove(name, &inst.version, gdb.current)
+                .with_context(|| format!("Recording removal of {}", name))?;
             }
         }
     }
 
-    // ── 5. Update DB ──────────────────────────────────────────
+    // 5. Record installs in DB
+    let mut gdb  = GenerationsDb::load()?;
+    let gen_num  = gdb.next_number();
 
-    for dl in &dl_results {
-        let store_entry = store_entries.iter()
-        .find(|e| e.name == dl.package.name)
-        .expect("store entry must exist after unpack");
+    for entry in &store_entries {
+        let pkg = to_install.iter().find(|p| p.name == entry.name)
+        .ok_or_else(|| anyhow::anyhow!("Internal: package {} not in install list", entry.name))?;
 
-        let reason = if ctx.explicit.iter().any(|n| n == &dl.package.name) {
+        let reason = if ctx.explicit.contains(&entry.name) {
             InstallReason::User
         } else {
             InstallReason::Dependency
         };
 
-        if plan.upgrade_from.contains_key(&dl.package.name) {
-            let old_ver = plan.upgrade_from[&dl.package.name].clone();
-            db.record_upgrade(&old_ver, &dl.package, &store_entry.hash, gen_number)?;
-        } else {
-            db.record_install(&dl.package, reason, &store_entry.hash, gen_number)?;
-        }
+        db.record_install(pkg, reason, &entry.hash, gen_num)
+        .with_context(|| format!("Recording install of {}", entry.name))?;
     }
 
-    for name in &plan.to_remove {
-        if let Some(inst) = db.get(name) {
-            db.record_remove(name, &inst.version, gen_number)?;
-        }
+    // 6. Include existing installed packages in profile
+    let existing_entries: Vec<crate::store::StoreEntry> = db.list_all()
+    .unwrap_or_default()
+    .iter()
+    .filter(|p| !to_install.iter().any(|i| i.name == p.name))
+    .filter(|p| !plan.to_remove.contains(&p.name))
+    .filter_map(|p| {
+        let path = PathBuf::from(crate::store::STORE_DIR)
+        .join(format!("{}-{}-{}", p.name, p.version, p.store_hash));
+        if path.exists() {
+            Some(crate::store::StoreEntry {
+                name:    p.name.clone(),
+                 version: p.version.clone(),
+                 hash:    p.store_hash.clone(),
+                 path,
+            })
+        } else { None }
+    })
+    .collect();
+
+    let mut all_entries = existing_entries;
+    all_entries.extend(store_entries);
+
+    // 7. Compose new generation profile
+    println!("  {}  Composing gen-{}…", "⬡".bright_cyan().bold(), gen_num);
+    let gen = compose_profile(gen_num, &all_entries, Some(note.to_string()))
+    .context("Composing generation profile")?;
+
+    // 8. Record generation
+    gdb.generations.push(gen.clone());
+    gdb.pending = Some(gen_num);
+    gdb.save()?;
+
+    // 9. Set pending symlink
+    profile::set_pending(&gen)?;
+
+    // 10. Update GRUB
+    if let Err(e) = crate::grub::update_grub(&gdb) {
+        log::warn(&format!("transaction: GRUB update failed: {}", e));
     }
 
-    // ── 6. Record integrity hash ──────────────────────────────
+    println!("  {}  Staged as gen-{} — reboot to activate",
+             "✔".bright_green().bold(), gen_num);
+    log::info(&format!("transaction: gen-{} staged — {}", gen_num, note));
 
-    if !ctx.user_mode {
-        let _ = crate::gpg::record_gen_hash(gen_number);
-    }
+    Ok(gen_num)
+}
 
-    log::info(&format!(
-        "transaction complete: gen-{} (live={}, user={})",
-                       gen_number, applied_live, ctx.user_mode
-    ));
+// ─────────────────────────────────────────────────────────────
+//  Save postinst script
+// ─────────────────────────────────────────────────────────────
 
-    Ok(gen_number)
+fn save_postinst_script(pkg_name: &str, script: &str) -> Result<PathBuf> {
+    let dir  = Path::new("/hammer/db/postinst");
+    std::fs::create_dir_all(dir)?;
+    let dest = dir.join(format!("{}.postinst", pkg_name));
+    std::fs::write(&dest, script)?;
+    Ok(dest)
 }
