@@ -1,16 +1,16 @@
 pub(crate) mod conflicts;
+pub(crate) mod dpll;
 pub(crate) mod error;
 pub(crate) mod provides;
 pub(crate) mod sat;
 pub(crate) mod version;
 
-// ── SAT engine ────────────────────────────────────────────────
-pub(crate) mod dpll;
-
 use anyhow::Result;
 use crate::cache::PackageCache;
 use crate::db::InstalledDb;
 use crate::package::Package;
+use crate::pins::PinDb;
+use crate::multi_arch::MultiArchDb;
 use std::collections::HashMap;
 
 #[derive(Debug, Default)]
@@ -37,13 +37,21 @@ impl TransactionPlan {
 }
 
 pub struct Solver<'a> {
-    pub(crate) cache: &'a PackageCache,
-    pub(crate) db:    &'a InstalledDb,
+    pub(crate) cache:      &'a PackageCache,
+    pub(crate) db:         &'a InstalledDb,
+    /// Loaded once and shared across all resolution calls
+    pub(crate) pins:       PinDb,
+    pub(crate) multi_arch: MultiArchDb,
 }
 
 impl<'a> Solver<'a> {
     pub fn new(cache: &'a PackageCache, db: &'a InstalledDb) -> Self {
-        Solver { cache, db }
+        Solver {
+            cache,
+            db,
+            pins:       PinDb::load().unwrap_or_default(),
+            multi_arch: MultiArchDb::load(),
+        }
     }
 
     pub fn resolve_install(&self, names: &[String], no_recommends: bool) -> Result<TransactionPlan> {
