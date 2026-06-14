@@ -590,3 +590,4 @@ pub fn cmd_activate_internal() -> Result<()> {
     }
     Ok(())
 }
+
