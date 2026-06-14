@@ -17,17 +17,25 @@ pub struct DebPackage {
     pub data_compression: Compression,
     pub file_list:        Vec<String>,
     /// Content of the postinst maintainer script (if present)
-    pub postinst:         Option<String>,
+    pub postinst: Option<String>,
     /// Content of the preinst maintainer script (if present)
-    pub preinst:          Option<String>,
+    pub preinst:  Option<String>,
     /// Content of the postrm maintainer script (if present)
-    pub postrm:           Option<String>,
+    pub postrm:   Option<String>,
     /// Content of the prerm maintainer script (if present)
-    pub prerm:            Option<String>,
+    pub prerm:    Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
 pub enum Compression { Gz, Xz, Zst, Bz2, None }
+
+/// Result of extract_data: the extracted paths plus conffiles list.
+pub struct ExtractResult {
+    pub regular_files: Vec<PathBuf>,
+    pub all_files:     Vec<PathBuf>,
+    /// (absolute_install_path, original_content) pairs for conffile tracking
+    pub conffiles:     Vec<(PathBuf, Vec<u8>)>,
+}
 
 impl DebPackage {
     pub fn parse(deb_bytes: &[u8]) -> Result<Self> {
@@ -82,13 +90,12 @@ impl DebPackage {
         let control   = Package::parse_block(&control_raw).context("Parsing control")?;
         let file_list = list_regular_files(&data_bytes, data_comp).unwrap_or_default();
 
-        // Extract maintainer scripts from control.tar
-        let control_tar_decompressed = decompress(&control_tar, control_comp)
-        .unwrap_or_default();
-        let postinst = extract_script_from_tar(&control_tar_decompressed, "postinst");
-        let preinst  = extract_script_from_tar(&control_tar_decompressed, "preinst");
-        let postrm   = extract_script_from_tar(&control_tar_decompressed, "postrm");
-        let prerm    = extract_script_from_tar(&control_tar_decompressed, "prerm");
+        // Extract maintainer scripts
+        let control_tar_dec = decompress(&control_tar, control_comp).unwrap_or_default();
+        let postinst = extract_script_from_tar(&control_tar_dec, "postinst");
+        let preinst  = extract_script_from_tar(&control_tar_dec, "preinst");
+        let postrm   = extract_script_from_tar(&control_tar_dec, "postrm");
+        let prerm    = extract_script_from_tar(&control_tar_dec, "prerm");
 
         Ok(DebPackage {
             control, control_raw,
@@ -99,18 +106,39 @@ impl DebPackage {
         })
     }
 
-    /// Extract a named maintainer script from the control.tar.
     pub fn extract_script(&self, name: &str) -> Option<String> {
         let tar = decompress(&self.control_tar, self.control_comp).ok()?;
         extract_script_from_tar(&tar, name)
     }
 
     /// Extract data.tar into `root`.
-    /// Returns (regular_files, all_extracted)
-    pub fn extract_data(&self, root: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+    /// Also extracts conffiles and records their original content.
+    /// Returns ExtractResult with (regular_files, all_files, conffiles).
+    pub fn extract_data(&self, root: &Path) -> Result<ExtractResult> {
         let tar = decompress(&self.data_bytes, self.data_compression)
         .context("Decompressing data.tar")?;
-        extract_tar(root, &tar)
+        let (regular_files, all_files) = extract_tar(root, &tar)?;
+
+        // Build conffiles list from the `conffiles` control file
+        let conffiles_list = self.extract_script("conffiles")
+        .unwrap_or_default();
+
+        let mut conffiles: Vec<(PathBuf, Vec<u8>)> = Vec::new();
+        for line in conffiles_list.lines() {
+            let path_str = line.trim();
+            if path_str.is_empty() { continue; }
+            let abs_path = PathBuf::from(path_str);
+
+            // Strip leading / to get relative path within extraction root
+            let rel = abs_path.strip_prefix("/").unwrap_or(&abs_path);
+            let extracted_path = root.join(rel);
+
+            if let Ok(content) = std::fs::read(&extracted_path) {
+                conffiles.push((abs_path, content));
+            }
+        }
+
+        Ok(ExtractResult { regular_files, all_files, conffiles })
     }
 }
 
@@ -168,8 +196,8 @@ fn extract_script_from_tar(tar_bytes: &[u8], script_name: &str) -> Option<String
     let entries = archive.entries().ok()?;
     for entry in entries {
         let mut entry = entry.ok()?;
-        let path      = entry.path().ok()?;
-        let name      = path.to_string_lossy();
+        let path = entry.path().ok()?;
+        let name = path.to_string_lossy();
         if name == format!("./{}", script_name) || name == script_name {
             let mut s = String::new();
             entry.read_to_string(&mut s).ok()?;
@@ -189,9 +217,7 @@ fn list_regular_files(bytes: &[u8], comp: Compression) -> Result<Vec<String>> {
         if matches!(entry.header().entry_type(), EntryType::Regular | EntryType::Continuous) {
             let s = entry.path()?.to_string_lossy().to_string();
             let s = s.trim_start_matches("./");
-            if !s.is_empty() {
-                files.push(format!("/{}", s));
-            }
+            if !s.is_empty() { files.push(format!("/{}", s)); }
         }
     }
     Ok(files)
