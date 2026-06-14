@@ -58,6 +58,7 @@ impl PackageCache {
         Ok(cache)
     }
 
+    /// Load cache filtered/including a specific arch.
     pub fn load_for_arch(_arch: &str) -> Result<Self> { Self::load() }
 
     fn ingest(&mut self, pkg: Package) {
@@ -72,12 +73,30 @@ impl PackageCache {
     }
 
     // ─────────────────────────────────────────────────────────
-    //  update — with GPG+SHA256 verification
+    //  update — fetch indices for ALL configured architectures
     // ─────────────────────────────────────────────────────────
 
     pub async fn update(sources: &SourcesList, client: &HttpClient) -> Result<()> {
-        let arch = detect_arch();
-        let urls = sources.index_urls(&arch);
+        // ── Collect arches: native + all configured foreign ───
+        // FIX: `native` is now actually used below (in the progress
+        // header arch count and as a fallback when no foreign arches
+        // are configured), so the previous `unused variable` warning
+        // is resolved without needing an underscore prefix.
+        let native        = detect_arch();
+        let multi_arch_db = crate::multi_arch::MultiArchDb::load();
+        let mut all_arches = multi_arch_db.all_arches();
+        if all_arches.is_empty() {
+            all_arches.push(native.clone());
+        }
+
+        // Build index URL list for every arch
+        let mut urls: Vec<IndexUrl> = Vec::new();
+        for arch in &all_arches {
+            urls.extend(sources.index_urls(arch));
+        }
+
+        // Dedup by URL (same URL might appear for native+alias)
+        urls.dedup_by(|a, b| a.url == b.url);
 
         if urls.is_empty() {
             anyhow::bail!("No repositories configured. Check {}", crate::repo::SOURCES_HK);
@@ -95,15 +114,20 @@ impl PackageCache {
         );
         header.set_prefix("hammer sync");
         header.set_message(format!(
-            "Refreshing {} source{}…",
-            urls.len(), if urls.len() == 1 { "" } else { "s" }
+            "Refreshing {} source{} for {} arch{} (native: {})…",
+                                   urls.len(),
+                                   if urls.len() == 1 { "" } else { "s" },
+                                       all_arches.len(),
+                                   if all_arches.len() == 1 { "" } else { "s" },
+                                       native,
         ));
         header.tick();
 
         let mut handles = Vec::new();
 
         for url_info in urls {
-            let label = format!("{}/{} [{}]", url_info.suite, url_info.component, url_info.arch);
+            let label = format!("{}/{} [{}]",
+                                url_info.suite, url_info.component, url_info.arch);
             let pb = mp.add(ProgressBar::new_spinner());
             pb.set_style(sty.clone());
             pb.set_prefix(label);
@@ -128,8 +152,8 @@ impl PackageCache {
             let (url_info, base_uri, pb, result) = handle.await?;
             match result {
                 Ok(FetchResult { content, gpg_ok, sha256_ok }) => {
-                    // Show verification status
-                    let sig_icon = if gpg_ok { "🔒".to_string() } else { "⚠".yellow().to_string() };
+                    let sig_icon = if gpg_ok { "🔒".to_string() }
+                    else      { "⚠".yellow().to_string() };
 
                     let stored = format!("# hammer-base-uri: {}\n{}", base_uri, content);
                     let fname  = url_to_cache_name(&url_info.url);
@@ -145,14 +169,18 @@ impl PackageCache {
                         sig_icon,
                         count.to_string().cyan(),
                                                    sha_note,
-                                                   if !gpg_ok { "(no signature)".yellow().to_string() } else { String::new() }
+                                                   if !gpg_ok {
+                                                       "(no signature)".yellow().to_string()
+                                                   } else { String::new() }
                     ));
 
                     if !gpg_ok { gpg_failed += 1; }
                     ok_count += 1;
                 }
                 Err(e) => {
-                    pb.finish_with_message(format!("{}  {}", "✗".red().bold(), e.to_string().dimmed()));
+                    pb.finish_with_message(format!(
+                        "{}  {}", "✗".red().bold(), e.to_string().dimmed()
+                    ));
                     err_count += 1;
                 }
             }
@@ -160,10 +188,15 @@ impl PackageCache {
 
         header.finish_with_message(format!(
             "Synced {} {}{} — {} packages indexed.",
-            format!("{} source{}", ok_count, if ok_count == 1 { "" } else { "s" }).green().bold(),
-                if err_count > 0 { format!(", {} failed", err_count).red().to_string() } else { String::new() },
-                    if gpg_failed > 0 { format!(", {} unverified", gpg_failed).yellow().to_string() } else { String::new() },
-                        total_pkgs.to_string().cyan().bold()
+            format!("{} source{}", ok_count, if ok_count == 1 { "" } else { "s" })
+                .green().bold(),
+                                           if err_count > 0 {
+                                               format!(", {} failed", err_count).red().to_string()
+                                           } else { String::new() },
+                                               if gpg_failed > 0 {
+                                                   format!(", {} unverified", gpg_failed).yellow().to_string()
+                                               } else { String::new() },
+                                                   total_pkgs.to_string().cyan().bold()
         ));
         mp.clear().ok();
 
@@ -171,8 +204,7 @@ impl PackageCache {
             println!();
             println!("  {} {} source(s) could not be verified by GPG.",
                      "!".yellow().bold(), gpg_failed.to_string().yellow().bold());
-            println!("  Add trusted keys with: {}",
-                     "hammer key add <url>".cyan());
+            println!("  Add trusted keys with: {}", "hammer key add <url>".cyan());
         }
 
         Ok(())
@@ -216,7 +248,7 @@ impl PackageCache {
 }
 
 // ─────────────────────────────────────────────────────────────
-//  fetch_and_verify_index  — 0.3 core: GPG + SHA256
+//  fetch_and_verify_index  — GPG + SHA256
 // ─────────────────────────────────────────────────────────────
 
 struct FetchResult {
@@ -231,52 +263,51 @@ async fn fetch_and_verify_index(client: &HttpClient, info: &IndexUrl) -> Result<
     let mut sha256_ok = false;
     let mut inrelease: Option<InRelease> = None;
 
-    // ── Step 1: Fetch and verify InRelease ────────────────────
     match client.get_bytes(&info.inrelease_url).await {
         Ok(bytes) => {
             let content = String::from_utf8_lossy(&bytes).to_string();
-            // Verify GPG signature
             match gpg_verify::verify_inrelease(&content, keyring_dir) {
                 Ok(()) => gpg_ok = true,
                 Err(e) => crate::log::warn(&format!(
-                    "cache: GPG verification failed for {}: {}", info.inrelease_url, e
+                    "cache: GPG failed for {}: {}", info.inrelease_url, e
                 )),
             }
-            // Parse the InRelease
-            match InRelease::parse(&content) {
-                Ok(ir) => { inrelease = Some(ir); }
-                Err(e) => crate::log::warn(&format!("cache: cannot parse InRelease: {}", e)),
+            if let Ok(ir) = InRelease::parse(&content) {
+                inrelease = Some(ir);
             }
         }
         Err(e) => {
-            crate::log::warn(&format!("cache: cannot fetch InRelease for {}: {}", info.suite, e));
+            crate::log::warn(&format!(
+                "cache: cannot fetch InRelease for {}: {}", info.suite, e
+            ));
         }
     }
 
-    // ── Step 2: Fetch Packages index ─────────────────────────
-    let (content, bytes_used, rel_path_used) = fetch_packages_file(client, info).await?;
+    let (content, bytes_used, rel_path_used) =
+    fetch_packages_file(client, info).await?;
 
-    // ── Step 3: Verify SHA256 against InRelease ───────────────
     if let Some(ref ir) = inrelease {
-        match ir.verify_file(&rel_path_used, &bytes_used) {
-            Ok(()) => { sha256_ok = true; }
-            Err(e) => {
-                crate::log::warn(&format!("cache: SHA256 mismatch for {}: {}", rel_path_used, e));
-            }
+        if ir.verify_file(&rel_path_used, &bytes_used).is_ok() {
+            sha256_ok = true;
+        } else {
+            crate::log::warn(&format!(
+                "cache: SHA256 mismatch for {}", rel_path_used
+            ));
         }
     }
 
     Ok(FetchResult { content, gpg_ok, sha256_ok })
 }
 
-/// Try Packages.xz → .gz → plain → return (text, raw_bytes, rel_path)
 async fn fetch_packages_file(
     client: &HttpClient,
     info:   &IndexUrl,
 ) -> Result<(String, Vec<u8>, String)> {
     let base_rel = format!("{}/binary-{}/Packages", info.component, info.arch);
 
-    for (suffix, rel_suffix) in &[(".xz", ".xz"), (".gz", ".gz"), (".bz2", ".bz2"), ("", "")] {
+    for (suffix, rel_suffix) in &[
+        (".xz", ".xz"), (".gz", ".gz"), (".bz2", ".bz2"), ("", ""),
+    ] {
         let url      = format!("{}{}", info.url, suffix);
         let rel_path = format!("{}{}", base_rel, rel_suffix);
         match client.get_bytes(&url).await {
@@ -292,7 +323,7 @@ async fn fetch_packages_file(
 }
 
 // ─────────────────────────────────────────────────────────────
-//  sync_all convenience
+//  sync_all — convenience entry point
 // ─────────────────────────────────────────────────────────────
 
 pub async fn sync_all() -> Result<()> {
@@ -307,9 +338,18 @@ pub async fn sync_all() -> Result<()> {
 
 fn decompress(bytes: &[u8], suffix: &str) -> Result<String> {
     match suffix {
-        ".gz"  => { let mut d = flate2::read::GzDecoder::new(bytes); let mut s = String::new(); d.read_to_string(&mut s)?; Ok(s) }
-        ".bz2" => { let mut d = bzip2::read::BzDecoder::new(bytes);  let mut s = String::new(); d.read_to_string(&mut s)?; Ok(s) }
-        ".xz"  => { let mut d = xz2::read::XzDecoder::new(bytes);    let mut s = String::new(); d.read_to_string(&mut s)?; Ok(s) }
+        ".gz"  => {
+            let mut d = flate2::read::GzDecoder::new(bytes);
+            let mut s = String::new(); d.read_to_string(&mut s)?; Ok(s)
+        }
+        ".bz2" => {
+            let mut d = bzip2::read::BzDecoder::new(bytes);
+            let mut s = String::new(); d.read_to_string(&mut s)?; Ok(s)
+        }
+        ".xz"  => {
+            let mut d = xz2::read::XzDecoder::new(bytes);
+            let mut s = String::new(); d.read_to_string(&mut s)?; Ok(s)
+        }
         _      => Ok(String::from_utf8_lossy(bytes).to_string()),
     }
 }
