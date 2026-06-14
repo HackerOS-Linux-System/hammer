@@ -61,3 +61,4 @@ impl fmt::Display for SolverError {
 }
 
 impl std::error::Error for SolverError {}
+
