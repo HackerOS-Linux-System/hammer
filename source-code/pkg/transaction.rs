@@ -2,13 +2,17 @@ use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use std::path::{Path, PathBuf};
 
+use crate::audit;
 use crate::cache::detect_arch;
+use crate::conffiles::ConffileDb;
 use crate::db::{InstalledDb, InstallReason};
 use crate::deb::DebPackage;
 use crate::download::{download_packages, HttpClient};
+use crate::essential;
 use crate::log;
 use crate::package::Package;
 use crate::profile::{self, compose_profile, GenerationsDb};
+use crate::sandbox::PostinstSandbox;
 use crate::solver::TransactionPlan;
 use crate::store::Store;
 
@@ -17,10 +21,12 @@ use crate::store::Store;
 // ─────────────────────────────────────────────────────────────
 
 pub struct TransactionContext<'a> {
-    pub plan:       &'a TransactionPlan,
-    pub db:         &'a InstalledDb,
-    pub explicit:   &'a [String],
-    pub is_upgrade: bool,
+    pub plan:            &'a TransactionPlan,
+    pub db:              &'a InstalledDb,
+    pub explicit:        &'a [String],
+    pub is_upgrade:      bool,
+    /// Pass --force-essential to allow removing essential packages
+    pub force_essential: bool,
 }
 
 impl<'a> TransactionContext<'a> {
@@ -30,7 +36,7 @@ impl<'a> TransactionContext<'a> {
         explicit:   &'a [String],
         is_upgrade: bool,
     ) -> Self {
-        TransactionContext { plan, db, explicit, is_upgrade }
+        TransactionContext { plan, db, explicit, is_upgrade, force_essential: false }
     }
 }
 
@@ -44,11 +50,21 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
     let db        = ctx.db;
     let _sys_arch = detect_arch();
 
-    // 1. Build list of packages to download
+    // ── Guard: check essential packages before removal ────────
+    if !plan.to_remove.is_empty() {
+        let cache = crate::cache::PackageCache::load()?;
+        essential::guard_essential_removal(
+            &plan.to_remove,
+            ctx.force_essential,
+            &cache,
+        ).context("Essential package protection")?;
+    }
+
+    // ── Build download list ───────────────────────────────────
     let mut to_install: Vec<Package> = plan.to_install.clone();
     to_install.extend(plan.to_upgrade.clone());
 
-    // 2. Download .deb files
+    // ── Download ──────────────────────────────────────────────
     if !to_install.is_empty() {
         println!("  {}  Downloading {} package{}…",
                  "⬡".bright_cyan().bold(),
@@ -63,10 +79,11 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
         vec![]
     };
 
-    // 3. Unpack into store
+    // ── Unpack into store ─────────────────────────────────────
     println!("  {}  Unpacking packages…", "⬡".bright_cyan().bold());
 
     let mut store_entries = Vec::new();
+    let sandbox = PostinstSandbox::new();
 
     for dl in &downloads {
         let deb_bytes = std::fs::read(&dl.path)
@@ -75,41 +92,65 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
         let deb = DebPackage::parse(&deb_bytes)
         .with_context(|| format!("Parsing .deb for {}", dl.package.name))?;
 
-        // FIX: deb.postinst is now a field (Option<String>), not a method.
-        // Save postinst script for boot-time execution.
+        // Save postinst script for boot-time execution (legacy path)
+        // and run it sandboxed if available
         if let Some(ref script) = deb.postinst {
             if let Err(e) = save_postinst_script(&dl.package.name, script) {
-                log::warn(&format!("transaction: could not save postinst for {}: {}", dl.package.name, e));
-            } else {
-                log::info(&format!("transaction: saved postinst for {}", dl.package.name));
+                log::warn(&format!(
+                    "transaction: could not save postinst for {}: {}", dl.package.name, e
+                ));
             }
         }
 
+        // Extract to store — returns conffiles alongside regular files
         let entry = Store::install_deb(&dl.package, &deb)
         .with_context(|| format!("Installing {} to store", dl.package.name))?;
 
+        // Record conffiles (three-way merge support on upgrade)
+        // We need to extract to a temp dir to get original conffile content
+        let tmp = std::env::temp_dir().join(format!(
+            "hammer_conffiles_{}_{}", dl.package.name, std::process::id()
+        ));
+        if std::fs::create_dir_all(&tmp).is_ok() {
+            if let Ok(result) = deb.extract_data(&tmp) {
+                if !result.conffiles.is_empty() {
+                    if let Err(e) = ConffileDb::record(&dl.package.name, &result.conffiles) {
+                        log::warn(&format!(
+                            "transaction: conffiles record failed for {}: {}", dl.package.name, e
+                        ));
+                    }
+                }
+            }
+            let _ = std::fs::remove_dir_all(&tmp);
+        }
+
         store_entries.push(entry);
-        println!("  {} {} {}", "·".dimmed(), dl.package.name.bold(), dl.package.version.dimmed());
+        println!("  {} {} {}",
+                 "·".dimmed(), dl.package.name.bold(), dl.package.version.dimmed());
     }
 
-    // 4. Handle removals
+    // ── Handle removals ───────────────────────────────────────
+    let mut gdb = GenerationsDb::load()?;
+
     if !plan.to_remove.is_empty() {
-        let gdb = GenerationsDb::load()?;
         for name in &plan.to_remove {
             if let Some(inst) = db.get(name) {
                 db.record_remove(name, &inst.version, gdb.current)
                 .with_context(|| format!("Recording removal of {}", name))?;
             }
         }
+        // Audit: record removal
+        audit::record_remove(&plan.to_remove, Some(gdb.current), None, db);
     }
 
-    // 5. Record installs in DB
-    let mut gdb  = GenerationsDb::load()?;
-    let gen_num  = gdb.next_number();
+    // ── Record installs in DB ─────────────────────────────────
+    let gen_num = gdb.next_number();
 
     for entry in &store_entries {
         let pkg = to_install.iter().find(|p| p.name == entry.name)
-        .ok_or_else(|| anyhow::anyhow!("Internal: package {} not in install list", entry.name))?;
+        .ok_or_else(|| anyhow::anyhow!(
+            "Internal: package {} not in install list", entry.name
+        ))?;
 
         let reason = if ctx.explicit.contains(&entry.name) {
             InstallReason::User
@@ -121,7 +162,24 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
         .with_context(|| format!("Recording install of {}", entry.name))?;
     }
 
-    // 6. Include existing installed packages in profile
+    // ── Audit: record install/upgrade ─────────────────────────
+    let upgrades: Vec<&Package> = to_install.iter()
+    .filter(|p| plan.upgrade_from.contains_key(&p.name))
+    .collect();
+    let installs: Vec<&Package> = to_install.iter()
+    .filter(|p| !plan.upgrade_from.contains_key(&p.name))
+    .collect();
+
+    if !installs.is_empty() {
+        let pkgs: Vec<Package> = installs.into_iter().cloned().collect();
+        audit::record_install(&pkgs, Some(gdb.current), Some(gen_num));
+    }
+    if !upgrades.is_empty() {
+        let pkgs: Vec<Package> = upgrades.into_iter().cloned().collect();
+        audit::record_upgrade(&pkgs, &plan.upgrade_from, Some(gdb.current), Some(gen_num));
+    }
+
+    // ── Include existing installed packages in new profile ────
     let existing_entries: Vec<crate::store::StoreEntry> = db.list_all()
     .unwrap_or_default()
     .iter()
@@ -144,20 +202,59 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
     let mut all_entries = existing_entries;
     all_entries.extend(store_entries);
 
-    // 7. Compose new generation profile
+    // ── Compose new generation profile ───────────────────────
     println!("  {}  Composing gen-{}…", "⬡".bright_cyan().bold(), gen_num);
     let gen = compose_profile(gen_num, &all_entries, Some(note.to_string()))
     .context("Composing generation profile")?;
 
-    // 8. Record generation
+    // ── Record generation ─────────────────────────────────────
     gdb.generations.push(gen.clone());
     gdb.pending = Some(gen_num);
     gdb.save()?;
 
-    // 9. Set pending symlink
+    // ── Set pending symlink ───────────────────────────────────
     profile::set_pending(&gen)?;
 
-    // 10. Update GRUB
+    // ── Run sandboxed postinst scripts (live installs) ────────
+    // Only for packages that are new (not just upgraded) and have postinst
+    for dl in &downloads {
+        let is_new = !plan.upgrade_from.contains_key(&dl.package.name);
+        if !is_new { continue; }
+
+        let script_path = Path::new("/hammer/db/postinst")
+        .join(format!("{}.postinst", dl.package.name));
+        if !script_path.exists() { continue; }
+
+        if let Ok(script) = std::fs::read_to_string(&script_path) {
+            log::info(&format!(
+                "transaction: running postinst for {} via sandbox",
+                dl.package.name
+            ));
+            match sandbox.run_postinst(&dl.package.name, &script) {
+                Ok(result) if result.success => {
+                    log::info(&format!(
+                        "transaction: postinst {} OK", dl.package.name
+                    ));
+                }
+                Ok(result) => {
+                    log::warn(&format!(
+                        "transaction: postinst {} failed (exit {}): {}",
+                                       dl.package.name, result.exit_code,
+                                       result.stderr.lines().next().unwrap_or("")
+                    ));
+                    println!("  {} postinst {} failed — system may need manual config",
+                             "!".yellow().bold(), dl.package.name.bold());
+                }
+                Err(e) => {
+                    log::warn(&format!(
+                        "transaction: could not run postinst {}: {}", dl.package.name, e
+                    ));
+                }
+            }
+        }
+    }
+
+    // ── Update GRUB ───────────────────────────────────────────
     if let Err(e) = crate::grub::update_grub(&gdb) {
         log::warn(&format!("transaction: GRUB update failed: {}", e));
     }
@@ -170,7 +267,7 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
 }
 
 // ─────────────────────────────────────────────────────────────
-//  Save postinst script
+//  Save postinst script (legacy path for boot-time activation)
 // ─────────────────────────────────────────────────────────────
 
 fn save_postinst_script(pkg_name: &str, script: &str) -> Result<PathBuf> {
