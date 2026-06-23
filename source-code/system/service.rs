@@ -254,3 +254,115 @@ fn find_unit_package(unit: &str) -> Option<String> {
 fn ensure_service_suffix(name: &str) -> String {
     if name.contains('.') { name.to_string() } else { format!("{}.service", name) }
 }
+
+// ─────────────────────────────────────────────────────────────
+//  list --all (all systemd units, not just hammer ones)
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_service_list_all(filter_pkg: Option<&str>) -> Result<()> {
+    println!();
+    println!("  {}  All systemd units{}", "⬡".bright_cyan().bold(),
+             filter_pkg.map(|p| format!(" — package: {}", p.cyan())).unwrap_or_default());
+    println!("  {}", "─".repeat(80).dimmed());
+    println!("  {:<40} {:<14} {:<12} {}",
+             "Unit".bold(), "Active".bold(), "Load".bold(), "Description".bold());
+    println!("  {}", "─".repeat(80).dimmed());
+
+    // Use systemctl --output=json if possible, fall back to text
+    let out = Command::new("systemctl")
+        .args(["list-units", "--all", "--no-legend", "--no-pager",
+               "--type=service,socket,timer,path"])
+        .output()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+
+    let db = crate::db::InstalledDb::open().ok();
+
+    let mut count = 0usize;
+    for line in text.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 { continue; }
+        let unit   = parts[0];
+        let load   = parts[1];
+        let active = parts[2];
+        let desc   = parts[4..].join(" ");
+
+        // Package filter
+        if let Some(pkg) = filter_pkg {
+            let bare = unit.split('.').next().unwrap_or(unit);
+            let owned = db.as_ref()
+                .and_then(|db| db.list_all().ok())
+                .map(|pkgs| pkgs.iter().any(|p| {
+                    p.name == pkg && (p.name == bare || p.name.contains(bare))
+                }))
+                .unwrap_or(false);
+            if !owned { continue; }
+        }
+
+        let active_col = match active {
+            "active"   => active.bright_green().to_string(),
+            "failed"   => active.red().bold().to_string(),
+            "inactive" => active.dimmed().to_string(),
+            other      => other.to_string(),
+        };
+        println!("  {:<40} {:<22} {:<12} {}",
+                 unit.bold(), active_col, load.dimmed(),
+                 desc.chars().take(40).collect::<String>().dimmed());
+        count += 1;
+    }
+    println!("  {}", "─".repeat(80).dimmed());
+    println!("  {} unit(s).", count);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  journal with --since / --until
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_service_log_filtered(
+    units:  &[String],
+    since:  Option<&str>,
+    until:  Option<&str>,
+    lines:  usize,
+    follow: bool,
+) -> Result<()> {
+    if units.is_empty() { bail!("Usage: hammer service log <unit> [--since=...] [--until=...]"); }
+    for unit in units {
+        let unit_name = ensure_service_suffix(unit);
+        println!("  {}  Logs for {}", "⬡".cyan().bold(), unit_name.bold());
+        if let Some(s) = since { println!("  {} Since: {}", "·".dimmed(), s.cyan()); }
+        if let Some(u) = until { println!("  {} Until: {}", "·".dimmed(), u.cyan()); }
+        println!("  {}", "─".repeat(60).dimmed());
+
+        let mut args = vec!["-u", &unit_name, "--no-pager"];
+        let lines_str = format!("{}", lines);
+        if !follow { args.extend_from_slice(&["-n", &lines_str]); }
+        let since_str; let until_str;
+        if let Some(s) = since { since_str = s.to_string(); args.extend_from_slice(&["--since", &since_str]); }
+        if let Some(u) = until { until_str = u.to_string(); args.extend_from_slice(&["--until", &until_str]); }
+        if follow { args.push("--follow"); }
+
+        let _ = Command::new("journalctl").args(&args).status();
+        println!();
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  preset — enable/disable units according to preset policy
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_service_preset(units: &[String]) -> Result<()> {
+    println!("  {}  Applying service presets…", "⬡".bright_cyan().bold());
+    if units.is_empty() {
+        let _ = Command::new("systemctl").args(["preset-all", "--no-reload"]).status();
+    } else {
+        for unit in units {
+            let uname = ensure_service_suffix(unit);
+            let _ = Command::new("systemctl")
+                .args(["preset", "--no-reload", &uname]).status();
+            println!("  {} preset applied: {}", "✔".bright_green(), uname.cyan());
+        }
+    }
+    let _ = Command::new("systemctl").arg("daemon-reload").status();
+    Ok(())
+}
