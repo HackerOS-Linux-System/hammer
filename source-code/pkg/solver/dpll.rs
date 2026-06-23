@@ -32,7 +32,7 @@ type ClauseIdx = usize;
 //  CdclSolver
 // ─────────────────────────────────────────────────────────────
 
-pub struct CdclSolver {
+pub struct DpllSolver {
     num_vars:   u32,
     clauses:    Vec<Vec<Lit>>,
     assign:     Vec<Val>,
@@ -51,11 +51,11 @@ pub struct CdclSolver {
     luby_index: u64,
 }
 
-impl CdclSolver {
+impl DpllSolver {
     pub fn new(num_vars: u32) -> Self {
         let n = num_vars as usize;
         let nlit = (num_vars as usize) * 2;
-        CdclSolver {
+        DpllSolver {
             num_vars,
             clauses:   Vec::new(),
             assign:    vec![Val::Unset; n],
@@ -366,7 +366,7 @@ fn luby(mut i: u64) -> u64 {
 pub struct PackageSatProblem {
     pub var_to_pkg: Vec<(String, String)>,
     pub pkg_to_var: HashMap<(String, String), Var>,
-    solver:         CdclSolver,
+    solver:         DpllSolver,
     num_vars:       u32,
     pending:        Vec<Vec<Lit>>,
 }
@@ -376,7 +376,7 @@ impl PackageSatProblem {
         PackageSatProblem {
             var_to_pkg: Vec::new(),
             pkg_to_var: HashMap::new(),
-            solver:     CdclSolver::new(0),
+            solver:     DpllSolver::new(0),
             num_vars:   0,
             pending:    Vec::new(),
         }
@@ -393,7 +393,7 @@ impl PackageSatProblem {
     }
 
     pub fn build(&mut self) {
-        self.solver = CdclSolver::new(self.num_vars);
+        self.solver = DpllSolver::new(self.num_vars);
         let pending = std::mem::take(&mut self.pending);
         for clause in pending {
             self.solver.add_clause(clause);
@@ -458,7 +458,7 @@ mod tests {
 
     #[test]
     fn test_simple_sat() {
-        let mut s = CdclSolver::new(2);
+        let mut s = DpllSolver::new(2);
         s.add_clause(vec![Lit::pos(0), Lit::pos(1)]);
         s.add_clause(vec![Lit::neg(0), Lit::pos(1)]);
         let r = s.solve().unwrap();
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn test_simple_unsat() {
-        let mut s = CdclSolver::new(1);
+        let mut s = DpllSolver::new(1);
         s.add_clause(vec![Lit::pos(0)]);
         s.add_clause(vec![Lit::neg(0)]);
         assert!(s.solve().is_none());
@@ -475,7 +475,7 @@ mod tests {
 
     #[test]
     fn test_unit_chain() {
-        let mut s = CdclSolver::new(3);
+        let mut s = DpllSolver::new(3);
         s.add_clause(vec![Lit::pos(0)]);
         s.add_clause(vec![Lit::neg(0), Lit::pos(1)]);
         s.add_clause(vec![Lit::neg(1), Lit::pos(2)]);
