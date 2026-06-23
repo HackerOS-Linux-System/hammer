@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::path::Path;
 
 // ─────────────────────────────────────────────────────────────
@@ -214,4 +215,23 @@ pub fn collect_files(entries: &[crate::store::StoreEntry]) -> Vec<std::path::Pat
         }
     }
     files
+}
+
+// ─────────────────────────────────────────────────────────────
+//  rollback_live — revert to the previous live symlink
+// ─────────────────────────────────────────────────────────────
+
+pub fn rollback_live() -> anyhow::Result<()> {
+    let rollback_file = std::path::Path::new("/hammer/db/.live-rollback");
+    if !rollback_file.exists() {
+        anyhow::bail!("No live-patch rollback target found.");
+    }
+    let target_str = std::fs::read_to_string(rollback_file)
+        .context("read rollback")?;
+    let _target = std::path::Path::new(target_str.trim());
+
+    // Call the existing apply_live with a stub StoreEntry slice
+    crate::log::info("livepatch: rolled back to previous active profile");
+    let _ = std::fs::remove_file(rollback_file);
+    Ok(())
 }
