@@ -181,7 +181,8 @@ impl<'a> UserStore<'a> {
                       version: pkg.version.clone(),
                       hash,
                       path:    entry_path,
-            });
+                    backend: crate::store::StoreBackend::Hardlink,
+                });
         }
 
         // Extract data.tar into user store
@@ -198,7 +199,8 @@ impl<'a> UserStore<'a> {
            version: pkg.version.clone(),
            hash,
            path:    entry_path,
-        })
+                    backend: crate::store::StoreBackend::Hardlink,
+                })
     }
 }
 
@@ -335,3 +337,7 @@ impl UserEnv {
         Self::current()
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Architecture normalisation
+// ─────────────────────────────────────────────────────────────
