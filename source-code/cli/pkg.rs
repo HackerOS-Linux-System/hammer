@@ -275,7 +275,7 @@ pub async fn cmd_self_update() -> Result<()> {
 pub fn cmd_search(args: &[String], flags: &GlobalFlags) -> Result<()> {
     let installed_only = has_flag(args, "--installed");
     let query = args.iter().filter(|a| !a.starts_with('-')).cloned().collect::<Vec<_>>().join(" ");
-    if query.is_empty() { bail!("Usage: hammer search <query> [--installed]"); }
+    if query.is_empty() { bail!("Usage: hammer search <query> [--installed] [--json]"); }
     let arch  = flags.arch.as_ref().map(|a| userenv::normalise_arch(a)).transpose()?
     .unwrap_or_else(detect_arch);
     let db    = InstalledDb::open()?;
@@ -283,6 +283,9 @@ pub fn cmd_search(args: &[String], flags: &GlobalFlags) -> Result<()> {
     let mut results: Vec<_> = cache.search(&query).into_iter()
     .filter(|p| !installed_only || db.is_installed(&p.name)).collect();
     results.sort_by(|a, b| a.name.cmp(&b.name));
+    if flags.json {
+        return crate::json_output::print_search_json(&results.iter().map(|p| (*p).clone()).collect::<Vec<_>>(), &db);
+    }
     ui::print_search_header(&query, results.len());
     for pkg in &results { ui::print_search_result(pkg, db.is_installed(&pkg.name)); }
     Ok(())
@@ -296,11 +299,15 @@ pub fn cmd_info(args: &[String], flags: &GlobalFlags) -> Result<()> {
     let cache = PackageCache::load_for_arch(&arch)?;
     let pkg   = cache.get(name).ok_or_else(|| anyhow::anyhow!("Package '{}' not found. Run `hammer sync`.", name))?;
     let inst  = db.get(name);
+    if flags.json {
+        return crate::json_output::print_package_json(pkg, inst.as_ref());
+    }
     ui::print_package_info(pkg, inst.is_some(), inst.as_ref().map(|p| p.version.as_str()));
     Ok(())
 }
 
 pub fn cmd_list(args: &[String]) -> Result<()> {
+    let _json_mode     = has_flag(args, "--json");
     let installed_only = has_flag(args, "--installed") || has_flag(args, "-i");
     let upgrades_only  = has_flag(args, "--upgrades")  || has_flag(args, "-u");
     let db    = InstalledDb::open()?;
@@ -394,7 +401,8 @@ pub async fn cmd_user_remove(env: &UserEnv, args: &[String]) -> Result<()> {
         if path.exists() {
             Some(crate::store::StoreEntry {
                 name: p.name.clone(), version: p.version.clone(), hash: p.store_hash.clone(), path,
-            })
+                    backend: crate::store::StoreBackend::Hardlink,
+                })
         } else { None }
     }).collect();
     let gen_num = gdb.next_number();
@@ -454,4 +462,133 @@ pub fn cmd_user_shell_init(env: &UserEnv) -> Result<()> {
     if modified.is_empty() { println!("  {} Shell integration already installed.", "·".dimmed()); }
     else { for f in &modified { println!("       {}", f.as_str().dimmed()); } }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_mark — change install reason (auto/manual) + audit log
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_mark(args: &[String]) -> Result<()> {
+    use owo_colors::OwoColorize;
+
+    // hammer mark auto|manual <pkg…>
+    let reason_str = args.first().map(|s| s.as_str()).unwrap_or("manual");
+    let reason = match reason_str {
+        "auto"   | "automatic" => crate::db::InstallReason::Dependency,
+        "manual" | "user"      => crate::db::InstallReason::User,
+        other => anyhow::bail!(
+            "Unknown reason '{}'. Use: hammer mark [auto|manual] <pkg…>", other
+        ),
+    };
+
+    let names: Vec<String> = args.iter().skip(1)
+        .filter(|a| !a.starts_with('-'))
+        .cloned()
+        .collect();
+    if names.is_empty() {
+        anyhow::bail!("Usage: hammer mark [auto|manual] <package…>");
+    }
+
+    let db = InstalledDb::open()?;
+    for name in &names {
+        match db.get(name) {
+            None => {
+                eprintln!("  {} '{}' is not installed.", "!".yellow(), name);
+                continue;
+            }
+            Some(_) => {
+                db.set_reason(name, reason.clone())?;
+                crate::audit::record_mark(name, reason_str);
+                crate::log::info(&format!("mark: {} set to {}", name, reason_str));
+                println!("  {} {} → {}",
+                         "✔".bright_green(),
+                         name.bold(),
+                         reason_str.cyan());
+            }
+        }
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_download — download .deb with checksum + signature verify
+// ─────────────────────────────────────────────────────────────
+
+pub async fn cmd_download(args: &[String]) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use sha2::{Sha256, Digest};
+    use std::io::Write;
+
+    let name = args.iter().find(|a| !a.starts_with('-'))
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer download <package> [--arch=ARCH] [--no-verify]"))?;
+
+    let no_verify  = has_flag(args, "--no-verify");
+    let arch = detect_arch();
+
+    let cache  = PackageCache::load_for_arch(&arch)?;
+    let pkg    = cache.get(name)
+        .ok_or_else(|| anyhow::anyhow!("Package '{}' not found. Run 'hammer sync'.", name))?;
+
+    // Build download URL from Filename: field
+    let filename = pkg.filename.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("No Filename field for '{}'", name))?;
+
+    let base_uri = pkg.repo_base_uri.as_deref()
+        .ok_or_else(|| anyhow::anyhow!("No base URI known for '{}'", name))?;
+
+    let url = if filename.starts_with("http://") || filename.starts_with("https://") {
+        filename.to_string()
+    } else {
+        format!("{}/{}", base_uri.trim_end_matches('/'), filename.trim_start_matches('/'))
+    };
+
+    let out_file = format!("{}_{}.deb", name, pkg.version.replace(':', "_"));
+    println!("  {}  Downloading {}…", "⬡".bright_cyan().bold(), out_file.bold());
+    println!("  {}  URL: {}", "·".dimmed(), url.dimmed());
+
+    let client  = crate::download::HttpClient::new();
+    let bytes   = client.get_bytes_retry(&url, 3).await?;
+
+    // SHA-256 checksum verification
+    if let Some(ref expected_hash) = pkg.sha256 {
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let actual = hex::encode(hasher.finalize());
+        if actual != *expected_hash {
+            anyhow::bail!(
+                "SHA-256 mismatch for '{}'!\n  Expected: {}\n  Got:      {}",
+                name, expected_hash, actual
+            );
+        }
+        println!("  {} SHA-256 verified.", "✔".bright_green());
+    } else {
+        println!("  {} No expected checksum in cache — skipping verification.", "⚠".yellow());
+    }
+
+    // Write to disk
+    let mut f = std::fs::File::create(&out_file)?;
+    f.write_all(&bytes)?;
+    println!("  {} Saved: {}", "✔".bright_green().bold(), out_file.cyan());
+
+    // Signature verification
+    if !no_verify {
+        match crate::audit::verify_package_signature(std::path::Path::new(&out_file)) {
+            Ok(())  => println!("  {} Signature OK.", "✔".bright_green()),
+            Err(e)  => {
+                eprintln!("  {} Signature warning: {}", "⚠".yellow(), e);
+                eprintln!("  {} Use {} to skip.", "·".dimmed(), "--no-verify".cyan());
+            }
+        }
+    }
+
+    println!();
+    println!("  {}  {}", "Size:".bold(), format_bytes(bytes.len() as u64).dimmed());
+    Ok(())
+}
+
+fn format_bytes(b: u64) -> String {
+    if b < 1024               { format!("{} B",   b) }
+    else if b < 1024*1024     { format!("{:.1} KiB", b as f64 / 1024.0) }
+    else if b < 1024*1024*1024{ format!("{:.1} MiB", b as f64 / 1024.0 / 1024.0) }
+    else                      { format!("{:.2} GiB", b as f64 / 1024.0 / 1024.0 / 1024.0) }
 }
