@@ -1,3 +1,4 @@
+use crate::cli_types::has_flag;
 use anyhow::{bail, Context, Result};
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
@@ -738,4 +739,112 @@ mod sources_url_tests {
         // Flat repo / unrecognised layout
         assert_eq!(derive_sources_url("file:///srv/repo/Packages"), None);
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_build — build a source package (item 8)
+// ─────────────────────────────────────────────────────────────
+
+/// `hammer build [--arch-only|--indep-only] [--sbuild] <dir>`
+pub async fn cmd_build(args: &[String]) -> Result<()> {
+    use owo_colors::OwoColorize;
+
+    let arch_only  = has_flag(args, "--arch-only");
+    let indep_only = has_flag(args, "--indep-only");
+    let use_sbuild = has_flag(args, "--sbuild");
+    let dir = args.iter().find(|a| !a.starts_with('-'))
+        .map(|s| std::path::PathBuf::from(s))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+    if !dir.join("debian/control").exists() {
+        anyhow::bail!(
+            "'{}' does not look like a Debian source directory (no debian/control).",
+            dir.display()
+        );
+    }
+
+    // First install build-deps
+    println!("  {}  Installing build-dependencies…", "⬡".bright_cyan().bold());
+    let pkg_name = read_source_name(&dir)?;
+    let install_args = vec![pkg_name.clone()];
+    let _flags = crate::cli_types::GlobalFlags::default();
+    cmd_build_dep(&install_args).await?;
+
+    // Build
+    println!();
+    println!("  {}  Building {}…", "⬡".bright_cyan().bold(), pkg_name.bold());
+
+    if use_sbuild {
+        build_with_sbuild(&dir, arch_only, indep_only)?;
+    } else {
+        build_with_dpkg_buildpackage(&dir, arch_only, indep_only)?;
+    }
+    Ok(())
+}
+
+fn read_source_name(dir: &std::path::Path) -> Result<String> {
+    let control = std::fs::read_to_string(dir.join("debian/control"))?;
+    for line in control.lines() {
+        if let Some(name) = line.strip_prefix("Source:") {
+            return Ok(name.trim().to_string());
+        }
+        if let Some(name) = line.strip_prefix("Package:") {
+            return Ok(name.trim().to_string());
+        }
+    }
+    anyhow::bail!("Could not determine package name from debian/control")
+}
+
+fn build_with_dpkg_buildpackage(
+    dir:        &std::path::Path,
+    arch_only:  bool,
+    indep_only: bool,
+) -> Result<()> {
+    use owo_colors::OwoColorize;
+    let mut args = vec!["-us", "-uc"];  // unsigned build
+    if arch_only  { args.push("-B"); }
+    if indep_only { args.push("-A"); }
+
+    println!("  {} dpkg-buildpackage {}", "→".cyan(), args.join(" ").dimmed());
+    let status = std::process::Command::new("dpkg-buildpackage")
+        .args(&args)
+        .current_dir(dir)
+        .status()
+        .context("dpkg-buildpackage not found — install dpkg-dev")?;
+
+    if !status.success() {
+        anyhow::bail!("dpkg-buildpackage failed with exit {}", status);
+    }
+    println!("  {} Build complete.", "✔".bright_green().bold());
+    Ok(())
+}
+
+fn build_with_sbuild(
+    dir:        &std::path::Path,
+    arch_only:  bool,
+    indep_only: bool,
+) -> Result<()> {
+    use owo_colors::OwoColorize;
+    let mut args = vec!["--no-clean-source"];
+    if arch_only  { args.push("--arch-only"); }
+    if indep_only { args.push("--indep-only"); }
+
+    println!("  {} sbuild {}", "→".cyan(), args.join(" ").dimmed());
+    let status = std::process::Command::new("sbuild")
+        .args(&args)
+        .current_dir(dir)
+        .status()
+        .context("sbuild not found — install sbuild")?;
+
+    if !status.success() {
+        anyhow::bail!("sbuild failed with exit {}", status);
+    }
+    println!("  {} sbuild complete.", "✔".bright_green().bold());
+    Ok(())
+}
+
+// cmd_build_dep already defined but needs --arch-only / --indep-only flags check:
+/// Override of cmd_build_dep to accept &GlobalFlags (for cli.rs compat)
+pub async fn cmd_build_dep_with_flags(args: &[String], _flags: &crate::cli_types::GlobalFlags) -> Result<()> {
+    cmd_build_dep(args).await
 }
