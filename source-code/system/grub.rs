@@ -295,3 +295,199 @@ pub fn grub_status() -> String {
         "not installed — run `hammer init`".to_string()
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Bootloader detection and multi-backend support
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum BootloaderKind {
+    GrubBios,
+    GrubEfi,
+    SystemdBoot,
+    Unknown,
+}
+
+impl std::fmt::Display for BootloaderKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BootloaderKind::GrubBios    => write!(f, "GRUB (BIOS)"),
+            BootloaderKind::GrubEfi     => write!(f, "GRUB (EFI)"),
+            BootloaderKind::SystemdBoot => write!(f, "systemd-boot"),
+            BootloaderKind::Unknown     => write!(f, "unknown"),
+        }
+    }
+}
+
+/// Detect which bootloader is managing this system.
+pub fn detect_bootloader() -> BootloaderKind {
+    // systemd-boot: /boot/efi/EFI/systemd or /efi/EFI/systemd
+    let sdb_paths = [
+        "/boot/efi/EFI/systemd/systemd-bootx64.efi",
+        "/efi/EFI/systemd/systemd-bootx64.efi",
+        "/boot/EFI/systemd/systemd-bootx64.efi",
+    ];
+    if sdb_paths.iter().any(|p| std::path::Path::new(p).exists()) {
+        return BootloaderKind::SystemdBoot;
+    }
+
+    // Check bootctl --print-esp
+    if let Ok(out) = std::process::Command::new("bootctl")
+        .arg("is-installed")
+        .output()
+    {
+        if out.status.success() {
+            return BootloaderKind::SystemdBoot;
+        }
+    }
+
+    // GRUB EFI: grubx64.efi in EFI partition
+    let grub_efi_paths = [
+        "/boot/efi/EFI/grub/grubx64.efi",
+        "/boot/efi/EFI/ubuntu/grubx64.efi",
+        "/boot/efi/EFI/debian/grubx64.efi",
+        "/boot/efi/EFI/HackerOS/grubx64.efi",
+    ];
+    if grub_efi_paths.iter().any(|p| std::path::Path::new(p).exists()) {
+        return BootloaderKind::GrubEfi;
+    }
+
+    // GRUB BIOS: /boot/grub/grub.cfg
+    if std::path::Path::new("/boot/grub/grub.cfg").exists() {
+        return BootloaderKind::GrubBios;
+    }
+
+    BootloaderKind::Unknown
+}
+
+// ─────────────────────────────────────────────────────────────
+//  systemd-boot entries management
+// ─────────────────────────────────────────────────────────────
+
+/// Write a systemd-boot entry for a hammer generation.
+pub fn write_systemd_boot_entry(gen_num: u32, _gen: &crate::profile::Generation) -> Result<()> {
+    // Find the ESP
+    let esp = find_esp()?;
+    let entries_dir = esp.join("loader/entries");
+    std::fs::create_dir_all(&entries_dir)?;
+
+    let entry_path = entries_dir.join(format!("hammer-gen-{}.conf", gen_num));
+
+    // Detect kernel and initrd
+    let (kernel, initrd) = find_kernel_initrd()?;
+    let cmdline = read_current_cmdline()?;
+
+    let content = format!(
+        "# hammer gen-{} — written by hammer v{}\n\
+         title   HackerOS (gen-{})\n\
+         linux   {}\n\
+         initrd  {}\n\
+         options {} hammer.gen={}\n",
+        gen_num,
+        env!("CARGO_PKG_VERSION"),
+        gen_num,
+        kernel,
+        initrd,
+        cmdline,
+        gen_num,
+    );
+
+    std::fs::write(&entry_path, content)
+        .with_context(|| format!("Writing systemd-boot entry {}", entry_path.display()))?;
+
+    log::info(&format!("grub: wrote systemd-boot entry for gen-{}", gen_num));
+    Ok(())
+}
+
+/// Write a systemd-boot loader.conf pointing to the active generation.
+pub fn set_systemd_boot_default(gen_num: u32) -> Result<()> {
+    let esp     = find_esp()?;
+    let loader  = esp.join("loader/loader.conf");
+    let content = format!(
+        "# Written by hammer v{}\n\
+         default hammer-gen-{}.conf\n\
+         timeout 5\n\
+         editor  no\n",
+        env!("CARGO_PKG_VERSION"), gen_num
+    );
+    std::fs::write(&loader, content)?;
+    log::info(&format!("grub: set systemd-boot default to gen-{}", gen_num));
+    Ok(())
+}
+
+/// Remove the systemd-boot entry for a generation.
+pub fn remove_systemd_boot_entry(gen_num: u32) -> Result<()> {
+    let esp   = find_esp()?;
+    let entry = esp.join("loader/entries").join(format!("hammer-gen-{}.conf", gen_num));
+    if entry.exists() { std::fs::remove_file(&entry)?; }
+    Ok(())
+}
+
+/// Update bootloader (GRUB or systemd-boot) for all generations.
+pub fn update_all_bootloader_entries(gens_db: &crate::profile::GenerationsDb) -> Result<()> {
+    let kind = detect_bootloader();
+    match kind {
+        BootloaderKind::GrubBios | BootloaderKind::GrubEfi => {
+            update_grub(gens_db)?;
+        }
+        BootloaderKind::SystemdBoot => {
+            for gen in gens_db.all() {
+                write_systemd_boot_entry(gen.number, gen)?;
+            }
+            if let Some(active) = gens_db.active_num() {
+                set_systemd_boot_default(active)?;
+            }
+        }
+        BootloaderKind::Unknown => {
+            log::warn("grub: unknown bootloader — cannot write boot entries");
+        }
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────────────────────────
+
+fn find_esp() -> Result<std::path::PathBuf> {
+    // Check common ESP mount points
+    for path in &["/boot/efi", "/efi", "/boot"] {
+        let p = std::path::Path::new(path);
+        if p.join("EFI").exists() || p.join("loader").exists() {
+            return Ok(p.to_path_buf());
+        }
+    }
+    // Try findmnt
+    if let Ok(out) = std::process::Command::new("findmnt")
+        .args(["-n", "-o", "TARGET", "--type", "vfat", "--mountpoint", "/boot/efi"])
+        .output()
+    {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() { return Ok(std::path::PathBuf::from(s)); }
+    }
+    Ok(std::path::PathBuf::from("/boot/efi"))
+}
+
+fn find_kernel_initrd() -> Result<(String, String)> {
+    let boot = std::path::Path::new("/boot");
+    let kernel = std::fs::read_dir(boot)?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("vmlinuz-") && !n.ends_with(".old"))
+        .max() // latest = largest name (version sort approximation)
+        .map(|k| format!("/boot/{}", k))
+        .unwrap_or_else(|| "/boot/vmlinuz".to_string());
+
+    let initrd = kernel.replace("vmlinuz", "initrd.img");
+    Ok((kernel, initrd))
+}
+
+fn read_current_cmdline() -> Result<String> {
+    let cmdline = std::fs::read_to_string("/proc/cmdline")
+        .unwrap_or_default();
+    // Strip existing hammer.gen= from cmdline
+    let cleaned: Vec<&str> = cmdline.split_whitespace()
+        .filter(|s| !s.starts_with("hammer.gen=") && !s.starts_with("BOOT_IMAGE="))
+        .collect();
+    Ok(cleaned.join(" "))
+}
