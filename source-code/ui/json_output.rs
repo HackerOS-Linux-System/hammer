@@ -562,3 +562,46 @@ fn grub_status_summary() -> String {
         "unknown".to_string()
     }
 }
+
+/// Print search results as JSON array.
+pub fn print_search_json(
+    pkgs: &[crate::package::Package],
+    db:   &crate::db::InstalledDb,
+) -> anyhow::Result<()> {
+    let arr: Vec<serde_json::Value> = pkgs.iter().map(|p| {
+        serde_json::json!({
+            "name":        p.name,
+            "version":     p.version,
+            "summary":     p.description_short.as_deref(),
+            "section":     p.section,
+            "installed":   db.is_installed(&p.name),
+            "architecture": p.architecture,
+        })
+    }).collect();
+    println!("{}", serde_json::to_string_pretty(&arr)?);
+    Ok(())
+}
+
+/// Print full package info as JSON.
+pub fn print_package_json(
+    pkg:  &crate::package::Package,
+    inst: Option<&crate::db::InstalledPackage>,
+) -> anyhow::Result<()> {
+    let obj = serde_json::json!({
+        "name":         pkg.name,
+        "version":      pkg.version,
+        "architecture": pkg.architecture,
+        "section":      pkg.section,
+        "maintainer":   pkg.maintainer,
+        "description":  pkg.description_long.as_deref().or(pkg.description_short.as_deref()),
+        "depends":      pkg.depends,
+        "recommends":   pkg.recommends,
+        "suggests":     pkg.suggests,
+        "homepage":     pkg.homepage,
+        "installed":    inst.is_some(),
+        "installed_version": inst.map(|i| &i.version),
+        "installed_at":      inst.map(|i| i.installed_at.to_rfc3339()),
+    });
+    println!("{}", serde_json::to_string_pretty(&obj)?);
+    Ok(())
+}
