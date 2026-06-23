@@ -56,9 +56,10 @@ This command is only usable in a live-build hook environment."
 
         store_entries.push(StoreEntry {
             name:    pkg.name.clone(),
-                           version: pkg.version.clone(),
-                           hash:    hash.to_string(),
-                           path:    store_path,
+            version: pkg.version.clone(),
+            hash:    hash.to_string(),
+            path:    store_path,
+            backend: crate::store::StoreBackend::Hardlink,
         });
 
         if let Err(e) = db.record_install(pkg, InstallReason::User, hash, 0) {
