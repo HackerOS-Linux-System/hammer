@@ -24,6 +24,7 @@ fn spinner_style() -> ProgressStyle {
 //  PackageCache
 // ─────────────────────────────────────────────────────────────
 
+#[derive(Default)]
 pub struct PackageCache {
     by_name: HashMap<String, Package>,
     all:     HashMap<String, Package>,
@@ -306,7 +307,7 @@ async fn fetch_packages_file(
     let base_rel = format!("{}/binary-{}/Packages", info.component, info.arch);
 
     for (suffix, rel_suffix) in &[
-        (".xz", ".xz"), (".gz", ".gz"), (".bz2", ".bz2"), ("", ""),
+        (".zst", ".zst"), (".xz", ".xz"), (".gz", ".gz"), (".bz2", ".bz2"), ("", ""),
     ] {
         let url      = format!("{}{}", info.url, suffix);
         let rel_path = format!("{}{}", base_rel, rel_suffix);
