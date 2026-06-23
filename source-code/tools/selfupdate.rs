@@ -92,6 +92,33 @@ pub async fn self_update(client: &HttpClient) -> Result<()> {
         }
     }
 
+    // Phase 1b: Ed25519 signature verification — verify ALL before installing ANY
+    for (tmp_path, dest_name) in &downloaded {
+        let sig_url = format!(
+            "{}/{}/{}.sig",
+            crate::selfupdate::RELEASE_BASE, tag, dest_name.rsplit('/').next().unwrap_or(dest_name)
+        );
+        match client.get_bytes(&sig_url).await {
+            Ok(sig_bytes) => {
+                let sig_path = tmp_path.with_extension("sig");
+                std::fs::write(&sig_path, &sig_bytes)?;
+                match crate::audit::verify_package_signature(tmp_path) {
+                    Ok(()) => println!("  {} Ed25519 OK: {}", "✔".bright_green(), dest_name),
+                    Err(e) => {
+                        // Clean up all downloads
+                        for (p, _) in &downloaded { std::fs::remove_file(p).ok(); }
+                        bail!("Signature verification FAILED for {}: {}
+                                 Self-update aborted — hammer was NOT updated.", dest_name, e);
+                    }
+                }
+            }
+            Err(_) => {
+                println!("  {} No .sig for {} — skipping signature check (legacy release?)",
+                         "⚠".yellow(), dest_name);
+            }
+        }
+    }
+
     // Phase 2: atomic rename — point of no return
     for (tmp_path, dest_str) in &downloaded {
         let dest = Path::new(dest_str);
