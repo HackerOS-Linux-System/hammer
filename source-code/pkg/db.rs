@@ -93,37 +93,6 @@ impl InstalledDb {
         Ok(db)
     }
 
-    fn migrate(&self) -> Result<()> {
-        self.conn.execute_batch("
-        CREATE TABLE IF NOT EXISTS installed (
-            name              TEXT PRIMARY KEY,
-            version           TEXT NOT NULL,
-            architecture      TEXT NOT NULL,
-            installed_size_kb INTEGER NOT NULL DEFAULT 0,
-            section           TEXT,
-            maintainer        TEXT,
-            description_short TEXT,
-            installed_at      TEXT NOT NULL,
-            reason            TEXT NOT NULL DEFAULT 'user',
-            store_hash        TEXT NOT NULL DEFAULT '',
-            depends           TEXT,
-            recommends        TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS history (
-            id         INTEGER PRIMARY KEY AUTOINCREMENT,
-            action     TEXT NOT NULL,
-            package    TEXT NOT NULL,
-            old_ver    TEXT,
-            new_ver    TEXT,
-            generation INTEGER NOT NULL DEFAULT 0,
-            timestamp  TEXT NOT NULL
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_history_ts ON history(timestamp DESC);
-        ")?;
-        Ok(())
-    }
 
     // ── Queries ───────────────────────────────────────────────
 
@@ -275,4 +244,264 @@ fn row_to_installed(row: &rusqlite::Row) -> rusqlite::Result<InstalledPackage> {
        depends:           row.get(10)?,
        recommends:        row.get(11)?,
     })
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Schema migrations
+// ─────────────────────────────────────────────────────────────
+
+const CURRENT_SCHEMA_VERSION: u32 = 4;
+
+impl InstalledDb {
+    /// Run all pending schema migrations. Called on every open().
+    pub fn migrate(&self) -> Result<()> {
+        // Create schema_version table if missing (first-time setup)
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version INTEGER NOT NULL
+            );
+        ")?;
+
+        let version: u32 = self.conn
+            .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
+            .unwrap_or(0);
+
+        if version < 1 { self.migrate_v1()?; }
+        if version < 2 { self.migrate_v2()?; }
+        if version < 3 { self.migrate_v3()?; }
+        if version < 4 { self.migrate_v4()?; }
+
+        // Write current version
+        self.conn.execute_batch(&format!(
+            "DELETE FROM schema_version;
+             INSERT INTO schema_version VALUES ({});",
+            CURRENT_SCHEMA_VERSION
+        ))?;
+        Ok(())
+    }
+
+    /// v1 — baseline tables (installed, history)
+    fn migrate_v1(&self) -> Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS installed (
+                name              TEXT PRIMARY KEY,
+                version           TEXT NOT NULL,
+                architecture      TEXT NOT NULL DEFAULT 'amd64',
+                installed_size_kb INTEGER NOT NULL DEFAULT 0,
+                section           TEXT,
+                maintainer        TEXT,
+                description_short TEXT,
+                installed_at      TEXT NOT NULL,
+                reason            TEXT NOT NULL DEFAULT 'user',
+                store_hash        TEXT NOT NULL DEFAULT '',
+                depends           TEXT,
+                recommends        TEXT
+            );
+            CREATE TABLE IF NOT EXISTS history (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                action     TEXT NOT NULL,
+                package    TEXT NOT NULL,
+                old_ver    TEXT,
+                new_ver    TEXT,
+                generation INTEGER NOT NULL DEFAULT 0,
+                timestamp  TEXT NOT NULL
+            );
+        ")?;
+        Ok(())
+    }
+
+    /// v2 — add pins and holds tables
+    fn migrate_v2(&self) -> Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS pins (
+                name       TEXT PRIMARY KEY,
+                constraint TEXT NOT NULL,
+                priority   INTEGER NOT NULL DEFAULT 100,
+                note       TEXT
+            );
+            CREATE TABLE IF NOT EXISTS holds (
+                name       TEXT PRIMARY KEY,
+                held_at    TEXT NOT NULL
+            );
+        ")?;
+        Ok(())
+    }
+
+    /// v3 — add indexes for common query patterns
+    fn migrate_v3(&self) -> Result<()> {
+        self.conn.execute_batch("
+            CREATE INDEX IF NOT EXISTS idx_installed_section ON installed(section);
+            CREATE INDEX IF NOT EXISTS idx_installed_reason  ON installed(reason);
+            CREATE INDEX IF NOT EXISTS idx_history_package   ON history(package);
+            CREATE INDEX IF NOT EXISTS idx_history_action    ON history(action);
+            CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp);
+        ")?;
+        Ok(())
+    }
+
+    /// v4 — add conffiles tracking table
+    fn migrate_v4(&self) -> Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS conffiles (
+                package    TEXT NOT NULL,
+                path       TEXT NOT NULL,
+                orig_hash  TEXT NOT NULL,
+                curr_hash  TEXT,
+                modified   INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (package, path)
+            );
+            CREATE INDEX IF NOT EXISTS idx_conffiles_pkg  ON conffiles(package);
+            CREATE INDEX IF NOT EXISTS idx_conffiles_path ON conffiles(path);
+        ")?;
+        Ok(())
+    }
+
+    // ── Pin management (via DB) ───────────────────────────────
+
+    pub fn pin_package(&self, name: &str, constraint: &str, priority: i32) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pins (name, constraint, priority, note)
+             VALUES (?1, ?2, ?3, NULL)",
+            params![name, constraint, priority],
+        )?;
+        Ok(())
+    }
+
+    pub fn unpin_package(&self, name: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM pins WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
+    pub fn get_pin(&self, name: &str) -> Option<(String, i32)> {
+        self.conn.query_row(
+            "SELECT constraint, priority FROM pins WHERE name = ?1",
+            params![name],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?)),
+        ).ok()
+    }
+
+    pub fn list_pins(&self) -> Result<Vec<(String, String, i32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT name, constraint, priority FROM pins ORDER BY name"
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i32>(2)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // ── Hold management ───────────────────────────────────────
+
+    pub fn hold_package(&self, name: &str) -> Result<()> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn.execute(
+            "INSERT OR REPLACE INTO holds (name, held_at) VALUES (?1, ?2)",
+            params![name, now],
+        )?;
+        Ok(())
+    }
+
+    pub fn unhold_package(&self, name: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM holds WHERE name = ?1", params![name])?;
+        Ok(())
+    }
+
+    pub fn is_held(&self, name: &str) -> bool {
+        self.conn.query_row(
+            "SELECT 1 FROM holds WHERE name = ?1",
+            params![name], |_| Ok(true),
+        ).unwrap_or(false)
+    }
+
+    pub fn list_holds(&self) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare("SELECT name FROM holds ORDER BY name")?;
+        let rows = stmt.query_map([], |r| r.get::<_,String>(0))?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // ── Conffile tracking ─────────────────────────────────────
+
+    pub fn register_conffile(&self, pkg: &str, path: &str, hash: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO conffiles (package, path, orig_hash, curr_hash, modified)
+             VALUES (?1, ?2, ?3, ?3, 0)",
+            params![pkg, path, hash],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_conffile_hash(&self, path: &str, curr_hash: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE conffiles SET curr_hash = ?1, modified = (orig_hash != ?1)
+             WHERE path = ?2",
+            params![curr_hash, path],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_modified_conffiles(&self, pkg: Option<&str>) -> Result<Vec<(String, String)>> {
+        let (sql, param): (&str, Box<dyn rusqlite::types::ToSql>) = if let Some(p) = pkg {
+            ("SELECT package, path FROM conffiles WHERE modified = 1 AND package = ?1",
+             Box::new(p.to_string()))
+        } else {
+            ("SELECT package, path FROM conffiles WHERE modified = 1 ORDER BY package",
+             Box::new(""))
+        };
+        let mut stmt = self.conn.prepare(sql)?;
+        let rows = stmt.query_map(params![param], |r| {
+            Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?))
+        })?;
+        Ok(rows.filter_map(|r| r.ok()).collect())
+    }
+
+    // ── Maintenance ───────────────────────────────────────────
+
+    pub fn vacuum(&self) -> Result<()> {
+        self.conn.execute_batch("VACUUM; ANALYZE;")?;
+        Ok(())
+    }
+
+    /// List packages installed explicitly by the user (reason = "user").
+
+    /// Change the install reason for a package (user/dependency).
+    pub fn set_reason(&self, name: &str, reason: InstallReason) -> Result<()> {
+        let r = match reason {
+            InstallReason::User       => "user",
+            InstallReason::Dependency => "dependency",
+        };
+        self.conn.execute(
+            "UPDATE installed SET reason = ?1 WHERE name = ?2",
+            params![r, name],
+        )?;
+        Ok(())
+    }
+
+    fn row_to_pkg(&self, r: &rusqlite::Row<'_>) -> rusqlite::Result<InstalledPackage> {
+        Ok(InstalledPackage {
+            name:              r.get(0)?,
+            version:           r.get(1)?,
+            architecture:      r.get(2)?,
+            installed_size_kb: r.get(3).unwrap_or(0),
+            section:           r.get(4).ok(),
+            maintainer:        r.get(5).ok(),
+            description_short: r.get(6).ok(),
+            installed_at:      r.get(7).and_then(|s: String| {
+                                   chrono::DateTime::parse_from_rfc3339(&s)
+                                       .map(|dt| dt.with_timezone(&chrono::Utc))
+                                       .map_err(|_| rusqlite::Error::InvalidQuery)
+                               }).unwrap_or_else(|_| chrono::Utc::now()),
+            reason:            match r.get::<_, String>(8).as_deref() {
+                                   Ok("dependency") => InstallReason::Dependency,
+                                   _               => InstallReason::User,
+                               },
+            store_hash:        r.get(9).unwrap_or_default(),
+            depends:           r.get(10).ok(),
+            recommends:        r.get(11).ok(),
+        })
+    }
+
+    pub fn remove(&self, name: &str) -> Result<()> {
+        self.conn.execute("DELETE FROM installed WHERE name = ?1", params![name])?;
+        Ok(())
+    }
 }
