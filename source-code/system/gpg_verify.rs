@@ -6,7 +6,8 @@ use std::process::Command;
 
 use crate::log;
 
-pub const KEYRING_DIR: &str = "/etc/hammer/trusted.gpg.d";
+// Re-use canonical constant from gpg.rs
+pub use crate::gpg::KEYRING_DIR;
 
 // ─────────────────────────────────────────────────────────────
 //  InRelease parser
