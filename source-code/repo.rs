@@ -38,6 +38,65 @@ pub const KNOWN_SUITES: &[&str] = &[
 // ─────────────────────────────────────────────────────────────
 
 impl SourcesList {
+    pub fn entries(&self) -> &[SourceEntry] { &self.entries }
+    pub fn entries_mut(&mut self) -> &mut Vec<SourceEntry> { &mut self.entries }
+
+    pub fn add_entry(&mut self, entry: SourceEntry) {
+        self.entries.push(entry);
+    }
+
+    pub fn remove_entry_by_index(&mut self, idx: usize) {
+        if idx < self.entries.len() { self.entries.remove(idx); }
+    }
+
+    pub fn remove_entry_by_uri(&mut self, uri: &str) {
+        self.entries.retain(|e| !e.uri.contains(uri));
+    }
+
+    pub fn set_enabled_by_index(&mut self, idx: usize, enabled: bool) {
+        if let Some(e) = self.entries.get_mut(idx) { e.enabled = enabled; }
+    }
+
+    pub fn set_enabled_by_uri(&mut self, uri: &str, enabled: bool) {
+        for e in &mut self.entries {
+            if e.uri.contains(uri) { e.enabled = enabled; }
+        }
+    }
+
+    pub fn set_default_by_index(&mut self, idx: usize) {
+        // Move the entry at idx to position 0
+        if idx < self.entries.len() {
+            let entry = self.entries.remove(idx);
+            self.entries.insert(0, entry);
+        }
+    }
+
+    pub fn set_default_by_uri(&mut self, uri: &str) {
+        if let Some(idx) = self.entries.iter().position(|e| e.uri.contains(uri)) {
+            self.set_default_by_index(idx);
+        }
+    }
+
+    pub fn save(&self) -> anyhow::Result<()> {
+        self.save_to(std::path::Path::new(SOURCES_HK))
+    }
+
+    pub fn save_to(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut f = std::fs::File::create(path)?;
+        for e in &self.entries {
+            let kind = match e.kind {
+                EntryKind::Deb    => "deb",
+                EntryKind::DebSrc => "deb-src",
+            };
+            if !e.enabled { write!(f, "# ")?; }
+            write!(f, "{} {} {}", kind, e.uri, e.suite)?;
+            for comp in &e.components { write!(f, " {}", comp)?; }
+            writeln!(f)?;
+        }
+        Ok(())
+    }
+
     pub fn load() -> Result<Self> {
         let hk_path = Path::new(SOURCES_HK);
         if hk_path.exists() {
@@ -339,4 +398,207 @@ pub struct IndexUrl {
     pub arch:          String,
     pub signed_by:     Option<String>,
     pub name:          String,
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_repo — manage sources-list.hk
+// ─────────────────────────────────────────────────────────────
+
+/// `hammer repo <sub> [args…]`
+pub fn cmd_repo(args: &[String]) -> anyhow::Result<()> {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("list");
+    match sub {
+        "list" | "ls" => repo_list(),
+        "add"         => repo_add(&args[1..]),
+        "remove" | "rm" | "delete" => repo_remove(&args[1..]),
+        "enable"      => repo_enable(&args[1..], true),
+        "disable"     => repo_enable(&args[1..], false),
+        "info"        => repo_info(&args[1..]),
+        "set-default" => repo_set_default(&args[1..]),
+        other => anyhow::bail!(
+            "Unknown repo subcommand '{}'\n  \
+             Usage: hammer repo [list|add <url>|remove <id>|enable <id>|disable <id>|info <id>]",
+            other
+        ),
+    }
+}
+
+fn repo_list() -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let list = SourcesList::load()?;
+    println!();
+    println!("  {}  Configured repositories  ({})", "⬡".bright_cyan().bold(), SOURCES_HK.dimmed());
+    println!("  {}", "─".repeat(70).dimmed());
+    println!("  {:<4} {:<36} {:<14} {}",
+             "#".bold(), "URI".bold(), "Suite".bold(), "Components".bold());
+    println!("  {}", "─".repeat(70).dimmed());
+
+    let entries = list.entries();
+    if entries.is_empty() {
+        println!("  {} No repositories configured.", "·".dimmed());
+        println!("  Hint: {}", "hammer repo add <uri> <suite> <components>".cyan());
+        return Ok(());
+    }
+
+    for (i, e) in entries.iter().enumerate() {
+        let status = if e.enabled {
+            "✔".bright_green().to_string()
+        } else {
+            "✘".red().to_string()
+        };
+        let uri_short = if e.uri.len() > 34 {
+            format!("{}…", &e.uri[..33])
+        } else {
+            e.uri.clone()
+        };
+        println!("  {} {:<2} {:<36} {:<14} {}",
+                 status,
+                 (i + 1).to_string().dimmed(),
+                 uri_short.cyan(),
+                 e.suite.bold(),
+                 e.components.join(" ").dimmed());
+    }
+    println!();
+    println!("  {} entries. Toggle with {}.",
+             entries.len(), "hammer repo enable/disable <#>".cyan());
+    Ok(())
+}
+
+fn repo_add(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    // hammer repo add <uri> <suite> [components…]
+    // or: hammer repo add "deb https://… suite comp1 comp2"  (apt-style)
+    if args.is_empty() {
+        anyhow::bail!("Usage: hammer repo add <uri> <suite> [main contrib non-free …]");
+    }
+
+    // Support apt-style "deb <uri> <suite> <comps>" as a single arg
+    let (uri, suite, components) = if args[0].starts_with("deb ") || args[0].starts_with("deb-src ") {
+        let parts: Vec<&str> = args[0].splitn(4, ' ').collect();
+        if parts.len() < 3 {
+            anyhow::bail!("Invalid apt-style source: '{}'", args[0]);
+        }
+        let comps: Vec<String> = if parts.len() >= 4 {
+            parts[3].split_whitespace().map(|s| s.to_string()).collect()
+        } else {
+            vec!["main".to_string()]
+        };
+        (parts[1].to_string(), parts[2].to_string(), comps)
+    } else if args.len() >= 2 {
+        let uri   = args[0].clone();
+        let suite = args[1].clone();
+        let comps: Vec<String> = if args.len() >= 3 {
+            args[2..].to_vec()
+        } else {
+            vec!["main".to_string()]
+        };
+        (uri, suite, comps)
+    } else {
+        anyhow::bail!("Usage: hammer repo add <uri> <suite> [main contrib non-free …]");
+    };
+
+    let mut list = SourcesList::load()?;
+    // Check for duplicates
+    if list.entries().iter().any(|e| e.uri == uri && e.suite == suite) {
+        println!("  {} Repository already configured: {} {}", "·".yellow(), uri, suite);
+        return Ok(());
+    }
+
+    list.add_entry(SourceEntry {
+        kind:       EntryKind::Deb,
+        uri:        uri.clone(),
+        suite:      suite.clone(),
+        components: components.clone(),
+        arches:     vec![],
+        signed_by:  None,
+        enabled:    true,
+        name:       None,
+    });
+    list.save()?;
+
+    println!("  {} Added: {} {} {}", "✔".bright_green().bold(),
+             uri.cyan(), suite.bold(), components.join(" ").dimmed());
+    println!("  Run {} to update the package index.", "hammer sync".cyan());
+    Ok(())
+}
+
+fn repo_remove(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let id = args.first().ok_or_else(|| anyhow::anyhow!("Usage: hammer repo remove <# or uri>"))?;
+
+    let mut list = SourcesList::load()?;
+    let before = list.entries().len();
+
+    // Try by index (1-based) first, then by URI substring
+    if let Ok(idx) = id.parse::<usize>() {
+        list.remove_entry_by_index(idx.saturating_sub(1));
+    } else {
+        list.remove_entry_by_uri(id);
+    }
+
+    let after = list.entries().len();
+    if after == before {
+        anyhow::bail!("No repository matched '{}'", id);
+    }
+    list.save()?;
+    println!("  {} Removed repository {}.", "✔".bright_green(), id.cyan());
+    Ok(())
+}
+
+fn repo_enable(args: &[String], enable: bool) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let id = args.first().ok_or_else(|| anyhow::anyhow!(
+        "Usage: hammer repo {}/disable <# or uri>",
+        if enable { "enable" } else { "disable" }
+    ))?;
+
+    let mut list = SourcesList::load()?;
+    let verb = if enable { "Enabled" } else { "Disabled" };
+
+    if let Ok(idx) = id.parse::<usize>() {
+        list.set_enabled_by_index(idx.saturating_sub(1), enable);
+    } else {
+        list.set_enabled_by_uri(id, enable);
+    }
+    list.save()?;
+    println!("  {} {} repository {}.", "✔".bright_green(), verb, id.cyan());
+    Ok(())
+}
+
+fn repo_info(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let id = args.first().ok_or_else(|| anyhow::anyhow!("Usage: hammer repo info <# or uri>"))?;
+    let list = SourcesList::load()?;
+    let entry = if let Ok(idx) = id.parse::<usize>() {
+        list.entries().get(idx.saturating_sub(1)).cloned()
+    } else {
+        list.entries().iter().find(|e| e.uri.contains(id.as_str())).cloned()
+    };
+    match entry {
+        None => anyhow::bail!("No repository matched '{}'", id),
+        Some(e) => {
+            println!();
+            println!("  {:<20} {}", "URI:".bold(), e.uri.cyan());
+            println!("  {:<20} {}", "Suite:".bold(), e.suite);
+            println!("  {:<20} {}", "Components:".bold(), e.components.join(" "));
+            println!("  {:<20} {}", "Enabled:".bold(),
+                     if e.enabled { "yes".bright_green().to_string() }
+                     else         { "no".red().to_string() });
+        }
+    }
+    Ok(())
+}
+
+fn repo_set_default(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let id = args.first().ok_or_else(|| anyhow::anyhow!("Usage: hammer repo set-default <# or uri>"))?;
+    let mut list = SourcesList::load()?;
+    if let Ok(idx) = id.parse::<usize>() {
+        list.set_default_by_index(idx.saturating_sub(1));
+    } else {
+        list.set_default_by_uri(id);
+    }
+    list.save()?;
+    println!("  {} Default repository set to {}.", "✔".bright_green(), id.cyan());
+    Ok(())
 }
