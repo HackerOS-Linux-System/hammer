@@ -6,8 +6,6 @@
 #[path = "pkg/solver/mod.rs"]      mod solver;
 #[path = "pkg/store.rs"]           mod store;
 #[path = "pkg/transaction.rs"]     mod transaction;
-
-// ── pkg/ — new modules ────────────────────────────────────────
 #[path = "pkg/conffiles.rs"]       mod conffiles;
 #[path = "pkg/essential.rs"]       mod essential;
 #[path = "pkg/multi_arch.rs"]      mod multi_arch;
@@ -19,13 +17,11 @@
 #[path = "system/gpg.rs"]          mod gpg;
 #[path = "system/gpg_verify.rs"]   mod gpg_verify;
 #[path = "system/grub.rs"]         mod grub;
-#[path = "system/immutable.rs"]    mod immutable;
+#[path = "system/immuntable.rs"]   mod immutable;
 #[path = "system/livepatch.rs"]    mod livepatch;
 #[path = "system/postinst.rs"]     mod postinst;
 #[path = "system/profile.rs"]      mod profile;
 #[path = "system/service.rs"]      mod service;
-
-// ── system/ — new modules ─────────────────────────────────────
 #[path = "system/audit.rs"]        mod audit;
 #[path = "system/boot_fallback.rs"]mod boot_fallback;
 #[path = "system/sandbox.rs"]      mod sandbox;
@@ -34,14 +30,13 @@
 #[path = "tools/hk_tools.rs"]      mod hk_tools;
 #[path = "tools/selfupdate.rs"]    mod selfupdate;
 #[path = "tools/setup.rs"]         mod setup;
-
-// ── tools/ — new modules ─────────────────────────────────────
 #[path = "tools/build_dep.rs"]     mod build_dep;
 #[path = "tools/completion.rs"]    mod completion;
 #[path = "tools/mirror.rs"]        mod mirror;
 #[path = "tools/notify.rs"]        mod notify;
 
 // ── internal/ ─────────────────────────────────────────────────
+#[path = "internal/build_mode.rs"] mod build_mode;
 #[path = "internal/diff.rs"]       mod diff;
 #[path = "internal/livecheck.rs"]  mod livecheck;
 #[path = "internal/lock.rs"]       mod lock;
