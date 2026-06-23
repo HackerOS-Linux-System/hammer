@@ -1,3 +1,4 @@
+use crate::cache::PackageCache;
 use anyhow::{bail, Result};
 use owo_colors::OwoColorize;
 
@@ -16,7 +17,6 @@ use crate::profile::{
 };
 use crate::repo::SOURCES_HK;
 use crate::service;
-use crate::store::Store;
 use crate::ui;
 use crate::userenv::{self, UserEnv};
 
@@ -237,7 +237,8 @@ fn cmd_apply_live() -> Result<()> {
             Some(crate::store::StoreEntry {
                 name: p.name.clone(), version: p.version.clone(),
                  hash: p.store_hash.clone(), path,
-            })
+                    backend: crate::store::StoreBackend::Hardlink,
+                })
         } else { None }
     }).collect();
 
@@ -492,7 +493,7 @@ pub fn cmd_gc(args: &[String]) -> Result<()> {
     gdb.generations.retain(|g| !del_nums.contains(&g.number));
     let referenced: std::collections::HashSet<String> = gdb.generations.iter()
     .flat_map(|g| g.packages.iter().map(|p| format!("{}-{}-{}", p.name, p.version, p.store_hash))).collect();
-    Store::gc_unreferenced(&referenced)?;
+    crate::store::gc_unreferenced_pkgs(&referenced)?;
     gdb.save()?; let _ = grub::update_grub(&gdb);
     println!("  {} Garbage collection complete.", "✔".bright_green());
     Ok(())
@@ -591,3 +592,254 @@ pub fn cmd_activate_internal() -> Result<()> {
     Ok(())
 }
 
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_fsck — filesystem check of hammer store
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_fsck(args: &[String]) -> Result<()> {
+    println!();
+    println!("  {}  Hammer store filesystem check", "⬡".bright_cyan().bold());
+    println!("  {}", "─".repeat(60).dimmed());
+
+    let db     = InstalledDb::open()?;
+    let all    = db.list_all().unwrap_or_default();
+    let store  = std::path::Path::new(crate::store::STORE_DIR);
+    let mut ok = 0usize;
+    let mut bad= 0usize;
+
+    if !store.exists() {
+        println!("  {} Store directory not found: {}", "!".red().bold(), crate::store::STORE_DIR);
+        return Ok(());
+    }
+
+    for pkg in &all {
+        let entry_dir = store.join(format!("{}-{}-{}", pkg.name, pkg.version, pkg.store_hash));
+        if entry_dir.exists() {
+            println!("  {} {}  {}", "✔".bright_green(), pkg.name.bold(), pkg.version.dimmed());
+            ok += 1;
+        } else {
+            println!("  {} {} — store entry missing! ({}-{}-{})",
+                     "✗".red().bold(), pkg.name.red(), pkg.name, pkg.version, pkg.store_hash);
+            bad += 1;
+        }
+    }
+
+    println!();
+    if bad == 0 {
+        println!("  {} Store OK: {} entries verified.", "✔".bright_green().bold(), ok);
+    } else {
+        println!("  {} {} store entr{} missing. Run: {}",
+                 "✗".red().bold(), bad,
+                 if bad == 1 { "y" } else { "ies" },
+                 "hammer fix-broken".cyan());
+    }
+
+    // Also check for orphaned store entries (not referenced by any installed pkg)
+    if has_flag(args, "--full") || has_flag(args, "-f") {
+        let referenced: std::collections::HashSet<String> = all.iter()
+            .map(|p| format!("{}-{}-{}", p.name, p.version, p.store_hash))
+            .collect();
+        let mut orphans = 0usize;
+        if let Ok(entries) = std::fs::read_dir(store) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if !referenced.contains(&name) {
+                    println!("  {} orphan: {}", "·".yellow(), name.dimmed());
+                    orphans += 1;
+                }
+            }
+        }
+        if orphans > 0 {
+            println!("  {} {} orphaned store entr{}. Run: {}",
+                     "·".yellow(), orphans,
+                     if orphans == 1 { "y" } else { "ies" },
+                     "hammer gc".cyan());
+        }
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_check — package integrity check
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_check(args: &[String]) -> Result<()> {
+    println!();
+    println!("  {}  Package integrity check", "⬡".bright_cyan().bold());
+    println!("  {}", "─".repeat(60).dimmed());
+
+    let db    = InstalledDb::open()?;
+    let cache = crate::cache::PackageCache::load().unwrap_or_else(|_| PackageCache::empty());
+    let all   = db.list_all().unwrap_or_default();
+
+    let mut issues = 0usize;
+    let names: Vec<String> = args.iter().filter(|a| !a.starts_with('-')).cloned().collect();
+    let to_check: Vec<_> = if names.is_empty() {
+        all.iter().collect()
+    } else {
+        all.iter().filter(|p| names.contains(&p.name)).collect()
+    };
+
+    for pkg in &to_check {
+        let mut pkg_issues = Vec::new();
+
+        // Check if package is in any repo
+        if cache.get(&pkg.name).is_none() {
+            pkg_issues.push(format!("not in any configured repository (orphan)"));
+        }
+
+        // Check if store entry exists
+        let store_dir = std::path::Path::new(crate::store::STORE_DIR)
+            .join(format!("{}-{}-{}", pkg.name, pkg.version, pkg.store_hash));
+        if !store_dir.exists() {
+            pkg_issues.push(format!("store entry missing"));
+        }
+
+        // Check if newer version available
+        if let Some(avail) = cache.get(&pkg.name) {
+            if crate::solver::version::compare(&avail.version, &pkg.version)
+                == std::cmp::Ordering::Greater
+            {
+                pkg_issues.push(format!("update available: {}", avail.version));
+            }
+        }
+
+        if pkg_issues.is_empty() {
+            if !args.is_empty() {
+                println!("  {} {}  {}", "✔".bright_green(), pkg.name.bold(), pkg.version.dimmed());
+            }
+        } else {
+            issues += pkg_issues.len();
+            println!("  {} {}  {}", "!".yellow().bold(), pkg.name.bold(), pkg.version.dimmed());
+            for issue in &pkg_issues {
+                println!("      {} {}", "·".dimmed(), issue.yellow());
+            }
+        }
+    }
+
+    println!();
+    if issues == 0 {
+        println!("  {} All {} package(s) OK.", "✔".bright_green().bold(), to_check.len());
+    } else {
+        println!("  {} {} issue(s) found across {} package(s).",
+                 "!".yellow().bold(), issues, to_check.len());
+        println!("  Run {} to fix broken dependencies.", "hammer fix-broken".cyan());
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_boot — boot-related operations
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_boot(args: &[String]) -> Result<()> {
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+    match sub {
+        "status" => {
+            println!();
+            println!("  {}  Boot status", "⬡".bright_cyan().bold());
+            println!("  {}", "─".repeat(50).dimmed());
+            let _gdb = crate::profile::GenerationsDb::load()?;
+            let active  = crate::profile::read_active_gen();
+            let pending = crate::profile::read_pending_gen();
+            println!("  {:<28} {}", "Current generation:".bold(),
+                     active.map(|n| format!("gen-{}", n)).unwrap_or_else(|| "none".to_string()).cyan());
+            println!("  {:<28} {}", "Pending (next boot):".bold(),
+                     pending.map(|n| format!("gen-{}", n)).unwrap_or_else(|| "none".to_string()).yellow());
+            println!("  {:<28} {}", "GRUB status:".bold(), crate::grub::grub_status().dimmed());
+            if let Some(bg) = crate::grub::read_boot_gen() {
+                println!("  {:<28} gen-{}", "GRUB selected:".bold(), bg.to_string().cyan());
+            }
+            println!();
+        }
+        "activate" => {
+            println!("  {} Activating pending generation…", "⬡".bright_cyan().bold());
+            let result = crate::profile::activate_pending()?;
+            crate::ui::print_activation_result(&result);
+        }
+        "fallback" => {
+            println!("  {} Triggering boot fallback…", "⬡".bright_yellow().bold());
+            crate::boot_fallback::apply_fallback()?;
+        }
+        "update-grub" => {
+            let gdb = crate::profile::GenerationsDb::load()?;
+            crate::grub::update_grub(&gdb)?;
+            println!("  {} GRUB updated.", "✔".bright_green());
+        }
+        other => anyhow::bail!(
+            "Unknown boot subcommand: '{}'\n  Usage: hammer boot [status|activate|fallback|update-grub]",
+            other
+        ),
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_why — why is a package installed?
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_why(args: &[String]) -> Result<()> {
+    use owo_colors::OwoColorize;
+    let name = args.first()
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer why <package>"))?;
+    let cache = crate::cache::PackageCache::load()?;
+    let db    = InstalledDb::open()?;
+    let solver = crate::solver::Solver::new(&cache, &db);
+
+    println!();
+    println!("  {}  Why is '{}' installed?", "⬡".bright_cyan().bold(), name.bold());
+    println!("  {}", "─".repeat(60).dimmed());
+
+    if !db.is_installed(name) {
+        println!("  {} '{}' is not installed.", "·".dimmed(), name);
+        return Ok(());
+    }
+
+    let reasons = solver.why_installed(name);
+    if reasons.is_empty() {
+        println!("  {} No dependents found — possibly a manually installed package.", "·".dimmed());
+    } else {
+        for r in &reasons {
+            println!("  {} {}", "·".dimmed(), r.cyan());
+        }
+    }
+
+    if let Some(inst) = db.get(name) {
+        println!();
+        let reason_str = match inst.reason {
+            crate::db::InstallReason::User       => "manually installed".green().to_string(),
+            crate::db::InstallReason::Dependency => "installed as dependency".yellow().to_string(),
+        };
+        println!("  {:<28} {}", "Install reason:".bold(), reason_str);
+        println!("  {:<28} {}", "Version:".bold(), inst.version.cyan());
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_why_not — why can't a package be installed?
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_why_not(args: &[String]) -> Result<()> {
+    use owo_colors::OwoColorize;
+    let name = args.first()
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer why-not <package>"))?;
+    let cache  = crate::cache::PackageCache::load()?;
+    let db     = InstalledDb::open()?;
+    let solver = crate::solver::Solver::new(&cache, &db);
+
+    println!();
+    println!("  {}  Why not installable: '{}'", "⬡".bright_cyan().bold(), name.bold());
+    println!("  {}", "─".repeat(60).dimmed());
+
+    if db.is_installed(name) {
+        println!("  {} '{}' is already installed ({})",
+                 "ℹ".cyan(), name, db.get(name).map(|i| i.version).unwrap_or_default().dimmed());
+        return Ok(());
+    }
+
+    let explanation = solver.explain_failure(name);
+    println!("{}", explanation);
+    Ok(())
+}
