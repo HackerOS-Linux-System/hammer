@@ -264,3 +264,22 @@ fn extract_tar(root: &Path, tar_bytes: &[u8]) -> Result<(Vec<PathBuf>, Vec<PathB
     }
     Ok((regular, all_extr))
 }
+
+impl DebPackage {
+    /// Unpack the .deb data section into `root`.
+    /// This is the canonical install method used by transaction.rs.
+    /// Equivalent to extract_data() but named to match Debian conventions.
+    pub fn unpack(&self, root: &std::path::Path) -> anyhow::Result<crate::deb::ExtractResult> {
+        self.extract_data(root)
+    }
+
+    /// Return the prerm script content if present.
+    pub fn prerm(&self) -> Option<&str> { self.prerm.as_deref() }
+    /// Return the postrm script content if present.
+    pub fn postrm(&self) -> Option<&str> { self.postrm.as_deref() }
+    /// Return the postinst script content if present.
+    pub fn postinst(&self) -> Option<&str> { self.postinst.as_deref() }
+    /// Return the preinst script content if present.
+    pub fn preinst(&self) -> Option<&str> { self.preinst.as_deref() }
+
+}
