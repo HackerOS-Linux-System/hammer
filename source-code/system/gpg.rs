@@ -403,3 +403,34 @@ fn extract_inrelease_content(bytes: &[u8]) -> Result<String> {
     if content.is_empty() { return Ok(text.into_owned()); }
     Ok(content)
 }
+
+/// Verify a file against a detached GPG/ASCII-armored signature.
+pub fn verify_file_detached(
+    data_path: &std::path::Path,
+    sig_path:  &std::path::Path,
+) -> anyhow::Result<()> {
+    let status = std::process::Command::new("gpgv")
+        .args([
+            "--keyring", KEYRING_DIR,
+            "--",
+            sig_path.to_str().unwrap_or(""),
+            data_path.to_str().unwrap_or(""),
+        ])
+        .status()
+        .context("gpgv not found — install gnupg")?;
+    if status.success() {
+        crate::log::info(&format!("gpg: signature OK for {}", data_path.display()));
+        Ok(())
+    } else {
+        anyhow::bail!("GPG signature verification failed for '{}'", data_path.display())
+    }
+}
+
+/// True if the repository from which this .deb was downloaded is GPG-verified
+/// (i.e. its InRelease was verified during hammer sync).
+pub fn is_repo_trusted(deb_path: &std::path::Path) -> bool {
+    // Check if the parent directory has a .gpg-verified marker
+    deb_path.parent()
+        .map(|p| p.join(".gpg-verified").exists())
+        .unwrap_or(false)
+}
