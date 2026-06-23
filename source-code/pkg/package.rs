@@ -77,6 +77,7 @@ pub struct Package {
     pub depends:           Option<String>,
     pub pre_depends:       Option<String>,
     pub recommends:        Option<String>,
+    pub essential:          bool,
     pub suggests:          Option<String>,
     pub conflicts:         Option<String>,
     pub breaks:            Option<String>,
@@ -108,6 +109,7 @@ impl Default for Package {
     fn default() -> Self {
         Package {
             name:              String::new(),
+            essential:         false,
             version:           String::new(),
             architecture:      String::new(),
             depends:           None,
@@ -185,6 +187,7 @@ impl Package {
             "provides"       => self.provides            = Some(v),
             "replaces"       => self.replaces            = Some(v),
             "enhances"       => self.enhances            = Some(v),
+            "essential"      => self.essential           = v.to_lowercase() == "yes",
             "section"        => self.section             = Some(v),
             "priority"       => self.priority            = Some(v),
             "maintainer"     => self.maintainer          = Some(v),
