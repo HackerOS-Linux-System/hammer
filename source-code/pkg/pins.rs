@@ -265,3 +265,64 @@ pub fn cmd_pin(args: &[String]) -> Result<()> {
     }
     Ok(())
 }
+
+/// cmd_hold: hold a package at its current version (DB + file).
+pub fn cmd_hold(args: &[String]) -> anyhow::Result<()> {
+    let pkg = args.first().ok_or_else(|| anyhow::anyhow!("Usage: hammer hold <package>"))?;
+    let idb = crate::db::InstalledDb::open()?;
+    idb.hold_package(pkg)?;
+    println!("  {} {} held at {}.",
+             "[32m✔[0m", pkg, idb.get(pkg).map(|p| p.version).unwrap_or_default());
+    Ok(())
+}
+
+/// cmd_unhold: release a package from hold.
+pub fn cmd_unhold(args: &[String]) -> anyhow::Result<()> {
+    let pkg = args.first().ok_or_else(|| anyhow::anyhow!("Usage: hammer unhold <package>"))?;
+    let idb = crate::db::InstalledDb::open()?;
+    idb.unhold_package(pkg)?;
+    println!("  {} {} released from hold.", "[32m✔[0m", pkg);
+    Ok(())
+}
+
+impl PinDb {
+    /// Look up a pin constraint for a package.
+    /// Returns `(constraint_string, priority)` or None.
+    pub fn get_pin(&self, name: &str) -> Option<(String, i32)> {
+        self.entries.iter()
+            .find(|e| e.package == name && e.note.as_deref() != Some("held"))
+            .map(|e| (e.version.clone(), e.priority))
+    }
+
+    /// True if the package is held (pinned with held note, priority 1001).
+    pub fn is_held_local(&self, name: &str) -> bool {
+        self.entries.iter()
+            .any(|e| e.package == name && e.note.as_deref() == Some("held"))
+    }
+}
+
+/// cmd_unpin — remove a version pin
+pub fn cmd_unpin(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let names: Vec<&str> = args.iter()
+        .filter(|a| !a.starts_with('-'))
+        .map(|s| s.as_str())
+        .collect();
+    if names.is_empty() {
+        anyhow::bail!("Usage: hammer unpin <package…>");
+    }
+    let mut db = PinDb::load()?;
+    for name in &names {
+        let before = db.entries.len();
+        db.entries.retain(|e| e.package != *name);
+        let idb = crate::db::InstalledDb::open()?;
+        let _ = idb.unpin_package(name);
+        if db.entries.len() < before {
+            println!("  {} Unpinned {}", "✔".bright_green(), name.bold());
+        } else {
+            println!("  {} '{}' had no pin.", "·".dimmed(), name);
+        }
+    }
+    db.save()?;
+    Ok(())
+}
