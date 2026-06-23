@@ -1,3 +1,4 @@
+use anyhow::Context;
 use anyhow::Result;
 use owo_colors::OwoColorize;
 use std::process::Command;
@@ -171,4 +172,148 @@ WantedBy=timers.target\n";
     println!("  {} hammer-update-check.timer installed and enabled.", "✔".bright_green());
     crate::log::info("notify: installed systemd timer");
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Daemon mode with PID file and configurable interval
+// ─────────────────────────────────────────────────────────────
+
+pub const NOTIFY_PID_FILE: &str = "/run/hammer-notify.pid";
+pub const NOTIFY_SOCKET:   &str = "/run/hammer-notify.sock";
+
+#[derive(Debug)]
+pub struct NotifyDaemon {
+    pub interval_hours:   u64,
+    pub check_interval:   u64,
+}
+
+impl NotifyDaemon {
+    pub fn new(interval_hours: u64) -> Self {
+        NotifyDaemon { interval_hours, check_interval: interval_hours }
+    }
+
+    pub fn from_config() -> Self {
+        let interval = std::env::var("HAMMER_NOTIFY_INTERVAL")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(6);
+        Self::new(interval)
+    }
+
+    /// Start the daemon loop. Call only once — blocks.
+    pub fn run(&self) -> Result<()> {
+        // Write PID file
+        std::fs::write(NOTIFY_PID_FILE, format!("{}\n", std::process::id()))?;
+
+        // Install signal handler for clean shutdown
+        let running = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        {
+            let _r = running.clone();
+            let _ = unsafe {
+                libc::signal(libc::SIGTERM, handle_sigterm as libc::sighandler_t)
+            };
+        }
+
+        eprintln!("[hammer-notify] Started. Interval: {}h PID: {}",
+                  self.interval_hours, std::process::id());
+
+        let interval = std::time::Duration::from_secs(self.interval_hours * 3600);
+        let mut last_run = std::time::Instant::now()
+            .checked_sub(interval)
+            .unwrap_or(std::time::Instant::now());
+
+        loop {
+            if !running.load(std::sync::atomic::Ordering::SeqCst) { break; }
+            let now = std::time::Instant::now();
+            if now.duration_since(last_run) >= interval {
+                last_run = now;
+                self.run_check();
+            }
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+
+        let _ = std::fs::remove_file(NOTIFY_PID_FILE);
+        eprintln!("[hammer-notify] Stopped.");
+        Ok(())
+    }
+
+    fn run_check(&self) {
+        let out = Command::new("hammer")
+            .args(["list", "--upgradable"])
+            .output();
+        match out {
+            Ok(o) if o.status.success() => {
+                let text = String::from_utf8_lossy(&o.stdout);
+                let n    = text.lines().filter(|l| !l.trim().is_empty()).count();
+                if n > 0 {
+                    let summary = format!("{} update{} available", n, if n == 1 { "" } else { "s" });
+                    let _ = send_notification(
+                        &summary,
+                        "Run 'hammer upgrade' to install.",
+                        Urgency::Normal,
+                        "software-update-available",
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Stop a running daemon (send SIGTERM via PID file).
+    pub fn stop() -> Result<()> {
+        let pid_str = std::fs::read_to_string(NOTIFY_PID_FILE)
+            .context("No PID file — is hammer-notify running?")?;
+        let pid: i32 = pid_str.trim().parse()
+            .context("Invalid PID in PID file")?;
+        unsafe { libc::kill(pid, libc::SIGTERM); }
+        let _ = std::fs::remove_file(NOTIFY_PID_FILE);
+        println!("  {} Sent SIGTERM to hammer-notify (pid={}).", "✔".bright_green(), pid);
+        Ok(())
+    }
+
+    /// Find the DBUS_SESSION_BUS_ADDRESS for all active user sessions.
+    pub fn find_all_dbus_addresses() -> Vec<String> {
+        let mut addrs = Vec::new();
+        // Read from /run/user/<uid>/bus
+        if let Ok(entries) = std::fs::read_dir("/run/user") {
+            for e in entries.flatten() {
+                let bus = e.path().join("bus");
+                if bus.exists() {
+                    addrs.push(format!("unix:path={}", bus.display()));
+                }
+            }
+        }
+        addrs
+    }
+}
+
+extern "C" fn handle_sigterm(_: libc::c_int) {
+    // Set a flag — the loop checks it
+    std::process::exit(0);
+}
+
+/// Send a notification to every active desktop session.
+pub fn broadcast_notification(summary: &str, body: &str, urgency: Urgency, icon: &str) {
+    let addrs = NotifyDaemon::find_all_dbus_addresses();
+    if addrs.is_empty() {
+        let _ = send_notification(summary, body, urgency, icon);
+        return;
+    }
+    for addr in &addrs {
+        let urg = match urgency {
+            Urgency::Low      => "low",
+            Urgency::Normal   => "normal",
+            Urgency::Critical => "critical",
+        };
+        let _ = Command::new("notify-send")
+            .env("DBUS_SESSION_BUS_ADDRESS", addr)
+            .args([
+                "--app-name=hammer",
+                &format!("--icon={}", icon),
+                &format!("--urgency={}", urg),
+                summary,
+                body,
+            ])
+            .status();
+    }
 }
