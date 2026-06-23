@@ -23,6 +23,15 @@ const COMMANDS: &[(&str, &str)] = &[
     ("history",      "Show transaction history"),
     ("gen",          "Manage generations (list, switch)"),
     ("rollback",     "Roll back to previous generation"),
+    ("features",     "Show all feature flags for this build"),
+    ("snapshot",     "Create a filesystem snapshot"),
+    ("fsck",         "Filesystem check of hammer store"),
+    ("check",        "Check package integrity"),
+    ("audit",        "Security audit of packages"),
+    ("boot",         "Boot management (status, activate, fallback)"),
+    ("arch",         "Multi-arch management"),
+    ("dpkg-arch",    "dpkg --print-architecture compatible commands"),
+    ("repo",         "Manage source repositories (add/remove/list)"),
     ("diff",         "Show diff between generations"),
     ("pending",      "Manage pending changes"),
     ("verify",       "Verify package integrity"),
@@ -55,6 +64,8 @@ const COMMANDS: &[(&str, &str)] = &[
 
 const GLOBAL_FLAGS: &[&str] = &[
     "--user", "--arch=", "--yes", "-y", "--help", "-h", "--version",
+    "--dry-run", "-n", "--json", "--no-progress", "--debug", "--verbose",
+    "--quiet", "--color=always", "--color=never", "--root=", "--force",
 "--no-recommends", "--installed", "--upgrades", "--json",
 ];
 
