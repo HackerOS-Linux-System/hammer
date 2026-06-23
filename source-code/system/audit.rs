@@ -464,3 +464,72 @@ fn sha256_hex(data: &[u8]) -> String {
     h.update(data);
     hex::encode(h.finalize())
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Package signature verification
+// ─────────────────────────────────────────────────────────────
+
+/// Verify the Ed25519 signature of a downloaded .deb file.
+/// The signature is expected at `<path>.sig` (detached).
+/// Falls back to GPG verification if no `.sig` file is found.
+pub fn verify_package_signature(deb_path: &std::path::Path) -> Result<()> {
+    // Try Ed25519 first
+    let sig_path = deb_path.with_extension("deb.sig");
+    if sig_path.exists() {
+        return verify_ed25519_sig(deb_path, &sig_path);
+    }
+
+    // Try GPG (.deb.asc)
+    let asc_path = deb_path.with_extension("deb.asc");
+    if asc_path.exists() {
+        return crate::gpg::verify_file_detached(deb_path, &asc_path);
+    }
+
+    // No signature file found — warn but don't block if repository is trusted
+    let repo_trusted = crate::gpg::is_repo_trusted(deb_path);
+    if repo_trusted {
+        crate::log::info(&format!(
+            "audit: no signature file for {} (repo trusted via InRelease)",
+            deb_path.display()
+        ));
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "No signature found for package '{}' and repo is not GPG-verified.\n  \
+             Import the repository key with: hammer key import <keyfile>",
+            deb_path.display()
+        )
+    }
+}
+
+fn verify_ed25519_sig(data_path: &std::path::Path, sig_path: &std::path::Path) -> Result<()> {
+    let pub_key_bytes = std::fs::read(AUDIT_PUB)
+        .context("Reading Ed25519 public key from /etc/hammer/audit-key.pub")?;
+    if pub_key_bytes.len() != 32 {
+        anyhow::bail!("Invalid public key length in {}", AUDIT_PUB);
+    }
+    let pub_arr: [u8; 32] = pub_key_bytes[..32].try_into().unwrap();
+    let verifying_key = VerifyingKey::from_bytes(&pub_arr)
+        .context("Parsing Ed25519 verifying key")?;
+
+    let data      = std::fs::read(data_path).context("Reading package data")?;
+    let sig_bytes = std::fs::read(sig_path).context("Reading .sig file")?;
+    if sig_bytes.len() != 64 {
+        anyhow::bail!("Invalid signature length in {}", sig_path.display());
+    }
+    let sig_arr: [u8; 64] = sig_bytes[..64].try_into().unwrap();
+    let sig = Signature::from_bytes(&sig_arr);
+
+    verifying_key.verify(&data, &sig)
+        .context("Ed25519 signature verification failed")?;
+
+    crate::log::info(&format!(
+        "audit: Ed25519 signature OK for {}", data_path.display()
+    ));
+    Ok(())
+}
+
+pub fn record_mark(pkg: &str, reason: &str) {
+    let msg = format!("mark: {} set to {}", pkg, reason);
+    crate::log::info(&msg);
+}
