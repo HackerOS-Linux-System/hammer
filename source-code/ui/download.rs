@@ -64,6 +64,47 @@ impl HttpClient {
         let bytes = self.get_bytes(url).await?;
         Ok(String::from_utf8_lossy(&bytes).to_string())
     }
+
+    /// GET with conditional request (If-Modified-Since).
+    /// Returns None if server returns 304 Not Modified.
+    pub async fn get_bytes_if_modified(
+        &self,
+        url:            &str,
+        last_modified:  Option<&str>,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut req = self.inner.get(url);
+        if let Some(lm) = last_modified {
+            req = req.header("If-Modified-Since", lm);
+        }
+        let resp = req.send().await
+            .with_context(|| format!("GET {}", url))?;
+
+        if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
+            return Ok(None);  // cache is still valid
+        }
+        if !resp.status().is_success() {
+            bail!("HTTP {} for {}", resp.status(), url);
+        }
+        Ok(Some(resp.bytes().await?.to_vec()))
+    }
+
+    /// Returns (bytes, Last-Modified header value).
+    pub async fn get_bytes_with_meta(
+        &self,
+        url: &str,
+    ) -> Result<(Vec<u8>, Option<String>)> {
+        let resp = self.inner.get(url).send().await
+            .with_context(|| format!("GET {}", url))?;
+        if !resp.status().is_success() {
+            bail!("HTTP {} for {}", resp.status(), url);
+        }
+        let lm = resp
+            .headers()
+            .get(reqwest::header::LAST_MODIFIED)
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string());
+        Ok((resp.bytes().await?.to_vec(), lm))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -351,4 +392,36 @@ impl UnpackSpinner {
     }
 
     pub fn finish(self) { self.0.finish_and_clear(); }
+}
+
+impl HttpClient {
+    /// GET with an explicit timeout. Returns Err on timeout.
+    pub async fn get_string_timeout(
+        &self,
+        url:      &str,
+        duration: std::time::Duration,
+    ) -> anyhow::Result<String> {
+        let result = tokio::time::timeout(duration, self.get_bytes(url)).await
+            .map_err(|_| anyhow::anyhow!("Request timed out after {}s: {}", duration.as_secs(), url))?;
+        let bytes = result?;
+        Ok(String::from_utf8_lossy(&bytes).to_string())
+    }
+
+    /// GET with retry (up to `n` attempts, exponential backoff).
+    pub async fn get_bytes_retry(&self, url: &str, attempts: u32) -> anyhow::Result<Vec<u8>> {
+        let mut last_err = None;
+        for i in 0..attempts {
+            match self.get_bytes(url).await {
+                Ok(b) => return Ok(b),
+                Err(e) => {
+                    last_err = Some(e);
+                    if i + 1 < attempts {
+                        let delay = std::time::Duration::from_secs(2u64.pow(i));
+                        tokio::time::sleep(delay).await;
+                    }
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("All {} attempts failed for {}", attempts, url)))
+    }
 }
