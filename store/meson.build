@@ -1,89 +1,47 @@
 project('hammer-store', 'vala', 'c',
-    version:  '0.0.1',
-    license:  'Apache-2.0',
-    meson_version: '>= 0.60',
-    default_options: [
-        'c_std=c11',
-        'warning_level=1',
-        'werror=false',
-    ],
+  version: '0.4.0',
+  license: 'Apache-2.0',
+  meson_version: '>= 0.59',
+  default_options: ['warning_level=2']
 )
 
-# ─────────────────────────────────────────────────────────────
-#  Dependencies
-#  Note: we deliberately do NOT add gio-unix-2.0 — the Vala
-#  code uses only pure GLib IOChannel which is in glib-2.0.
-# ─────────────────────────────────────────────────────────────
+gnome  = import('gnome')
+i18n   = import('i18n')
 
-gtk4_dep  = dependency('gtk4',     version: '>= 4.6',  required: true)
-glib_dep  = dependency('glib-2.0', version: '>= 2.72', required: true)
-gio_dep   = dependency('gio-2.0',  version: '>= 2.72', required: true)
-
-# ─────────────────────────────────────────────────────────────
-#  Detect GTK version for AlertDialog conditional compilation
-# ─────────────────────────────────────────────────────────────
-
-gtk_version = gtk4_dep.version()
-gtk_major   = gtk_version.split('.')[0].to_int()
-gtk_minor   = gtk_version.split('.')[1].to_int()
-
-# AlertDialog available since GTK 4.10
-have_alert_dialog = gtk_major > 4 or (gtk_major == 4 and gtk_minor >= 10)
-
-vala_args = [
-    '--target-glib=2.72',
-    '--enable-experimental',
+deps = [
+  dependency('gtk4',           version: '>= 4.10'),
+  dependency('libadwaita-1',   version: '>= 1.4'),
+  dependency('glib-2.0',       version: '>= 2.76'),
+  dependency('json-glib-1.0',  version: '>= 1.6'),
 ]
 
-if have_alert_dialog
-    vala_args += ['--define=GTK_4_10']
-    message('GTK >= 4.10 detected — using AlertDialog')
-else
-    message('GTK < 4.10 — using fallback Dialog for errors')
-endif
-
-# ─────────────────────────────────────────────────────────────
-#  Executable
-# ─────────────────────────────────────────────────────────────
-
-executable(
-    'store',
-    'src/main.vala',
-    vala_args:    vala_args,
-    dependencies: [gtk4_dep, glib_dep, gio_dep],
-    install:      true,
-    install_dir:  get_option('datadir') / 'hammer',
+# GResources (icons, UI files)
+resources = gnome.compile_resources(
+  'hammer-store-resources',
+  'data/org.hackerOS.HammerStore.gresource.xml',
+  source_dir: 'data',
+  c_name: 'hammer_store',
 )
 
-# ─────────────────────────────────────────────────────────────
-#  Data files
-# ─────────────────────────────────────────────────────────────
-
-desktop_conf = configuration_data()
-desktop_conf.set('STORE_PATH',
-    get_option('prefix') / get_option('datadir') / 'hammer' / 'store')
-
-configure_file(
-    input:         'data/org.hackerOS.HammerStore.desktop.in',
-    output:        'org.hackerOS.HammerStore.desktop',
-    configuration: desktop_conf,
-    install:       true,
-    install_dir:   get_option('datadir') / 'applications',
+sources = files(
+  'src/Application.vala',
+  'src/MainWindow.vala',
+  'src/Models.vala',
+  'src/Views.vala',
+  'src/Widgets.vala',
 )
 
-install_data(
-    'data/org.hackerOS.HammerStore.metainfo.xml',
-    install_dir: get_option('datadir') / 'metainfo',
+executable('hammer-store',
+  [sources, resources],
+  dependencies: deps,
+  install: true,
+  install_dir: get_option('bindir'),
 )
 
-install_data(
-    'data/org.hackerOS.HammerStore.svg',
-    install_dir: get_option('datadir') / 'icons' / 'hicolor' / 'scalable' / 'apps',
+install_data('data/org.hackerOS.HammerStore.desktop',
+  install_dir: join_paths(get_option('datadir'), 'applications')
 )
 
-summary({
-    'GTK version':    gtk_version,
-    'AlertDialog':    have_alert_dialog,
-    'Install prefix': get_option('prefix'),
-    'Store binary':   get_option('prefix') / get_option('datadir') / 'hammer' / 'store',
-}, section: 'Hammer Store')
+install_data('data/icons/hammer-store.svg',
+  install_dir: join_paths(get_option('datadir'), 'icons', 'hicolor', 'scalable', 'apps')
+)
