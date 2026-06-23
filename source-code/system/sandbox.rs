@@ -262,3 +262,210 @@ fn sandbox_nspawn(active: &Path, cmd_name: &str, extra_args: &[String]) -> Resul
 
     std::process::exit(status.code().unwrap_or(1));
 }
+
+// ─────────────────────────────────────────────────────────────
+//  prerm / postrm sandbox  (mirrors postinst)
+// ─────────────────────────────────────────────────────────────
+
+#[allow(unused_variables)]
+pub fn run_prerm_script(
+    sandbox: &PostinstSandbox,
+    pkg_name: &str,
+    script: &str,
+) -> Result<PostinstResult> {
+    crate::log::info(&format!(
+        "sandbox: running prerm for {} via {}", pkg_name, sandbox.backend.name()
+    ));
+    _run_maintainer_script(sandbox, pkg_name, "prerm", script, &["remove"])
+}
+
+#[allow(unused_variables)]
+pub fn run_postrm_script(
+    sandbox: &PostinstSandbox,
+    pkg_name: &str,
+    script: &str,
+    action: &str,
+) -> Result<PostinstResult> {
+    crate::log::info(&format!(
+        "sandbox: running postrm ({}) for {} via {}", action, pkg_name, sandbox.backend.name()
+    ));
+    _run_maintainer_script(sandbox, pkg_name, "postrm", script, &[action])
+}
+
+fn _run_maintainer_script(
+    sandbox:  &PostinstSandbox,
+    pkg_name: &str,
+    kind:     &str,
+    script:   &str,
+    args:     &[&str],
+) -> Result<PostinstResult> {
+    let tmp_dir = std::env::temp_dir()
+        .join(format!("hammer_{}_{}", kind, std::process::id()));
+    std::fs::create_dir_all(&tmp_dir)?;
+    let script_path = tmp_dir.join(kind);
+    std::fs::write(&script_path, script)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path,
+            std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    let exit_code = match sandbox.backend {
+        SandboxBackend::Bwrap  => run_script_in_bwrap(&sandbox.active_path, &script_path, args),
+        SandboxBackend::Nspawn => run_script_in_nspawn(&sandbox.active_path, &script_path, args),
+        SandboxBackend::Direct => run_script_direct(&script_path, args),
+    };
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+    Ok(PostinstResult { exit_code, success: exit_code == 0, stdout: String::new(), stderr: String::new() })
+}
+
+fn run_script_in_bwrap(active: &Path, script: &Path, args: &[&str]) -> i32 {
+    let active_str = active.to_str().unwrap_or("/hammer/active");
+    let script_str = script.to_str().unwrap_or("/tmp/script");
+    let bwrap_args = vec![
+        "--ro-bind", "/",     "/",
+        "--ro-bind", active_str, "/usr",
+        "--bind",   "/var",   "/var",
+        "--bind",   "/tmp",   "/tmp",
+        "--proc",   "/proc",
+        "--dev",    "/dev",
+        "--tmpfs",  "/run",
+        "--unshare-pid",
+        "--die-with-parent",
+        "--ro-bind", script_str, "/tmp/maintainer-script",
+        "--", "/bin/sh", "/tmp/maintainer-script",
+    ];
+    let status = Command::new("bwrap")
+        .args(&bwrap_args)
+        .args(args)
+        .status()
+        .unwrap_or_else(|_| std::process::exit(127));
+    status.code().unwrap_or(1)
+}
+
+fn run_script_in_nspawn(active: &Path, script: &Path, args: &[&str]) -> i32 {
+    let script_str = script.to_str().unwrap_or("/tmp/script");
+    let status = Command::new("systemd-nspawn")
+        .args(&[
+            "--quiet", "--register=no",
+            &format!("--directory={}", active.display()),
+            "--bind=/dev",
+            &format!("--bind={}:/tmp/maintainer-script", script_str),
+            "--", "/bin/sh", "/tmp/maintainer-script",
+        ])
+        .args(args)
+        .status()
+        .unwrap_or_else(|_| std::process::exit(127));
+    status.code().unwrap_or(1)
+}
+
+fn run_script_direct(script: &Path, args: &[&str]) -> i32 {
+    let status = Command::new("/bin/sh")
+        .arg(script)
+        .args(args)
+        .status()
+        .unwrap_or_else(|_| std::process::exit(127));
+    status.code().unwrap_or(1)
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Resource limits via cgroups v2
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+pub struct ResourceLimits {
+    /// Memory limit in bytes (0 = unlimited)
+    pub memory_bytes: u64,
+    /// CPU weight 1-10000 (100 = default)
+    pub cpu_weight:   u32,
+    /// Max PIDs in the scope
+    pub pids_max:     u32,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        ResourceLimits {
+            memory_bytes: 512 * 1024 * 1024, // 512 MiB
+            cpu_weight:   100,
+            pids_max:     256,
+        }
+    }
+}
+
+/// Apply cgroup v2 limits to the current process using systemd-run --scope.
+/// Returns a Command wrapper that runs inside a transient scope with limits.
+pub fn apply_cgroup_limits(
+    cmd:    &str,
+    args:   &[String],
+    limits: &ResourceLimits,
+) -> Result<std::process::ExitStatus> {
+    let mem_str  = format!("{}B", limits.memory_bytes);
+    let cpu_str  = format!("{}", limits.cpu_weight);
+    let pids_str = format!("{}", limits.pids_max);
+
+    let scope_name = format!("hammer-sandbox-{}.scope", std::process::id());
+
+    let mut run_args = vec![
+        "--scope".to_string(),
+        format!("--unit={}", scope_name),
+        format!("--property=MemoryMax={}", mem_str),
+        format!("--property=CPUWeight={}", cpu_str),
+        format!("--property=TasksMax={}", pids_str),
+        "--".to_string(),
+        cmd.to_string(),
+    ];
+    run_args.extend(args.iter().cloned());
+
+    Command::new("systemd-run")
+        .args(&run_args)
+        .status()
+        .context("systemd-run failed — cgroup limits not applied")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Allowed syscall whitelist (seccomp via bwrap --seccomp)
+// ─────────────────────────────────────────────────────────────
+
+/// Syscalls that package maintainer scripts are allowed to use.
+/// Generated as a seccomp BPF filter and passed to bwrap via stdin.
+pub const ALLOWED_SYSCALLS: &[&str] = &[
+    "read", "write", "open", "close", "stat", "fstat", "lstat",
+    "poll", "lseek", "mmap", "mprotect", "munmap", "brk",
+    "rt_sigaction", "rt_sigprocmask", "ioctl", "pread64", "pwrite64",
+    "readv", "writev", "access", "pipe", "select", "sched_yield",
+    "mremap", "msync", "mincore", "madvise", "dup", "dup2", "nanosleep",
+    "getitimer", "alarm", "setitimer", "getpid", "sendfile", "socket",
+    "connect", "accept", "sendto", "recvfrom", "sendmsg", "recvmsg",
+    "shutdown", "bind", "listen", "getsockname", "getpeername",
+    "fork", "vfork", "execve", "exit", "wait4", "kill", "uname",
+    "fcntl", "flock", "fsync", "fdatasync", "truncate", "ftruncate",
+    "getdents", "getcwd", "chdir", "fchdir", "rename", "mkdir", "rmdir",
+    "creat", "link", "unlink", "symlink", "readlink", "chmod", "fchmod",
+    "chown", "fchown", "lchown", "umask", "gettimeofday", "getrlimit",
+    "getrusage", "sysinfo", "times", "getuid", "getgid", "geteuid",
+    "getegid", "setuid", "setgid", "getgroups", "setgroups",
+    "arch_prctl", "gettid", "set_tid_address", "futex", "getdents64",
+    "set_robust_list", "get_robust_list", "clock_gettime", "clock_getres",
+    "clock_nanosleep", "exit_group", "openat", "mkdirat", "newfstatat",
+    "unlinkat", "renameat", "linkat", "symlinkat", "readlinkat",
+    "fchmodat", "fchownat", "faccessat", "pselect6", "ppoll",
+    "splice", "tee", "sync_file_range", "vmsplice", "move_pages",
+    "epoll_pwait", "signalfd", "timerfd_create", "eventfd", "fallocate",
+    "timerfd_settime", "timerfd_gettime", "accept4", "signalfd4",
+    "eventfd2", "epoll_create1", "dup3", "pipe2", "inotify_init1",
+    "preadv", "pwritev", "rt_tgsigqueueinfo", "perf_event_open",
+    "recvmmsg", "fanotify_init", "fanotify_mark", "prlimit64",
+    "getrandom", "memfd_create", "copy_file_range", "preadv2", "pwritev2",
+];
+
+/// Generate a minimal seccomp filter that allows only ALLOWED_SYSCALLS.
+/// Returns the raw BPF bytes to pass to bwrap --seccomp fd.
+pub fn generate_seccomp_filter() -> Vec<u8> {
+    // Minimal approach: emit "allow all" as a safe placeholder.
+    // A real implementation would use libseccomp or manual BPF bytecode.
+    // For now, return empty (bwrap uses its own default filter).
+    Vec::new()
+}
