@@ -61,6 +61,16 @@ pub struct GenerationsDb {
 }
 
 impl GenerationsDb {
+    /// Iterate all generations.
+    pub fn all(&self) -> &[Generation] {
+        &self.generations
+    }
+
+    /// Return the active generation number, if any.
+    pub fn active_num(&self) -> Option<u32> {
+        read_active_gen()
+    }
+
     pub fn load() -> Result<Self> {
         let path = Path::new(GENERATIONS_FILE);
         if !path.exists() { return Ok(Self::default()); }
