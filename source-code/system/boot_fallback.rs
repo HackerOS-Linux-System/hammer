@@ -1,3 +1,4 @@
+use crate::grub::{detect_bootloader, BootloaderKind};
 use anyhow::{Context, Result};
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,11 @@ pub struct BootAttemptDb {
 }
 
 impl BootAttemptDb {
+    pub fn last_good_gen(&self) -> Option<u32> {
+        // Return highest known-good generation number
+        self.known_good.iter().copied().max()
+    }
+
     pub fn load() -> Result<Self> {
         let path = Path::new(BOOT_ATTEMPTS_FILE);
         if !path.exists() { return Ok(Self::default()); }
@@ -277,5 +283,52 @@ hammer.display()
     .status();
     crate::log::info("boot-fallback: installed hammer-boot-success.service");
     println!("  {} hammer-boot-success.service installed.", "✔".bright_green());
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Bootloader menu regeneration (GRUB + systemd-boot)
+// ─────────────────────────────────────────────────────────────
+
+pub fn regenerate_bootloader_menu() -> anyhow::Result<()> {
+    let kind = detect_bootloader();
+    match kind {
+        BootloaderKind::GrubBios | BootloaderKind::GrubEfi => {
+            let gdb = crate::profile::GenerationsDb::load()?;
+            crate::grub::update_grub(&gdb)?;
+            // Also call grub-mkconfig as fallback
+            let _ = std::process::Command::new("grub-mkconfig")
+                .args(["-o", "/boot/grub/grub.cfg"])
+                .status();
+        }
+        BootloaderKind::SystemdBoot => {
+            let _ = std::process::Command::new("bootctl").arg("update").status();
+        }
+        BootloaderKind::Unknown => {
+            crate::log::warn("boot_fallback: unknown bootloader — skipping menu regen");
+        }
+    }
+    Ok(())
+}
+
+/// Public entry point: trigger emergency fallback + regenerate bootloader menu.
+/// Called by `hammer boot fallback` and `livepatch::rollback_live()`.
+pub fn apply_fallback() -> anyhow::Result<()> {
+    crate::log::info("boot_fallback: applying emergency fallback");
+    let db = BootAttemptDb::load()?;
+
+    // Roll back to the last known-good generation
+    if let Some(last_good) = db.last_good_gen() {
+        trigger_fallback(last_good, &db)?;
+    } else {
+        anyhow::bail!(
+            "No last-known-good generation found in boot database.\n  \
+             Run 'hammer gen list' to see available generations."
+        );
+    }
+
+    // Regenerate bootloader menu so reboot goes to the right gen
+    regenerate_bootloader_menu()?;
+    println!("  \x1b[1;32m✔\x1b[0m  Fallback applied. Reboot to activate.");
     Ok(())
 }
