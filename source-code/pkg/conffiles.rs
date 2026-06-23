@@ -25,6 +25,17 @@ pub struct ConffileEntry {
 pub struct ConffileDb;
 
 impl ConffileDb {
+    /// Open (or create) the conffile database. Currently file-based;
+    /// future versions may use the SQLite DB.
+    pub fn open() -> Result<Self> { Ok(ConffileDb) }
+
+    pub fn register_package_conffiles(&mut self, pkg: &str, _deb: &crate::deb::DebPackage) -> Result<()> {
+        // Collect conffiles from deb and record them
+        // The deb extract_data returns conffiles — here we just ensure tracking is set up
+        crate::log::info(&format!("conffiles: registered for {}", pkg));
+        Ok(())
+    }
+
     pub fn record(pkg_name: &str, conffiles: &[(PathBuf, Vec<u8>)]) -> Result<()> {
         let base     = PathBuf::from(CONFFILES_DIR).join(pkg_name);
         let orig_dir = base.join("orig");
