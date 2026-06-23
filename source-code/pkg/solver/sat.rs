@@ -1,671 +1,564 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use anyhow::Result;
 
-use crate::multi_arch::{self, MultiArchMode};
-use crate::package::{parse_dep_field, Package};
-use crate::solver::conflicts;
-use crate::solver::dpll::PackageSatProblem;
-use crate::solver::error::{SolverError, SolverProblem};
-use crate::solver::provides::ProvidesMap;
-use crate::solver::version::{compare, satisfies};
-use super::{Solver, TransactionPlan};
+use super::error::SolverError;
 
-// ─────────────────────────────────────────────────────────────
-//  Architecture helper
-// ─────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+//  Types
+// ──────────────────────────────────────────────────────────────────────────────
 
-pub(crate) fn arch_matches(pkg_arch: &str, sys_arch: &str) -> bool {
-    matches!(pkg_arch, "all" | "any" | "") || pkg_arch == sys_arch
+pub type Var = u32;
+
+/// A literal: positive (var) or negative (~var)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Lit {
+    pub inner: u32,
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Pool
-// ─────────────────────────────────────────────────────────────
-
-struct Pool<'a> {
-    cache:      &'a crate::cache::PackageCache,
-    db:         &'a crate::db::InstalledDb,
-    provides:   ProvidesMap,
-    /// Native + all configured foreign arches
-    all_arches: Vec<String>,
-    /// Native arch (primary)
-    native:     String,
-    /// Pin priorities for version sorting
-    pins:       &'a crate::pins::PinDb,
+impl Lit {
+    #[inline] pub fn pos(v: Var) -> Self { Lit { inner: v << 1 } }
+    #[inline] pub fn neg(v: Var) -> Self { Lit { inner: (v << 1) | 1 } }
+    #[inline] pub fn var(self)   -> Var  { self.inner >> 1 }
+    #[inline] pub fn is_neg(self)-> bool { self.inner & 1 == 1 }
+    #[inline] pub fn negate(self)-> Self { Lit { inner: self.inner ^ 1 } }
 }
 
-impl<'a> Pool<'a> {
-    fn new(solver: &'a Solver<'_>) -> Self {
-        let native     = crate::cache::detect_arch();
-        let all_arches = solver.multi_arch.all_arches();
-        let provides   = crate::solver::provides::build(solver.cache);
-        Pool {
-            cache:      solver.cache,
-            db:         solver.db,
-            provides,
-            all_arches,
-            native,
-            pins:       &solver.pins,
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LitVal { True, False, Undef }
+
+#[derive(Debug, Clone)]
+pub struct Clause {
+    pub lits:     Vec<Lit>,
+    pub learnt:   bool,
+    pub activity: f64,
+    pub lbd:      u32,    // Literal Block Distance (Glucose metric)
+}
+
+impl Clause {
+    pub fn new(lits: Vec<Lit>, learnt: bool) -> Self {
+        Clause { lits, learnt, activity: 0.0, lbd: 0 }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Reason {
+    clause_idx: usize,
+}
+
+#[derive(Debug, Clone)]
+struct Trail {
+    lit:    Lit,
+    level:  u32,
+    reason: Option<Reason>,
+}
+
+/// VSIDS activity per variable
+#[derive(Debug, Clone)]
+struct VsidsHeap {
+    activity:  Vec<f64>,
+    in_heap:   Vec<bool>,
+    heap:      Vec<Var>,
+    increment: f64,
+    decay:     f64,
+}
+
+impl VsidsHeap {
+    fn new(n_vars: usize) -> Self {
+        VsidsHeap {
+            activity:  vec![0.0; n_vars + 1],
+            in_heap:   vec![false; n_vars + 1],
+            heap:      (1..=(n_vars as Var)).collect(),
+            increment: 1.0,
+            decay:     0.95,
         }
     }
 
-    /// Best (highest-priority, then newest) available version for a name,
-    /// filtered to native arch (and arch-independent).
-    fn best(&self, name: &str) -> Option<&Package> {
-        self.all_versions_native(name).into_iter().next()
+    fn bump(&mut self, v: Var) {
+        self.activity[v as usize] += self.increment;
+        if self.activity[v as usize] > 1e100 { self.rescale(); }
     }
 
-    /// All available versions for native arch, sorted by pin priority desc
-    /// then version desc. Forbidden versions (priority < 0) excluded.
-    fn all_versions_native(&self, name: &str) -> Vec<&Package> {
-        let real = self.provides.resolve(name);
-        self.sorted_versions(real, &self.native)
+    fn decay_all(&mut self) {
+        self.increment /= self.decay;
     }
 
-    /// All versions for a given arch, with pin filtering and priority sort.
-    fn all_versions_for_arch(&self, name: &str, arch: &str) -> Vec<&Package> {
-        let real = self.provides.resolve(name);
-        self.sorted_versions(real, arch)
+    fn rescale(&mut self) {
+        for a in &mut self.activity { *a *= 1e-100; }
+        self.increment *= 1e-100;
     }
 
-    fn sorted_versions(&self, real: &str, arch: &str) -> Vec<&Package> {
-        let inst_ver = self.db.get(real).map(|p| p.version);
+    fn pick_unassigned(&self, assigned: &[Option<bool>]) -> Option<Var> {
+        self.heap.iter()
+            .filter(|&&v| assigned.get(v as usize).map(|a| a.is_none()).unwrap_or(false))
+            .max_by(|&&a, &&b| {
+                self.activity[a as usize]
+                    .partial_cmp(&self.activity[b as usize])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .copied()
+    }
+}
 
-        let mut v: Vec<&Package> = self.cache.all_packages()
-        .into_iter()
-        .filter(|p| {
-            p.name == real
-            && (arch_matches(&p.architecture, arch)
-            || p.architecture == "all")
-        })
-        .filter(|p| !self.pins.is_forbidden(&p.name, &p.version))
-        .collect();
+/// Luby sequence restart schedule
+struct LubyRestarts {
+    u: u64,
+    v: u64,
+    factor: u64,
+    conflicts_until_restart: u64,
+}
 
-        // Sort: pin priority desc, then version desc
-        v.sort_by(|a, b| {
-            let pa = self.pins.priority(&a.name, &a.version,
-                                        inst_ver.as_deref());
-            let pb = self.pins.priority(&b.name, &b.version,
-                                        inst_ver.as_deref());
-            pb.cmp(&pa)
-            .then_with(|| compare(&b.version, &a.version))
-        });
+impl LubyRestarts {
+    fn new(factor: u64) -> Self {
+        LubyRestarts { u: 1, v: 1, factor, conflicts_until_restart: factor }
+    }
+
+    fn should_restart(&mut self, conflicts: u64) -> bool {
+        if conflicts >= self.conflicts_until_restart {
+            // Advance Luby sequence
+            if (self.u & self.u.wrapping_neg()) == self.v {
+                self.u += 1; self.v = 1;
+            } else {
+                self.v <<= 1;
+            }
+            self.conflicts_until_restart = conflicts + self.v * self.factor;
+            true
+        } else { false }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  Package → Literal mapping
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default)]
+pub struct VarMap {
+    pkg_to_var: HashMap<String, Var>,
+    var_to_pkg: Vec<String>,
+    next:       Var,
+}
+
+impl VarMap {
+    pub fn new() -> Self { VarMap { next: 1, ..Default::default() } }
+
+    pub fn var_of(&mut self, pkg: &str) -> Var {
+        if let Some(&v) = self.pkg_to_var.get(pkg) { return v; }
+        let v = self.next;
+        self.next += 1;
+        self.pkg_to_var.insert(pkg.to_string(), v);
+        self.var_to_pkg.push(pkg.to_string());
         v
     }
 
-    fn resolve<'b>(&'b self, name: &'b str) -> &'b str {
-        self.provides.resolve(name)
+    pub fn pkg_of(&self, v: Var) -> Option<&str> {
+        self.var_to_pkg.get((v - 1) as usize).map(|s| s.as_str())
     }
 
-    /// Check if a candidate can satisfy a dependency from `requirer_arch`.
-    fn can_satisfy(
-        &self,
-        candidate:      &Package,
-        requirer_arch:  &str,
-    ) -> bool {
-        // Determine Multi-Arch mode from package (not yet in our Package struct,
-        // default to No which means same-arch only)
-        let ma_mode = MultiArchMode::No; // TODO: parse Multi-Arch field when added to Package
-        multi_arch::can_satisfy_dep(&candidate.architecture, &ma_mode, requirer_arch)
-    }
+    pub fn n_vars(&self) -> usize { (self.next - 1) as usize }
 }
 
-// ─────────────────────────────────────────────────────────────
-//  resolve_install
-// ─────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
+//  CDCL Solver
+// ──────────────────────────────────────────────────────────────────────────────
 
-pub(super) fn resolve_install(
-    solver:        &Solver<'_>,
-    names:         &[String],
-    no_recommends: bool,
-) -> Result<TransactionPlan> {
-    let pool = Pool::new(solver);
-    let mut plan = TransactionPlan::default();
+pub struct CdclSolver {
+    pub vars:         VarMap,
+    clauses:          Vec<Clause>,
+    // Watched literals: watches[lit] = list of clause indices watching lit
+    watches:          Vec<Vec<usize>>,
+    // Current assignment: assigned[var] = Some(true/false) or None
+    assigned:         Vec<Option<bool>>,
+    // Phase saving
+    saved_phase:      Vec<bool>,
+    // Implication trail
+    trail:            Vec<Trail>,
+    trail_lim:        Vec<usize>,          // decision level → trail index
+    propagation_queue: VecDeque<Lit>,
+    level:            u32,
+    // VSIDS
+    vsids:            VsidsHeap,
+    // Learned clause management
+    clause_increment: f64,
+    clause_decay:     f64,
+    // Stats
+    pub conflicts:    u64,
+    pub decisions:    u64,
+    pub propagations: u64,
+    pub restarts:     u64,
+    max_conflicts:    Option<u64>,
+}
 
-    // ── Parse name:arch specs and validate roots ──────────────
-    let mut problems = Vec::new();
-    let mut root_specs: Vec<(String, String)> = Vec::new(); // (name, arch)
-
-    for name in names {
-        let (bare, arch_override) = multi_arch::parse_pkg_spec(name);
-        let arch = arch_override.as_deref().unwrap_or(&pool.native).to_string();
-
-        // Validate arch is configured
-        if !pool.all_arches.iter().any(|a| a == &arch) && arch != pool.native {
-            problems.push(SolverProblem::ArchMismatch {
-                package:  bare.clone(),
-                          pkg_arch: arch.clone(),
-                          sys_arch: pool.native.clone(),
-            });
-            continue;
+impl CdclSolver {
+    pub fn new() -> Self {
+        CdclSolver {
+            vars:              VarMap::new(),
+            clauses:           Vec::new(),
+            watches:           Vec::new(),
+            assigned:          Vec::new(),
+            saved_phase:       Vec::new(),
+            trail:             Vec::new(),
+            trail_lim:         Vec::new(),
+            propagation_queue: VecDeque::new(),
+            level:             0,
+            vsids:             VsidsHeap::new(0),
+            clause_increment:  1.0,
+            clause_decay:      0.999,
+            conflicts:         0,
+            decisions:         0,
+            propagations:      0,
+            restarts:          0,
+            max_conflicts:     None,
         }
+    }
 
-        let real = pool.resolve(&bare).to_string();
-        let candidates = pool.all_versions_for_arch(&real, &arch);
+    pub fn with_conflict_limit(mut self, n: u64) -> Self {
+        self.max_conflicts = Some(n); self
+    }
 
-        if candidates.is_empty() && !pool.provides.is_virtual(&real) {
-            problems.push(SolverProblem::NotFound {
-                name:    bare.clone(),
-                          similar: solver.find_similar(&bare),
-            });
-            continue;
+    fn grow_to(&mut self, v: Var) {
+        let n = (v + 1) as usize;
+        while self.assigned.len()    < n { self.assigned.push(None); }
+        while self.saved_phase.len() < n { self.saved_phase.push(true); }
+        while self.watches.len()     < n * 2 + 2 { self.watches.push(Vec::new()); }
+        if self.vsids.activity.len() < n {
+            self.vsids.activity.resize(n, 0.0);
+            self.vsids.in_heap.resize(n, false);
         }
+    }
 
-        // Check if best version is pinned forbidden
-        if let Some(best) = candidates.first() {
-            if solver.pins.is_forbidden(&best.name, &best.version) {
-                problems.push(SolverProblem::Generic(format!(
-                    "Package '{}' is pinned as forbidden (priority < 0). \
-See: hammer pin list", bare
-                )));
-                continue;
+    fn watch_idx(lit: Lit) -> usize { lit.inner as usize }
+
+    /// Add a clause. Returns Err on immediate unit-propagation contradiction.
+    pub fn add_clause(&mut self, mut lits: Vec<Lit>) -> Result<(), SolverError> {
+        // Dedup
+        lits.sort_unstable();
+        lits.dedup();
+        // Tautology check
+        for &l in &lits {
+            if lits.contains(&l.negate()) { return Ok(()); }
+        }
+        for &l in &lits { self.grow_to(l.var()); }
+
+        let idx = self.clauses.len();
+        match lits.len() {
+            0 => return Err(SolverError::Unsatisfiable("empty clause".into())),
+            1 => {
+                let lit = lits[0];
+                self.clauses.push(Clause::new(lits, false));
+                self.enqueue(lit, None).map_err(|_| SolverError::Unsatisfiable("unit conflict".into()))?;
+            }
+            _ => {
+                let l0 = lits[0];
+                let l1 = lits[1];
+                self.clauses.push(Clause::new(lits, false));
+                self.watches[Self::watch_idx(l0.negate())].push(idx);
+                self.watches[Self::watch_idx(l1.negate())].push(idx);
             }
         }
-
-        root_specs.push((real, arch));
+        Ok(())
     }
 
-    if !problems.is_empty() {
-        return Err(SolverError::new(problems).into());
+    /// Add a unit assumption (package must be installed/removed).
+    pub fn assume(&mut self, lit: Lit) -> Result<(), SolverError> {
+        self.grow_to(lit.var());
+        self.enqueue(lit, None).map_err(|_| SolverError::Unsatisfiable("conflicting assumption".into()))
     }
 
-    // ── BFS: collect candidates across all arches ─────────────
-    // Key: (real_name, arch) → sorted versions
-    let mut candidates: HashMap<(String, String), Vec<Package>> = HashMap::new();
-    let mut queue: VecDeque<(String, String)> = root_specs.iter().cloned().collect();
-    let mut visited: HashSet<(String, String)> = HashSet::new();
-
-    const MAX_EXPLORE: usize = 8_000; // higher limit for multi-arch
-
-    while let Some((name, arch)) = queue.pop_front() {
-        let key = (name.clone(), arch.clone());
-        if visited.contains(&key) { continue; }
-        visited.insert(key.clone());
-
-        if visited.len() > MAX_EXPLORE {
-            plan.warnings.push(format!(
-                "Dependency graph very large (>{} nodes). Some optional deps skipped.",
-                                       MAX_EXPLORE
-            ));
-            break;
+    fn enqueue(&mut self, lit: Lit, reason: Option<Reason>) -> Result<(), ()> {
+        let var = lit.var() as usize;
+        match self.assigned.get(var) {
+            Some(Some(b)) if *b == !lit.is_neg() => Ok(()),   // already true
+            Some(Some(_))                         => Err(()), // conflict
+            _ => {
+                self.assigned[var] = Some(!lit.is_neg());
+                self.trail.push(Trail { lit, level: self.level, reason });
+                self.propagation_queue.push_back(lit);
+                Ok(())
+            }
         }
+    }
 
-        let all_vers = pool.all_versions_for_arch(&name, &arch);
+    fn lit_val(&self, lit: Lit) -> LitVal {
+        match self.assigned.get(lit.var() as usize) {
+            Some(Some(b)) => if *b == !lit.is_neg() { LitVal::True } else { LitVal::False },
+            _             => LitVal::Undef,
+        }
+    }
 
-        // Keep: pin-preferred version + installed version
-        let inst_ver = solver.db.get(&name).map(|p| p.version.clone());
-        let keep: HashSet<String> = {
-            let mut s = HashSet::new();
-            if let Some(v) = all_vers.first() { s.insert(v.version.clone()); }
-            if let Some(ref iv) = inst_ver     { s.insert(iv.clone()); }
-            s
-        };
+    /// Unit propagation. Returns index of conflicting clause, or None.
+    fn propagate(&mut self) -> Option<usize> {
+        while let Some(p) = self.propagation_queue.pop_front() {
+            self.propagations += 1;
+            let watch_lit = p.negate();
+            let wl_idx    = Self::watch_idx(watch_lit);
+            let mut i     = 0;
+            while i < self.watches[wl_idx].len() {
+                let ci  = self.watches[wl_idx][i];
+                let clause_lits = self.clauses[ci].lits.clone();
 
-        let selected: Vec<Package> = all_vers.into_iter()
-        .filter(|p| keep.contains(&p.version))
-        .cloned()
-        .collect();
+                // Make sure the false lit is at index 1
+                let mut lits = clause_lits.clone();
+                if lits[0] == watch_lit { lits.swap(0, 1); }
 
-        // BFS: enqueue deps for all configured arches
-        for pkg in &selected {
-            for field in dep_fields(pkg, no_recommends) {
-                for group in parse_dep_field(field) {
-                    for alt in &group.alternatives {
-                        let dep_real = pool.resolve(&alt.name).to_string();
-                        // Determine which arch to fetch for this dep.
-                        // If dep has arch qualifier (e.g. foo:i386), use that.
-                        // Otherwise try native first, then foreign if Multi-Arch: foreign.
-                        for dep_arch in &pool.all_arches {
-                            let dk = (dep_real.clone(), dep_arch.clone());
-                            if !visited.contains(&dk) {
-                                queue.push_back(dk);
-                            }
-                        }
+                // Check the other watched literal
+                if self.lit_val(lits[0]) == LitVal::True {
+                    i += 1; continue;
+                }
+
+                // Try to find a new watch
+                let mut found_new = false;
+                for k in 2..lits.len() {
+                    if self.lit_val(lits[k]) != LitVal::False {
+                        lits.swap(1, k);
+                        self.clauses[ci].lits = lits.clone();
+                        self.watches[wl_idx].remove(i);
+                        self.watches[Self::watch_idx(lits[1].negate())].push(ci);
+                        found_new = true;
+                        break;
                     }
+                }
+                if !found_new {
+                    self.clauses[ci].lits = lits.clone();
+                    // Unit: propagate lits[0]
+                    let unit = lits[0];
+                    if self.lit_val(unit) == LitVal::False {
+                        self.propagation_queue.clear();
+                        return Some(ci);
+                    }
+                    if self.enqueue(unit, Some(Reason { clause_idx: ci })).is_err() {
+                        self.propagation_queue.clear();
+                        return Some(ci);
+                    }
+                    i += 1;
                 }
             }
         }
-
-        if !selected.is_empty() {
-            candidates.insert(key, selected);
-        }
+        None
     }
 
-    // ── Build SAT problem ─────────────────────────────────────
-    let mut sat = PackageSatProblem::new();
+    /// 1UIP clause learning. Returns (learned clause, backjump level).
+    /// Uses a separate "seen" set + trail index — never pops the trail.
+    fn analyze_conflict(&mut self, conflict_ci: usize) -> (Vec<Lit>, u32) {
+        let current_level = self.level;
+        let mut seen: HashSet<Var> = HashSet::new();
+        let mut learnt: Vec<Lit>   = Vec::new();
+        // counter = number of literals at current level still to resolve
+        let mut counter = 0i32;
+        // Walk the reason clause of the conflict
+        let mut reason_lits: Vec<Lit> = self.clauses[conflict_ci].lits.clone();
 
-    // Intern all candidates — pin priority already encoded in ordering,
-    // so lower Var index = preferred version for CDCL.
-    for ((name, arch), versions) in &candidates {
-        for pkg in versions {
-            // Use "name:arch" as SAT name to distinguish foreign copies
-            let sat_name = if arch == &pool.native {
-                name.clone()
-            } else {
-                format!("{}:{}", name, arch)
-            };
-            sat.intern(&sat_name, &pkg.version);
-        }
-    }
-    sat.build();
+        // Trail pointer: walk backwards
+        let mut trail_idx = self.trail.len();
+        let mut uip: Option<Lit> = None;
 
-    // Require roots
-    for (name, arch) in &root_specs {
-        let sat_name = if arch == &pool.native {
-            name.clone()
-        } else {
-            format!("{}:{}", name, arch)
-        };
-        let key = (name.clone(), arch.clone());
-        if let Some(vs) = candidates.get(&key) {
-            if let Some(pkg) = vs.first() {
-                if let Some(&v) = sat.pkg_to_var.get(&(sat_name.clone(), pkg.version.clone())) {
-                    sat.require(v);
+        loop {
+            for &q in &reason_lits {
+                let v = q.var();
+                if !seen.insert(v) { continue; }
+                self.vsids.bump(v);
+                let lv = self.trail.iter().rev()
+                    .find(|t| t.lit.var() == v)
+                    .map(|t| t.level)
+                    .unwrap_or(0);
+                if lv == current_level {
+                    counter += 1;
+                } else if lv > 0 {
+                    learnt.push(q.negate()); // literal from earlier level
                 }
             }
-        }
-    }
 
-    // At-most-one version per (name, arch) pair
-    for ((name, arch), versions) in &candidates {
-        let sat_name = if arch == &pool.native { name.clone() }
-        else { format!("{}:{}", name, arch) };
-        let vars: Vec<u32> = versions.iter()
-        .filter_map(|p| sat.pkg_to_var.get(&(sat_name.clone(), p.version.clone())).copied())
-        .collect();
-        if vars.len() > 1 { sat.add_at_most_one(&vars); }
-    }
-
-    // Dependency and conflict clauses
-    for ((name, arch), versions) in &candidates {
-        let sat_name = if arch == &pool.native { name.clone() }
-        else { format!("{}:{}", name, arch) };
-
-        for pkg in versions {
-            let pkg_var = match sat.pkg_to_var.get(&(sat_name.clone(), pkg.version.clone())).copied() {
-                Some(v) => v,
-                None    => continue,
-            };
-
-            for field in dep_fields(pkg, no_recommends) {
-                for group in parse_dep_field(field) {
-                    // Already satisfied by installed package of any compatible arch?
-                    let already_sat = group.alternatives.iter().any(|alt| {
-                        solver.db.get(&alt.name).map_or(false, |inst| {
-                            let inst_pkg_dummy = Package {
-                                architecture: inst.architecture.clone(),
-                                                        ..Package::default()
-                            };
-                            // Check version constraint
-                            let ver_ok = alt.constraint.as_ref()
-                            .map(|c| satisfies(&inst.version, c.op.as_str(), &c.version))
-                            .unwrap_or(true);
-                            // Check arch compatibility (Multi-Arch: foreign can satisfy any)
-                            let arch_ok = pool.can_satisfy(&inst_pkg_dummy, arch);
-                            ver_ok && (arch_ok || inst.architecture == "all")
-                        })
-                    });
-                    if already_sat { continue; }
-
-                    let mut dep_vars: Vec<u32> = Vec::new();
-
-                    for alt in &group.alternatives {
-                        let dep_real = pool.resolve(&alt.name).to_string();
-
-                        // Collect from all arches that can satisfy this dep
-                        for dep_arch in &pool.all_arches {
-                            let dep_key = (dep_real.clone(), dep_arch.clone());
-                            if let Some(dep_versions) = candidates.get(&dep_key) {
-                                let dep_sat_name = if dep_arch == &pool.native {
-                                    dep_real.clone()
-                                } else {
-                                    format!("{}:{}", dep_real, dep_arch)
-                                };
-                                for dv in dep_versions {
-                                    // Version constraint check
-                                    let ver_ok = alt.constraint.as_ref()
-                                    .map(|c| satisfies(&dv.version, c.op.as_str(), &c.version))
-                                    .unwrap_or(true);
-                                    // Multi-arch compatibility check
-                                    let arch_ok = pool.can_satisfy(dv, arch);
-                                    if ver_ok && arch_ok {
-                                        if let Some(&dvar) = sat.pkg_to_var
-                                            .get(&(dep_sat_name.clone(), dv.version.clone()))
-                                            {
-                                                dep_vars.push(dvar);
-                                            }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    if dep_vars.is_empty() {
-                        let dep_names = group.alternatives.iter()
-                        .map(|a| a.name.as_str()).collect::<Vec<_>>().join(" | ");
-                        plan.warnings.push(format!(
-                            "{}: dependency '{}' cannot be satisfied — skipped",
-                            pkg.name, dep_names
-                        ));
+            // Find the next trail entry at current level that is in seen
+            loop {
+                if trail_idx == 0 { break; }
+                trail_idx -= 1;
+                let t = &self.trail[trail_idx];
+                if t.level == current_level && seen.contains(&t.lit.var()) {
+                    counter -= 1;
+                    if counter == 0 {
+                        // This is the 1UIP
+                        uip = Some(t.lit);
+                        // Fetch its reason for further resolution (not needed at UIP)
+                        reason_lits = vec![];
                     } else {
-                        // Dedup (same var may appear via multiple arches)
-                        dep_vars.sort_unstable();
-                        dep_vars.dedup();
-                        sat.add_dependency(pkg_var, &dep_vars);
-                    }
-                }
-            }
-
-            // Conflicts
-            if let Some(ref c_str) = pkg.conflicts {
-                for group in parse_dep_field(c_str) {
-                    for alt in &group.alternatives {
-                        let dep_real = pool.resolve(&alt.name).to_string();
-                        for dep_arch in &pool.all_arches {
-                            let dep_key = (dep_real.clone(), dep_arch.clone());
-                            if let Some(dep_vs) = candidates.get(&dep_key) {
-                                let dep_sat_name = if dep_arch == &pool.native {
-                                    dep_real.clone()
-                                } else {
-                                    format!("{}:{}", dep_real, dep_arch)
-                                };
-                                for dv in dep_vs {
-                                    let matches = alt.constraint.as_ref()
-                                    .map(|c| satisfies(&dv.version, c.op.as_str(), &c.version))
-                                    .unwrap_or(true);
-                                    if matches {
-                                        if let Some(&dvar) = sat.pkg_to_var
-                                            .get(&(dep_sat_name.clone(), dv.version.clone()))
-                                            {
-                                                sat.add_conflict(pkg_var, dvar);
-                                            }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Breaks (advisory warnings)
-            if let Some(ref b_str) = pkg.breaks {
-                for group in parse_dep_field(b_str) {
-                    for alt in &group.alternatives {
-                        if let Some(inst) = solver.db.get(&alt.name) {
-                            let breaks_it = alt.constraint.as_ref()
-                            .map(|c| satisfies(&inst.version, c.op.as_str(), &c.version))
-                            .unwrap_or(true);
-                            if breaks_it {
-                                plan.warnings.push(format!(
-                                    "'{}' breaks installed '{}' {}",
-                                    pkg.name, inst.name, inst.version
-                                ));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // ── Run CDCL SAT ─────────────────────────────────────────
-    let solution = sat.solve().ok_or_else(|| {
-        SolverError::single(SolverProblem::Generic(
-            "Dependency resolution failed (SAT unsatisfiable).\n  \
-Unresolvable conflict between packages or pins.\n  \
-Try: hammer fix-broken, or adjust hammer pin list."
-.to_string(),
-        ))
-    })?;
-
-    // ── Map solution → TransactionPlan ────────────────────────
-    for (sat_name, version) in &solution {
-        // Decode sat_name back to (real_name, arch)
-        let (real_name, real_arch) = if let Some((n, a)) = sat_name.rsplit_once(':') {
-            (n.to_string(), a.to_string())
-        } else {
-            (sat_name.clone(), pool.native.clone())
-        };
-
-        let key = (real_name.clone(), real_arch.clone());
-        let pkg = match candidates.get(&key)
-        .and_then(|vs| vs.iter().find(|p| &p.version == version))
-        {
-            Some(p) => p.clone(),
-            None    => continue,
-        };
-
-        match solver.db.get(&real_name) {
-            Some(inst) if inst.version == *version => {
-                // Already installed at this version
-            }
-            Some(inst) if compare(version, &inst.version) == std::cmp::Ordering::Greater => {
-                plan.upgrade_from.insert(real_name.clone(), inst.version.clone());
-                plan.download_bytes += pkg.download_size.unwrap_or(0);
-                plan.install_bytes  += pkg.installed_size_kb.unwrap_or(0) * 1024;
-                plan.to_upgrade.push(pkg);
-            }
-            Some(_) => {
-                plan.download_bytes += pkg.download_size.unwrap_or(0);
-                plan.install_bytes  += pkg.installed_size_kb.unwrap_or(0) * 1024;
-                plan.to_install.push(pkg);
-            }
-            None => {
-                plan.download_bytes += pkg.download_size.unwrap_or(0);
-                plan.install_bytes  += pkg.installed_size_kb.unwrap_or(0) * 1024;
-                plan.to_install.push(pkg);
-            }
-        }
-    }
-
-    plan.to_install.sort_by(|a, b| a.name.cmp(&b.name));
-    plan.to_upgrade.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(plan)
-}
-
-// ─────────────────────────────────────────────────────────────
-//  resolve_reinstall
-// ─────────────────────────────────────────────────────────────
-
-pub(super) fn resolve_reinstall(solver: &Solver<'_>, names: &[String]) -> Result<TransactionPlan> {
-    let pool = Pool::new(solver);
-    let mut plan = TransactionPlan::default();
-    let mut problems = Vec::new();
-
-    for name in names {
-        let (bare, _) = multi_arch::parse_pkg_spec(name);
-        let pkg = match pool.best(&bare) {
-            Some(p) => p.clone(),
-            None    => {
-                problems.push(SolverProblem::NotFound {
-                    name: bare.clone(), similar: solver.find_similar(&bare),
-                });
-                continue;
-            }
-        };
-        plan.download_bytes += pkg.download_size.unwrap_or(0);
-        plan.install_bytes  += pkg.installed_size_kb.unwrap_or(0) * 1024;
-        if let Some(inst) = solver.db.get(&bare) {
-            plan.upgrade_from.insert(bare.clone(), inst.version.clone());
-            plan.to_upgrade.push(pkg);
-        } else {
-            plan.to_install.push(pkg);
-        }
-    }
-
-    if !problems.is_empty() { return Err(SolverError::new(problems).into()); }
-    Ok(plan)
-}
-
-// ─────────────────────────────────────────────────────────────
-//  resolve_remove
-// ─────────────────────────────────────────────────────────────
-
-pub(super) fn resolve_remove(solver: &Solver<'_>, names: &[String]) -> Result<TransactionPlan> {
-    let mut plan = TransactionPlan::default();
-    let mut problems = Vec::new();
-
-    for name in names {
-        let (bare, _) = multi_arch::parse_pkg_spec(name);
-        match solver.db.get(&bare) {
-            Some(inst) => {
-                plan.freed_bytes += inst.installed_size_kb * 1024;
-                plan.to_remove.push(bare.clone());
-            }
-            None => problems.push(SolverProblem::Generic(
-                format!("Package '{}' is not installed.", bare)
-            )),
-        }
-    }
-    if !problems.is_empty() { return Err(SolverError::new(problems).into()); }
-
-    for rdep in conflicts::reverse_depends(&plan.to_remove, solver.db) {
-        plan.warnings.push(format!(
-            "Removing '{}' may break '{}' which depends on it",
-            names.join(", "), rdep
-        ));
-    }
-    Ok(plan)
-}
-
-// ─────────────────────────────────────────────────────────────
-//  resolve_upgrade
-// ─────────────────────────────────────────────────────────────
-
-pub(super) fn resolve_upgrade(solver: &Solver<'_>) -> Result<TransactionPlan> {
-    let pool = Pool::new(solver);
-    let mut plan = TransactionPlan::default();
-
-    for inst in solver.db.list_all()? {
-        // Skip held packages
-        if solver.pins.is_held(&inst.name) { continue; }
-
-        if let Some(avail) = pool.best(&inst.name) {
-            if compare(&avail.version, &inst.version) == std::cmp::Ordering::Greater {
-                plan.upgrade_from.insert(inst.name.clone(), inst.version.clone());
-                plan.download_bytes += avail.download_size.unwrap_or(0);
-                plan.install_bytes  += avail.installed_size_kb.unwrap_or(0) * 1024;
-                plan.to_upgrade.push(avail.clone());
-            }
-        }
-    }
-    plan.to_upgrade.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(plan)
-}
-
-// ─────────────────────────────────────────────────────────────
-//  resolve_dist_upgrade
-// ─────────────────────────────────────────────────────────────
-
-pub(super) fn resolve_dist_upgrade(solver: &Solver<'_>) -> Result<TransactionPlan> {
-    let installed_names: Vec<String> = solver.db.list_all()?
-    .into_iter().map(|p| p.name).collect();
-    let mut plan = resolve_install(solver, &installed_names, false)?;
-    plan.warnings.insert(0,
-                         "dist-upgrade: aggressive — review carefully.".to_string());
-    Ok(plan)
-}
-
-// ─────────────────────────────────────────────────────────────
-//  resolve_autoremove
-// ─────────────────────────────────────────────────────────────
-
-pub(super) fn resolve_autoremove(solver: &Solver<'_>) -> Result<TransactionPlan> {
-    use std::collections::VecDeque;
-    let mut plan = TransactionPlan::default();
-    let user_pkgs = solver.db.list_user_installed()?;
-    let mut needed: HashSet<String> = user_pkgs.iter().map(|p| p.name.clone()).collect();
-    let mut queue: VecDeque<String> = needed.iter().cloned().collect();
-
-    while let Some(name) = queue.pop_front() {
-        if let Some(pkg) = solver.db.get(&name) {
-            if let Some(ref dep_str) = pkg.depends {
-                for group in parse_dep_field(dep_str) {
-                    if let Some(dep) = group.alternatives.iter()
-                        .find(|a| solver.db.is_installed(&a.name))
-                        {
-                            if needed.insert(dep.name.clone()) {
-                                queue.push_back(dep.name.clone());
-                            }
-                        }
-                }
-            }
-        }
-    }
-
-    for pkg in solver.db.list_all()? {
-        if !needed.contains(&pkg.name) {
-            plan.freed_bytes   += pkg.installed_size_kb * 1024;
-            plan.to_autoremove.push(pkg.name.clone());
-        }
-    }
-    plan.to_autoremove.sort();
-    Ok(plan)
-}
-
-// ─────────────────────────────────────────────────────────────
-//  resolve_fix_broken
-// ─────────────────────────────────────────────────────────────
-
-pub(super) fn resolve_fix_broken(solver: &Solver<'_>) -> Result<TransactionPlan> {
-    let pool = Pool::new(solver);
-    let mut plan   = TransactionPlan::default();
-    let mut to_install: HashSet<String> = HashSet::new();
-    let mut broken: Vec<String>         = Vec::new();
-
-    for inst in solver.db.list_all()? {
-        if let Some(ref dep_str) = inst.depends {
-            for group in parse_dep_field(dep_str) {
-                let satisfied = group.alternatives.iter().any(|alt| {
-                    solver.db.get(&alt.name).map_or(false, |i| {
-                        alt.constraint.as_ref()
-                        .map(|c| satisfies(&i.version, c.op.as_str(), &c.version))
-                        .unwrap_or(true)
-                    })
-                });
-                if !satisfied {
-                    if let Some(dep) = group.alternatives.iter()
-                        .find(|a| pool.best(&a.name).is_some())
-                        {
-                            to_install.insert(dep.name.clone());
+                        // Continue resolving: expand this literal's reason clause
+                        if let Some(ref r) = t.reason {
+                            reason_lits = self.clauses[r.clause_idx].lits.clone();
                         } else {
-                            let dep_str2 = group.alternatives.iter()
-                            .map(|a| a.name.as_str()).collect::<Vec<_>>().join(" | ");
-                            broken.push(format!("{}: cannot satisfy '{}'", inst.name, dep_str2));
+                            reason_lits = vec![];
                         }
+                    }
+                    break;
+                }
+            }
+
+            if counter <= 0 { break; }
+        }
+
+        // Build the learned clause: ¬UIP ∨ learnt literals
+        let mut clause = Vec::with_capacity(learnt.len() + 1);
+        if let Some(u) = uip { clause.push(u.negate()); }
+        clause.extend_from_slice(&learnt);
+        clause.sort_unstable();
+        clause.dedup();
+
+        // Backjump level = max decision level among non-UIP literals
+        let btlevel = clause.iter().skip(1)
+            .filter_map(|l| {
+                self.trail.iter().rev()
+                    .find(|t| t.lit.var() == l.var())
+                    .map(|t| t.level)
+            })
+            .max()
+            .unwrap_or(0);
+
+        (clause, btlevel)
+    }
+
+    fn backtrack(&mut self, level: u32) {
+        while let Some(t) = self.trail.last() {
+            if t.level <= level { break; }
+            let v = self.trail.last().unwrap().lit.var() as usize;
+            // Save phase
+            if let Some(b) = self.assigned[v] {
+                if self.saved_phase.len() > v { self.saved_phase[v] = b; }
+            }
+            self.assigned[v] = None;
+            self.trail.pop();
+        }
+        self.trail_lim.truncate(level as usize);
+        self.level = level;
+        self.propagation_queue.clear();
+    }
+
+    fn add_learnt_clause(&mut self, lits: Vec<Lit>) {
+        if lits.is_empty() { return; }
+        // Compute LBD
+        let mut levels: HashSet<u32> = HashSet::new();
+        for l in &lits {
+            if let Some(t) = self.trail.iter().find(|t| t.lit.var() == l.var()) {
+                levels.insert(t.level);
+            }
+        }
+        let lbd = levels.len() as u32;
+        let idx = self.clauses.len();
+        let l0 = lits[0];
+        let mut clause = Clause::new(lits.clone(), true);
+        clause.activity = self.clause_increment;
+        clause.lbd      = lbd;
+        if lits.len() == 1 {
+            self.clauses.push(clause);
+        } else {
+            let l1 = lits[1];
+            self.clauses.push(clause);
+            self.watches[Self::watch_idx(l0.negate())].push(idx);
+            self.watches[Self::watch_idx(l1.negate())].push(idx);
+        }
+        let _ = self.enqueue(l0, Some(Reason { clause_idx: idx }));
+    }
+
+    fn pick_decision_literal(&self) -> Option<Lit> {
+        let v = self.vsids.pick_unassigned(&self.assigned)?;
+        let phase = self.saved_phase.get(v as usize).copied().unwrap_or(true);
+        Some(if phase { Lit::pos(v) } else { Lit::neg(v) })
+    }
+
+    /// Reduce learned clause database (keep low-LBD clauses).
+    fn reduce_db(&mut self) {
+        let limit = self.clause_increment / self.clauses.len() as f64;
+        let mut to_remove: Vec<usize> = self.clauses.iter().enumerate()
+            .filter(|(_, c)| c.learnt && c.lbd > 2 && c.activity < limit)
+            .map(|(i, _)| i)
+            .collect();
+        to_remove.sort_unstable();
+        for &i in to_remove.iter().rev() {
+            // Remove from watches
+            let l0 = self.clauses[i].lits.get(0).cloned();
+            let l1 = self.clauses[i].lits.get(1).cloned();
+            if let Some(l) = l0 {
+                self.watches[Self::watch_idx(l.negate())].retain(|&ci| ci != i);
+            }
+            if let Some(l) = l1 {
+                self.watches[Self::watch_idx(l.negate())].retain(|&ci| ci != i);
+            }
+            self.clauses.remove(i);
+            // Fix indices in watches (expensive but correctness first)
+            for wl in &mut self.watches {
+                for ci in wl.iter_mut() {
+                    if *ci > i { *ci -= 1; }
+                }
+            }
+        }
+        self.clause_increment /= self.clause_decay;
+    }
+
+    /// Main solve loop. Returns Ok(true) = SAT, Ok(false) = UNSAT.
+    pub fn solve(&mut self) -> Result<bool, SolverError> {
+        let mut luby = LubyRestarts::new(100);
+        let mut reduce_at = 2000u64;
+
+        // Initial unit propagation
+        if self.propagate().is_some() {
+            return Err(SolverError::Unsatisfiable("initial propagation conflict".into()));
+        }
+
+        loop {
+            if let Some(ci) = self.propagate() {
+                // Conflict
+                self.conflicts += 1;
+                if let Some(max) = self.max_conflicts {
+                    if self.conflicts >= max { return Ok(false); } // budget exceeded
+                }
+                if self.level == 0 {
+                    return Err(SolverError::Unsatisfiable("conflict at level 0".into()));
+                }
+                let (learnt, btlevel) = self.analyze_conflict(ci);
+                self.vsids.decay_all();
+                self.backtrack(btlevel);
+                self.add_learnt_clause(learnt);
+
+                if luby.should_restart(self.conflicts) {
+                    self.restarts += 1;
+                    self.backtrack(0);
+                }
+                if self.conflicts >= reduce_at {
+                    self.reduce_db();
+                    reduce_at = (reduce_at as f64 * 1.5) as u64;
+                }
+            } else {
+                // Pick next decision
+                match self.pick_decision_literal() {
+                    None => return Ok(true), // all vars assigned → SAT
+                    Some(lit) => {
+                        self.decisions += 1;
+                        self.trail_lim.push(self.trail.len());
+                        self.level += 1;
+                        let _ = self.enqueue(lit, None);
+                    }
                 }
             }
         }
     }
 
-    if !to_install.is_empty() {
-        let names: Vec<String> = to_install.into_iter().collect();
-        let sub = resolve_install(solver, &names, true)?;
-        plan.to_install     = sub.to_install;
-        plan.to_upgrade     = sub.to_upgrade;
-        plan.upgrade_from   = sub.upgrade_from;
-        plan.download_bytes = sub.download_bytes;
-        plan.install_bytes  = sub.install_bytes;
-        plan.warnings.extend(sub.warnings);
+    /// Extract the solution: package name → installed?
+    pub fn model(&self) -> HashMap<String, bool> {
+        let mut m = HashMap::new();
+        for v in 1..self.vars.next {
+            if let Some(pkg) = self.vars.pkg_of(v) {
+                let val = self.assigned.get(v as usize)
+                    .copied().flatten().unwrap_or(false);
+                m.insert(pkg.to_string(), val);
+            }
+        }
+        m
     }
-    for msg in broken { plan.warnings.push(msg); }
-    if plan.is_empty() && plan.warnings.is_empty() {
-        plan.warnings.push("No broken dependencies found.".to_string());
-    }
-    plan.to_install.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(plan)
 }
 
-// ─────────────────────────────────────────────────────────────
-//  Helpers
-// ─────────────────────────────────────────────────────────────
 
-fn dep_fields<'a>(pkg: &'a Package, no_recommends: bool) -> Vec<&'a str> {
-    let mut f = Vec::new();
-    if let Some(ref s) = pkg.pre_depends { f.push(s.as_str()); }
-    if let Some(ref s) = pkg.depends     { f.push(s.as_str()); }
-    if !no_recommends {
-        if let Some(ref s) = pkg.recommends { f.push(s.as_str()); }
-    }
-    f
+#[derive(Debug, Default)]
+pub struct SolverStats {
+    pub conflicts:    u64,
+    pub decisions:    u64,
+    pub propagations: u64,
+    pub restarts:     u64,
+    pub n_clauses:    usize,
+    pub n_vars:       usize,
 }
