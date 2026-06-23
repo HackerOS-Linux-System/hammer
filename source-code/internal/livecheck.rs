@@ -78,3 +78,70 @@ fn check_hostname() -> bool {
     || h.contains("-live")
     || h.starts_with("live-")
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Container / virtualisation detection
+// ─────────────────────────────────────────────────────────────
+
+pub fn is_container() -> bool {
+    check_docker()
+    || check_podman()
+    || check_wsl()
+    || check_systemd_nspawn()
+    || check_lxc()
+}
+
+pub fn container_reason() -> Option<&'static str> {
+    if check_docker()         { return Some("running inside Docker container"); }
+    if check_podman()         { return Some("running inside Podman container"); }
+    if check_wsl()            { return Some("running inside WSL (Windows Subsystem for Linux)"); }
+    if check_systemd_nspawn() { return Some("running inside systemd-nspawn container"); }
+    if check_lxc()            { return Some("running inside LXC container"); }
+    None
+}
+
+/// Warn (but don't abort) if running in a container.
+pub fn warn_if_container() {
+    if let Some(reason) = container_reason() {
+        eprintln!(
+            "\n  \x1b[1;33m⚠\x1b[0m  hammer in container: {}\n  \
+             Some features (immutable FS, GRUB, systemd services) will not work.\n",
+            reason
+        );
+    }
+}
+
+fn check_docker() -> bool {
+    // /.dockerenv is the canonical Docker indicator
+    Path::new("/.dockerenv").exists()
+    // cgroup-based detection
+    || std::fs::read_to_string("/proc/1/cgroup").unwrap_or_default().contains("docker")
+    || std::env::var("container").as_deref() == Ok("docker")
+}
+
+fn check_podman() -> bool {
+    Path::new("/run/.containerenv").exists()
+    || std::env::var("container").as_deref() == Ok("podman")
+}
+
+fn check_wsl() -> bool {
+    std::env::var("WSL_DISTRO_NAME").is_ok()
+    || std::env::var("WSL_INTEROP").is_ok()
+    || std::fs::read_to_string("/proc/version")
+        .unwrap_or_default()
+        .to_lowercase()
+        .contains("microsoft")
+}
+
+fn check_systemd_nspawn() -> bool {
+    std::env::var("container").as_deref() == Ok("systemd-nspawn")
+    || Path::new("/run/host").exists()
+}
+
+fn check_lxc() -> bool {
+    Path::new("/proc/1/environ").exists() && {
+        std::fs::read_to_string("/proc/1/environ")
+            .unwrap_or_default()
+            .contains("container=lxc")
+    }
+}
