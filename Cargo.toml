@@ -1,15 +1,33 @@
 [package]
 name        = "hammer"
-version     = "0.3.0"
+version     = "0.4.0"
 edition     = "2021"
 authors     = ["HackerOS Team <hackeros068@gmail.com>"]
 description = "Atomic Debian package manager — HackerOS"
 license     = "Apache-2.0"
 repository  = "https://github.com/HackerOS-Linux-System/hammer"
 
+# ── Build modes ───────────────────────────────────────────────
+#
+#  Atomic (default):
+#    cargo build --release
+#    → /usr/bin/hammer  — full atomicity, immutable FS, read-only store,
+#      generation rollback, CDCL SAT solver
+#
+#  Normal (classic):
+#    cargo build --release --features normal-mode
+#    → /usr/bin/hammer  — all package management without atomicity or
+#      immutable FS (like a classic apt/dnf, but with hammer's SAT solver,
+#      multi-arch, pinning, services, doctor, etc.)
+
 [[bin]]
 name = "hammer"
 path = "source-code/main.rs"
+
+[features]
+default     = []
+# Disables: immutable FS, atomic store, generation rollback
+normal-mode = []
 
 [dependencies]
 anyhow          = "1"
@@ -41,18 +59,13 @@ hk-parser       = "0.3.0"
 indexmap        = { version = "2", features = ["serde"] }
 resolvo         = "0.4"
 fslock          = "0.2"
+regex           = "1"
+once_cell       = "1"
 
-# ── New dependencies for expanded modules ─────────────────────
-
-# audit.rs — Ed25519 signing via ed25519-dalek
+# audit.rs — Ed25519 signing
 ed25519-dalek   = { version = "2", features = ["rand_core"] }
 rand_core       = { version = "0.6", features = ["getrandom"] }
 getrandom       = { version = "0.2", features = ["std"] }
 
-# audit.rs — HMAC fallback (keep for compatibility)
+# hmac fallback
 hmac            = "0.12"
-
-# store_v2.rs — ZFS backend uses process::Command (no extra dep needed)
-# mirror.rs   — resumable downloads use reqwest (already present)
-# sandbox.rs  — uses std::process::Command (no extra dep)
-# notify.rs   — uses std::process::Command (no extra dep)
