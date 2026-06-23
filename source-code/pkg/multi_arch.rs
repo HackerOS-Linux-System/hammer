@@ -210,3 +210,50 @@ mod tests {
         assert!(can_satisfy_dep("all",   &MultiArchMode::No,      "i386"));
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_dpkg_arch — hammer dpkg-arch (mimic dpkg --print-architecture)
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_dpkg_arch(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("print");
+    match sub {
+        "--print-architecture" | "print" | "" => {
+            println!("{}", crate::cache::detect_arch());
+        }
+        "--print-foreign-architectures" | "foreign" => {
+            let db = MultiArchDb::load();
+            for arch in &db.foreign_arches { println!("{}", arch); }
+        }
+        "--add-architecture" | "add" => {
+            let arch = args.get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: hammer dpkg-arch add <arch>"))?;
+            let mut db = MultiArchDb::load();
+            db.add_arch(arch)?;
+            println!("  {} Added {}", "✔".bright_green(), arch.bold());
+        }
+        "--remove-architecture" | "remove" => {
+            let arch = args.get(1)
+                .ok_or_else(|| anyhow::anyhow!("Usage: hammer dpkg-arch remove <arch>"))?;
+            let mut db = MultiArchDb::load();
+            db.remove_arch(arch)?;
+            println!("  {} Removed {}", "✔".bright_green(), arch.bold());
+        }
+        "--assert-multi-arch" | "assert" => {
+            let db = MultiArchDb::load();
+            if db.foreign_arches.is_empty() {
+                anyhow::bail!("Multi-arch is not enabled");
+            }
+        }
+        other => {
+            anyhow::bail!(
+                "Unknown dpkg-arch subcommand '{}'\n  \
+                 Usage: hammer dpkg-arch [print|foreign|add <arch>|remove <arch>|assert]",
+                other
+            );
+        }
+    }
+    Ok(())
+}
