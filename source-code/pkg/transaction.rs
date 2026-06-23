@@ -14,7 +14,6 @@ use crate::package::Package;
 use crate::profile::{self, compose_profile, GenerationsDb};
 use crate::sandbox::PostinstSandbox;
 use crate::solver::TransactionPlan;
-use crate::store::Store;
 
 // ─────────────────────────────────────────────────────────────
 //  TransactionContext
@@ -103,7 +102,7 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
         }
 
         // Extract to store — returns conffiles alongside regular files
-        let entry = Store::install_deb(&dl.package, &deb)
+        let entry = crate::store::install_deb_pkg(&dl.package, &deb)
         .with_context(|| format!("Installing {} to store", dl.package.name))?;
 
         // Record conffiles (three-way merge support on upgrade)
@@ -194,7 +193,8 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
                  version: p.version.clone(),
                  hash:    p.store_hash.clone(),
                  path,
-            })
+                    backend: crate::store::StoreBackend::Hardlink,
+                })
         } else { None }
     })
     .collect();
@@ -276,4 +276,224 @@ fn save_postinst_script(pkg_name: &str, script: &str) -> Result<PathBuf> {
     let dest = dir.join(format!("{}.postinst", pkg_name));
     std::fs::write(&dest, script)?;
     Ok(dest)
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Normal-mode transaction (no atomic store, no generations)
+//  cargo build --release --features normal-mode
+// ─────────────────────────────────────────────────────────────
+
+#[cfg(feature = "normal-mode")]
+pub async fn execute_transaction_normal(ctx: TransactionContext<'_>, note: &str) -> Result<()> {
+    use crate::build_mode::staging_dir;
+
+    let plan   = ctx.plan;
+    let db     = ctx.db;
+    let client = crate::download::HttpClient::new();
+
+    if plan.is_empty() {
+        println!("  {} Nothing to do.", "·".dimmed());
+        return Ok(());
+    }
+
+    plan.print_summary(false);
+
+    // ── Dry-run: stop here ────────────────────────────────────
+    // (caller checks flags.dry_run before calling, but guard here too)
+
+    // ── Pre-transaction hook ──────────────────────────────────
+    run_hook("pre-transaction", note).await;
+
+    // ── Download ──────────────────────────────────────────────
+    let mut to_install = plan.to_install.clone();
+    to_install.extend(plan.to_upgrade.clone());
+
+    if !to_install.is_empty() {
+        println!("  {}  Downloading {} package(s)…", "⬡".cyan().bold(), to_install.len());
+        let downloads = crate::download::download_packages(&client, &to_install)
+            .await.context("Download")?;
+
+        // ── Verify signatures ─────────────────────────────────
+        for (pkg, path) in &downloads {
+            if let Err(e) = crate::audit::verify_package_signature(path) {
+                eprintln!("  {} Signature verification failed for {}: {}", "!".red().bold(), pkg.name, e);
+                anyhow::bail!("Aborting: signature verification failed for '{}'", pkg.name);
+            }
+        }
+
+        // ── Install directly to / ─────────────────────────────
+        let staging = staging_dir();
+        std::fs::create_dir_all(&staging)?;
+
+        let sandbox = crate::sandbox::PostinstSandbox::new();
+        for (pkg, deb_path) in downloads {
+            println!("  {} Unpacking {}…", "↓".cyan(), pkg.name.bold());
+            let deb  = DebPackage::read(&deb_path).context("Read .deb")?;
+
+            // prerm for upgrades
+            if db.is_installed(&pkg.name) {
+                if let Some(prerm) = deb.prerm() {
+                    let _ = crate::sandbox::run_prerm_script(&sandbox, &pkg.name, prerm);
+                }
+            }
+
+            // Unpack to /
+            deb.unpack(Path::new("/")).context("Unpack")?;
+            log::pkg("install-normal", &pkg.name, &pkg.version);
+
+            // postinst
+            if let Some(postinst) = deb.postinst() {
+                let result = sandbox.run_postinst(&pkg.name, postinst)?;
+                if result.exit_code != 0 {
+                    log::warn(&format!("postinst {} exit {}", pkg.name, result.exit_code));
+                }
+            }
+
+            // Update conffiles
+            let mut confdb = ConffileDb::open()?;
+            confdb.register_package_conffiles(&pkg.name, &deb)?;
+
+            // Record in DB
+            let entry = crate::db::InstalledPackage {
+                name:              pkg.name.clone(),
+                version:           pkg.version.clone(),
+                architecture:      pkg.architecture.clone().unwrap_or_else(|| "amd64".into()),
+                installed_size_kb: pkg.installed_size_kb.unwrap_or(0),
+                section:           pkg.section.clone(),
+                maintainer:        pkg.maintainer.clone(),
+                description_short: pkg.description.as_ref()
+                                      .and_then(|d| d.lines().next().map(|l| l.to_string())),
+                installed_at:      chrono::Utc::now(),
+                reason:            if ctx.explicit.contains(&pkg.name) {
+                                       crate::db::InstallReason::User
+                                   } else {
+                                       crate::db::InstallReason::Dependency
+                                   },
+                store_hash:        String::new(),  // no store in normal mode
+                depends:           pkg.depends.clone(),
+                recommends:        pkg.recommends.clone(),
+            };
+            db.upsert(&entry)?;
+        }
+    }
+
+    // ── Removals ──────────────────────────────────────────────
+    for name in plan.to_remove.iter().chain(plan.to_autoremove.iter()) {
+        println!("  {} Removing {}…", "✘".red(), name.bold());
+        let pkg_root = Path::new("/");
+
+        // prerm
+        if let Some(script_path) = find_maintainer_script(name, "prerm") {
+            let sandbox = crate::sandbox::PostinstSandbox::new();
+            let _ = crate::sandbox::run_prerm_script(
+                &sandbox, name,
+                &std::fs::read_to_string(&script_path).unwrap_or_default()
+            );
+        }
+
+        // Remove files listed in dpkg info
+        remove_package_files(name, pkg_root)?;
+
+        // postrm
+        if let Some(script_path) = find_maintainer_script(name, "postrm") {
+            let sandbox = crate::sandbox::PostinstSandbox::new();
+            let _ = crate::sandbox::run_postrm_script(
+                &sandbox, name,
+                &std::fs::read_to_string(&script_path).unwrap_or_default(),
+                "remove"
+            );
+        }
+
+        db.remove(name)?;
+        log::pkg("remove-normal", name, "");
+    }
+
+    // ── Post-transaction hook ─────────────────────────────────
+    run_hook("post-transaction", note).await;
+
+    println!("  {} Transaction complete.", "✔".bright_green().bold());
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Pre/Post transaction hooks
+// ─────────────────────────────────────────────────────────────
+
+async fn run_hook(hook: &str, note: &str) {
+    let hook_path = format!("/etc/hammer/hooks.d/{}", hook);
+    let path = Path::new(&hook_path);
+    if !path.exists() { return; }
+
+    log::info(&format!("hook: running {} ({})", hook, note));
+    let _ = tokio::process::Command::new("/bin/sh")
+        .arg(&hook_path)
+        .env("HAMMER_TRANSACTION", note)
+        .status()
+        .await;
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Partial-install rollback
+// ─────────────────────────────────────────────────────────────
+
+pub struct RollbackGuard {
+    /// Packages that were successfully installed before a failure
+    installed: Vec<String>,
+    db:        std::sync::Arc<InstalledDb>,
+    activated: bool,
+}
+
+impl RollbackGuard {
+    pub fn new(db: std::sync::Arc<InstalledDb>) -> Self {
+        RollbackGuard { installed: Vec::new(), db, activated: false }
+    }
+    pub fn record(&mut self, name: &str) { self.installed.push(name.to_string()); }
+    pub fn commit(mut self)               { self.activated = true; }
+}
+
+impl Drop for RollbackGuard {
+    fn drop(&mut self) {
+        if !self.activated && !self.installed.is_empty() {
+            log::warn(&format!(
+                "transaction: rolling back partial install: {}",
+                self.installed.join(", ")
+            ));
+            for name in &self.installed {
+                let _ = crate::db::InstalledDb::open().and_then(|db| db.remove(name));
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Helpers
+// ─────────────────────────────────────────────────────────────
+
+fn find_maintainer_script(pkg: &str, kind: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(format!("/var/lib/dpkg/info/{}.{}", pkg, kind));
+    if path.exists() { Some(path) } else { None }
+}
+
+fn remove_package_files(pkg: &str, root: &Path) -> Result<()> {
+    let list_path = format!("/var/lib/dpkg/info/{}.list", pkg);
+    let list = match std::fs::read_to_string(&list_path) {
+        Ok(l) => l,
+        Err(_) => {
+            log::warn(&format!("remove: no dpkg file list for {}", pkg));
+            return Ok(());
+        }
+    };
+    let mut paths: Vec<&str> = list.lines().collect();
+    // Remove files before directories, and deeper paths first
+    paths.sort_by(|a, b| b.len().cmp(&a.len()));
+    for rel in paths {
+        let full = root.join(rel.trim_start_matches('/'));
+        if full.is_file() || full.is_symlink() {
+            let _ = std::fs::remove_file(&full);
+            log::file_op("remove", &full.to_string_lossy());
+        } else if full.is_dir() {
+            let _ = std::fs::remove_dir(&full); // only removes empty dirs
+        }
+    }
+    Ok(())
 }
