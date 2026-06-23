@@ -3,7 +3,6 @@ use owo_colors::OwoColorize;
 use std::io::{self, Write};
 
 use crate::db::{HistoryEntry, InstalledDb};
-use crate::diff::GenDiff;
 use crate::package::Package;
 use crate::profile::{ActivationResult, GenerationsDb};
 use crate::solver::TransactionPlan;
@@ -334,33 +333,55 @@ pub fn print_generations(gdb: &GenerationsDb) {
 //  Diff
 // ─────────────────────────────────────────────────────────────
 
-pub fn print_diff(diff: &GenDiff) {
-    println!();
-    println!("  {}  Diff: gen-{} → gen-{}",
-             "⬡".bright_cyan().bold(), diff.from, diff.to);
-    println!("  {}", "─".repeat(60).dimmed());
+pub fn print_diff(diff: &crate::diff::GenDiff) {
+    use owo_colors::OwoColorize;
+    use crate::diff::ChangeKind;
 
-    if diff.added.is_empty() && diff.removed.is_empty() && diff.upgraded.is_empty() {
-        println!("  {} No differences.", "·".dimmed());
+    if diff.is_empty() {
+        println!("  {} No changes between gen-{} and gen-{}.",
+                 "·".dimmed(), diff.from, diff.to);
         return;
     }
 
-    for pkg in &diff.added {
-        println!("  {} {} {}", "+".bright_green().bold(), pkg.name.bright_green(), pkg.version.cyan());
-    }
-    for (pkg, old_ver) in &diff.upgraded {
-        println!("  {} {} {} → {}", "↑".yellow().bold(), pkg.name.yellow(), old_ver.dimmed(), pkg.version.cyan());
-    }
-    for name in &diff.removed {
-        println!("  {} {}", "-".red().bold(), name.red());
+    for change in &diff.pkg_changes {
+        match change.kind {
+            ChangeKind::Added => println!(
+                "  {} {}  {}",
+                "++".bright_green(),
+                change.name.bold(),
+                change.to_ver.as_deref().unwrap_or("?").green()
+            ),
+            ChangeKind::Removed => println!(
+                "  {} {}  {}",
+                "--".red(),
+                change.name.bold(),
+                change.from_ver.as_deref().unwrap_or("?").dimmed()
+            ),
+            ChangeKind::Upgraded => println!(
+                "  {} {}:  {} → {}",
+                "~~".bright_yellow(),
+                change.name.bold(),
+                change.from_ver.as_deref().unwrap_or("?").dimmed(),
+                change.to_ver.as_deref().unwrap_or("?").bright_yellow()
+            ),
+            ChangeKind::Downgraded => println!(
+                "  {} {}:  {} → {}",
+                "↓↓".red(),
+                change.name.bold(),
+                change.from_ver.as_deref().unwrap_or("?").dimmed(),
+                change.to_ver.as_deref().unwrap_or("?").red()
+            ),
+        }
     }
 
     println!();
-    println!("  {} added  {} upgraded  {} removed",
-             diff.added.len().to_string().bright_green(),
-             diff.upgraded.len().to_string().yellow(),
-             diff.removed.len().to_string().red());
+    println!("  {} +{}  ↑{}  -{}",
+             "Summary:".bold(),
+             diff.n_added().to_string().green(),
+             diff.n_upgraded().to_string().yellow(),
+             diff.n_removed().to_string().red());
 }
+
 
 // ─────────────────────────────────────────────────────────────
 //  List entry
