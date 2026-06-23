@@ -1,4 +1,3 @@
-
 use anyhow::Result;
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -656,4 +655,158 @@ fn dir_size_bytes(path: &Path) -> u64 {
     .filter_map(|e| std::fs::metadata(e.path()).ok())
     .map(|m| m.len())
     .sum()
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_show — short package info
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_show(args: &[String], flags: &crate::cli_types::GlobalFlags) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let name = args.first()
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer show <package>"))?;
+    let cache = crate::cache::PackageCache::load()?;
+    let db    = crate::db::InstalledDb::open()?;
+    let pkg   = cache.get(name)
+        .ok_or_else(|| anyhow::anyhow!("Package '{}' not found.", name))?;
+    let inst  = db.get(name);
+
+    if flags.json {
+        return crate::json_output::print_package_json(pkg, inst.as_ref());
+    }
+
+    println!();
+    println!("  {} {}  {}", "⬡".cyan(), pkg.name.bold(), pkg.version.dimmed());
+    if let Some(ref s) = pkg.section { println!("  {:<18} {}", "Section:".bold(), s); }
+    println!("  {:<18} {}", "Description:".bold(),
+             pkg.description_short.as_deref().unwrap_or("—"));
+    if inst.is_some() {
+        println!("  {:<18} {}", "Status:".bold(), "installed".bright_green());
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_depends / cmd_rdepends — dependency display
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_depends(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let name = args.first()
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer depends <package>"))?;
+    let cache = crate::cache::PackageCache::load()?;
+    let pkg   = cache.get(name)
+        .ok_or_else(|| anyhow::anyhow!("Package '{}' not found.", name))?;
+
+    println!("\n  {}  Dependencies of {}", "⬡".cyan(), name.bold());
+    println!("  {}", "─".repeat(50).dimmed());
+
+    let db = crate::db::InstalledDb::open()?;
+    for (label, dep_str) in [
+        ("Pre-Depends:", pkg.pre_depends.as_deref()),
+        ("Depends:",     pkg.depends.as_deref()),
+        ("Recommends:",  pkg.recommends.as_deref()),
+        ("Suggests:",    pkg.suggests.as_deref()),
+    ] {
+        if let Some(s) = dep_str {
+            println!("  {}", label.bold());
+            for group in crate::package::parse_dep_field(s) {
+                let alts: Vec<String> = group.alternatives.iter().map(|a| {
+                    let installed = db.is_installed(&a.name);
+                    let ver = a.constraint.as_ref()
+                        .map(|c| format!(" ({})", c)).unwrap_or_default();
+                    let n = if installed { a.name.bright_green().to_string() }
+                            else         { a.name.clone() };
+                    format!("{}{}", n, ver.dimmed())
+                }).collect();
+                println!("    {}", alts.join(" | "));
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn cmd_rdepends(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let name = args.first()
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer rdepends <package>"))?;
+    let cache = crate::cache::PackageCache::load()?;
+    let db    = crate::db::InstalledDb::open()?;
+
+    println!("\n  {}  Packages that depend on {}", "⬡".cyan(), name.bold());
+    println!("  {}", "─".repeat(50).dimmed());
+
+    let mut count = 0;
+    for pkg in cache.all_packages() {
+        let dep_strs = [pkg.pre_depends.as_deref(), pkg.depends.as_deref()];
+        for dep_str in dep_strs.iter().flatten() {
+            for group in crate::package::parse_dep_field(dep_str) {
+                if group.alternatives.iter().any(|a| a.name == *name) {
+                    let installed = db.is_installed(&pkg.name);
+                    let sym = if installed { "✔".bright_green().to_string() }
+                              else        { "·".dimmed().to_string() };
+                    println!("  {} {}", sym, pkg.name.bold());
+                    count += 1;
+                }
+            }
+        }
+    }
+    if count == 0 {
+        println!("  {} No packages depend on '{}'.", "·".dimmed(), name);
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_which — which package owns a file
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_which(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let path = args.first()
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer which <file-path>"))?;
+
+    // Search dpkg info files
+    let info_dir = std::path::Path::new("/var/lib/dpkg/info");
+    if info_dir.exists() {
+        for entry in std::fs::read_dir(info_dir)?.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".list") { continue; }
+            let content = std::fs::read_to_string(entry.path()).unwrap_or_default();
+            if content.lines().any(|l| l.trim() == path.as_str()) {
+                let pkg_name = name.trim_end_matches(".list");
+                println!("  {} {} is owned by {}", "✔".bright_green(), path.cyan(), pkg_name.bold());
+                return Ok(());
+            }
+        }
+    }
+    println!("  {} No package owns '{}'.", "·".dimmed(), path);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_policy — show package priority and versions
+// ─────────────────────────────────────────────────────────────
+
+pub fn cmd_policy(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let name = args.first()
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer policy <package>"))?;
+    let cache = crate::cache::PackageCache::load()?;
+    let db    = crate::db::InstalledDb::open()?;
+
+    println!("\n  {}:", name.bold());
+    let inst_ver = db.get(name).map(|i| i.version);
+    println!("  {:<18} {}", "Installed:",
+             inst_ver.as_deref().unwrap_or("(none)").bright_green());
+
+    if let Some(pkg) = cache.get(name) {
+        println!("  {:<18} {}", "Candidate:", pkg.version.cyan());
+        if let Some(ref uri) = pkg.repo_base_uri {
+            println!("  {:<18} {}", "Repository:", uri.dimmed());
+        }
+    } else {
+        println!("  {:<18} (not in any repo)", "Candidate:".bold());
+    }
+    Ok(())
 }
