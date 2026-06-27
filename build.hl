@@ -4,6 +4,7 @@
 // ninja
 
 > cargo build --release
+;; for normal version: > cargo build --release --features normal-mode
 > cd store
 > meson setup build
 > ninja -C build
