@@ -1,0 +1,61 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! Przykład: popularne repozytoria zewnętrzne (third-party)
+! Każde wymaga oddzielnego klucza GPG.
+!
+! UWAGA: Repozytoria zewnętrzne nie są weryfikowane przez Debian.
+!        Używaj tylko zaufanych źródeł.
+!
+! Użycie:
+!   hammer sources --add third-party.hk
+!   hammer sync
+
+! ── Visual Studio Code ───────────────────────────────────────────────
+[vscode]
+-> name       => vscode
+-> baseurl    => https://packages.microsoft.com/repos/code
+-> suite      => stable
+-> components => ["main"]
+-> arch       => ["amd64", "arm64"]
+-> enabled    => true
+-> gpgkey     => https://packages.microsoft.com/keys/microsoft.asc
+
+! ── Docker CE ────────────────────────────────────────────────────────
+[docker-ce]
+-> name       => docker-ce
+-> baseurl    => https://download.docker.com/linux/debian
+-> suite      => trixie
+-> components => ["stable"]
+-> arch       => ["amd64"]
+-> enabled    => true
+-> gpgkey     => https://download.docker.com/linux/debian/gpg
+
+! ── GitHub CLI ───────────────────────────────────────────────────────
+[github-cli]
+-> name       => github-cli
+-> baseurl    => https://cli.github.com/packages
+-> suite      => stable
+-> components => ["main"]
+-> arch       => ["amd64"]
+-> enabled    => true
+-> gpgkey     => https://cli.github.com/packages/githubcli-archive-keyring.gpg
+
+! ── Signal Desktop ───────────────────────────────────────────────────
+[signal-desktop]
+-> name       => signal-desktop
+-> baseurl    => https://updates.signal.org/desktop/apt
+-> suite      => xenial
+-> components => ["main"]
+-> arch       => ["amd64"]
+-> enabled    => false
+-> gpgkey     => https://updates.signal.org/desktop/apt/keys.asc
+
+! ── Brave Browser ────────────────────────────────────────────────────
+[brave-browser]
+-> name       => brave-browser
+-> baseurl    => https://brave-browser-apt-release.s3.brave.com
+-> suite      => stable
+-> components => ["main"]
+-> arch       => ["amd64"]
+-> enabled    => false
+-> gpgkey     => https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg
