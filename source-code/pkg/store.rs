@@ -7,9 +7,19 @@ use crate::deb::DebPackage;
 use crate::log;
 use crate::package::Package;
 
+#[cfg(not(feature = "normal-mode"))]
 pub const STORE_DIR:    &str = "/hammer/store";
+#[cfg(not(feature = "normal-mode"))]
 pub const PROFILES_DIR: &str = "/hammer/profiles";
+#[cfg(not(feature = "normal-mode"))]
 pub const ACTIVE_LINK:  &str = "/hammer/active";
+
+#[cfg(feature = "normal-mode")]
+pub const STORE_DIR:    &str = "/var/lib/hammer/store";
+#[cfg(feature = "normal-mode")]
+pub const PROFILES_DIR: &str = "/var/lib/hammer/profiles";
+#[cfg(feature = "normal-mode")]
+pub const ACTIVE_LINK:  &str = "/var/lib/hammer/active";
 
 // ─────────────────────────────────────────────────────────────
 //  Backend detection
