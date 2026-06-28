@@ -2,11 +2,20 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 
 use crate::package::Package;
+use crate::build_mode;
 
+/// Resolved at runtime so normal-mode uses /var/lib/hammer/
+pub fn db_path() -> std::path::PathBuf {
+    build_mode::db_path()
+}
+
+/// Legacy constant kept for compatibility — prefer `db_path()` fn.
+#[cfg(not(feature = "normal-mode"))]
 pub const DB_PATH: &str = "/hammer/db/hammer.db";
+#[cfg(feature = "normal-mode")]
+pub const DB_PATH: &str = "/var/lib/hammer/hammer.db";
 
 // ─────────────────────────────────────────────────────────────
 //  InstalledPackage
@@ -70,13 +79,14 @@ pub struct InstalledDb {
 
 impl InstalledDb {
     pub fn open() -> Result<Self> {
-        let path = Path::new(DB_PATH);
+        let resolved = db_path();
+        let path = resolved.as_path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
             .with_context(|| format!("Cannot create {}", parent.display()))?;
         }
         let conn = Connection::open(path)
-        .with_context(|| format!("Cannot open database {}", DB_PATH))?;
+        .with_context(|| format!("Cannot open database {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
         let db = InstalledDb { conn };
         db.migrate()?;
@@ -250,7 +260,7 @@ fn row_to_installed(row: &rusqlite::Row) -> rusqlite::Result<InstalledPackage> {
 //  Schema migrations
 // ─────────────────────────────────────────────────────────────
 
-const CURRENT_SCHEMA_VERSION: u32 = 4;
+const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 impl InstalledDb {
     /// Run all pending schema migrations. Called on every open().
@@ -270,6 +280,7 @@ impl InstalledDb {
         if version < 2 { self.migrate_v2()?; }
         if version < 3 { self.migrate_v3()?; }
         if version < 4 { self.migrate_v4()?; }
+        if version < 5 { self.migrate_v5()?; }
 
         // Write current version
         self.conn.execute_batch(&format!(
@@ -335,6 +346,20 @@ impl InstalledDb {
             CREATE INDEX IF NOT EXISTS idx_history_package   ON history(package);
             CREATE INDEX IF NOT EXISTS idx_history_action    ON history(action);
             CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp);
+        ")?;
+        Ok(())
+    }
+
+    /// v5 — add file_index table (hammer what <file>, 0.5)
+    fn migrate_v5(&self) -> Result<()> {
+        self.conn.execute_batch("
+            CREATE TABLE IF NOT EXISTS file_index (
+                path    TEXT NOT NULL,
+                package TEXT NOT NULL,
+                PRIMARY KEY (path, package)
+            );
+            CREATE INDEX IF NOT EXISTS idx_file_index_pkg  ON file_index(package);
+            CREATE INDEX IF NOT EXISTS idx_file_index_path ON file_index(path);
         ")?;
         Ok(())
     }
@@ -454,6 +479,15 @@ impl InstalledDb {
         Ok(rows.filter_map(|r| r.ok()).collect())
     }
 
+    /// Usuń wszystkie conffiles dla danej paczki (wywoływane przez hammer undo).
+    pub fn remove_conffiles_for_package(&self, pkg: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM conffiles WHERE package = ?1",
+            params![pkg],
+        )?;
+        Ok(())
+    }
+
     // ── Maintenance ───────────────────────────────────────────
 
     pub fn vacuum(&self) -> Result<()> {
@@ -503,5 +537,181 @@ impl InstalledDb {
     pub fn remove(&self, name: &str) -> Result<()> {
         self.conn.execute("DELETE FROM installed WHERE name = ?1", params![name])?;
         Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Unified source of truth: SQLite ↔ JSON
+//
+//  SQLite is authoritative.  The JSON snapshot is:
+//    • Written atomically after every mutating operation
+//    • Read on startup when the SQLite file is absent/corrupt
+//      (disaster recovery + human-readable backup)
+//    • Used by external tooling (jq, scripts, HammerStore UI)
+//
+//  Path: /hammer/db/installed.json
+// ─────────────────────────────────────────────────────────────
+
+pub const JSON_PATH: &str = "/hammer/db/installed.json";
+
+/// Snapshot written to / read from the JSON file.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DbSnapshot {
+    pub schema_version: u32,
+    pub exported_at:    String,
+    pub packages:       Vec<InstalledPackage>,
+}
+
+impl InstalledDb {
+    // ── JSON export ───────────────────────────────────────────
+
+    /// Export all installed packages to the JSON side-car file.
+    /// Called automatically after every mutation.
+    pub fn export_json(&self) -> Result<()> {
+        self.export_json_to(JSON_PATH)
+    }
+
+    pub fn export_json_to(&self, path: &str) -> Result<()> {
+        let packages = self.list_all()?;
+        let snap = DbSnapshot {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            exported_at:    Utc::now().to_rfc3339(),
+            packages,
+        };
+        let json = serde_json::to_string_pretty(&snap)?;
+        // Atomic write: write to *.tmp then rename
+        let tmp = format!("{}.tmp", path);
+        std::fs::write(&tmp, json)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    // ── JSON import / recovery ────────────────────────────────
+
+    /// Import a JSON snapshot into SQLite.  Used for disaster recovery
+    /// when the SQLite file is absent or corrupt.  Safe to call on an
+    /// empty database — it will not duplicate existing rows.
+    pub fn import_json(&self, path: &str) -> Result<usize> {
+        let raw = std::fs::read_to_string(path)
+            .with_context(|| format!("Reading {}", path))?;
+        let snap: DbSnapshot = serde_json::from_str(&raw)
+            .context("Parsing JSON snapshot")?;
+        let mut imported = 0usize;
+        for ip in &snap.packages {
+            // Skip packages already in SQLite
+            if self.is_installed(&ip.name) { continue; }
+            let ts = ip.installed_at.to_rfc3339();
+            self.conn.execute(
+                "INSERT OR IGNORE INTO installed
+                (name,version,architecture,installed_size_kb,section,maintainer,
+                 description_short,installed_at,reason,store_hash,depends,recommends)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                params![
+                    ip.name, ip.version, ip.architecture, ip.installed_size_kb as i64,
+                    ip.section, ip.maintainer, ip.description_short, ts,
+                    ip.reason.as_str(), ip.store_hash, ip.depends, ip.recommends,
+                ],
+            )?;
+            imported += 1;
+        }
+        Ok(imported)
+    }
+
+    /// Try to recover from a corrupt/missing SQLite by importing the JSON
+    /// side-car.  Returns Ok(0) if nothing to recover.
+    pub fn recover_from_json() -> Result<usize> {
+        let json_path = std::path::Path::new(JSON_PATH);
+        if !json_path.exists() { return Ok(0); }
+        let db = Self::open()?;
+        if db.count() > 0 {
+            // SQLite is healthy — no recovery needed, just re-sync JSON
+            db.export_json()?;
+            return Ok(0);
+        }
+        let imported = db.import_json(JSON_PATH)?;
+        eprintln!("[hammer] Recovered {} packages from JSON snapshot.", imported);
+        Ok(imported)
+    }
+
+    /// Open the database, recovering from JSON if SQLite is empty/missing.
+    pub fn open_with_recovery() -> Result<Self> {
+        let db = Self::open()?;
+        if db.count() == 0 {
+            let json_path = std::path::Path::new(JSON_PATH);
+            if json_path.exists() {
+                let n = db.import_json(JSON_PATH)?;
+                if n > 0 {
+                    eprintln!("[hammer] Recovered {} packages from JSON backup.", n);
+                }
+            }
+        }
+        Ok(db)
+    }
+
+    // ── Auto-export wrappers ──────────────────────────────────
+    //
+    //  Wrap the three mutating methods so the JSON snapshot is always
+    //  kept in sync.  Callers use these instead of the raw methods.
+
+    pub fn record_install_and_sync(
+        &self,
+        pkg:        &Package,
+        reason:     InstallReason,
+        store_hash: &str,
+        gen:        u32,
+    ) -> Result<()> {
+        self.record_install(pkg, reason, store_hash, gen)?;
+        self.export_json().unwrap_or_else(|e| eprintln!("[db] JSON export failed: {}", e));
+        Ok(())
+    }
+
+    pub fn record_upgrade_and_sync(
+        &self,
+        old_ver:    &str,
+        pkg:        &Package,
+        store_hash: &str,
+        gen:        u32,
+    ) -> Result<()> {
+        self.record_upgrade(old_ver, pkg, store_hash, gen)?;
+        self.export_json().unwrap_or_else(|e| eprintln!("[db] JSON export failed: {}", e));
+        Ok(())
+    }
+
+    pub fn record_remove_and_sync(
+        &self,
+        name:    &str,
+        version: &str,
+        gen:     u32,
+    ) -> Result<()> {
+        self.record_remove(name, version, gen)?;
+        self.export_json().unwrap_or_else(|e| eprintln!("[db] JSON export failed: {}", e));
+        Ok(())
+    }
+
+    // ── Status ────────────────────────────────────────────────
+
+    /// Return the mtime of the JSON snapshot (for cache-busting).
+    pub fn json_mtime() -> Option<std::time::SystemTime> {
+        std::fs::metadata(JSON_PATH).ok()?.modified().ok()
+    }
+
+    /// Validate that JSON snapshot agrees with SQLite.
+    /// Returns (only_in_sqlite, only_in_json).
+    pub fn validate_json_sync(&self) -> Result<(Vec<String>, Vec<String>)> {
+        use std::collections::HashSet;
+        let sqlite_names: HashSet<String> = self.list_all()?
+            .into_iter().map(|p| p.name).collect();
+        let json_path = std::path::Path::new(JSON_PATH);
+        if !json_path.exists() {
+            return Ok((sqlite_names.into_iter().collect(), vec![]));
+        }
+        let raw = std::fs::read_to_string(json_path)?;
+        let snap: DbSnapshot = serde_json::from_str(&raw)?;
+        let json_names: HashSet<String> = snap.packages.into_iter().map(|p| p.name).collect();
+        let only_sqlite: Vec<String> = sqlite_names.difference(&json_names)
+            .cloned().collect();
+        let only_json: Vec<String> = json_names.difference(&sqlite_names)
+            .cloned().collect();
+        Ok((only_sqlite, only_json))
     }
 }
