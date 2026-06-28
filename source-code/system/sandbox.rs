@@ -294,7 +294,7 @@ pub fn run_postrm_script(
 
 fn _run_maintainer_script(
     sandbox:  &PostinstSandbox,
-    pkg_name: &str,
+    _pkg_name: &str,
     kind:     &str,
     script:   &str,
     args:     &[&str],
