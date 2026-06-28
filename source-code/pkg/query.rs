@@ -664,25 +664,143 @@ fn dir_size_bytes(path: &Path) -> u64 {
 pub fn cmd_show(args: &[String], flags: &crate::cli_types::GlobalFlags) -> anyhow::Result<()> {
     use owo_colors::OwoColorize;
     let name = args.first()
-        .ok_or_else(|| anyhow::anyhow!("Usage: hammer show <package>"))?;
-    let cache = crate::cache::PackageCache::load()?;
-    let db    = crate::db::InstalledDb::open()?;
-    let pkg   = cache.get(name)
-        .ok_or_else(|| anyhow::anyhow!("Package '{}' not found.", name))?;
-    let inst  = db.get(name);
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer show <package> [--verbose] [--json]"))?;
+    let verbose = args.iter().any(|a| a == "--verbose" || a == "-v");
+    let cache   = crate::cache::PackageCache::load()?;
+    let db      = crate::db::InstalledDb::open()?;
+    let pkg     = cache.get(name)
+        .ok_or_else(|| anyhow::anyhow!("Package '{}' not found in cache. Run: hammer sync", name))?;
+    let inst    = db.get(name);
 
     if flags.json {
         return crate::json_output::print_package_json(pkg, inst.as_ref());
     }
 
     println!();
-    println!("  {} {}  {}", "⬡".cyan(), pkg.name.bold(), pkg.version.dimmed());
-    if let Some(ref s) = pkg.section { println!("  {:<18} {}", "Section:".bold(), s); }
-    println!("  {:<18} {}", "Description:".bold(),
-             pkg.description_short.as_deref().unwrap_or("—"));
-    if inst.is_some() {
-        println!("  {:<18} {}", "Status:".bold(), "installed".bright_green());
+    // ── Header ──────────────────────────────────────────────
+    println!("  {}  {} {}  [{}]",
+        "⬡".bright_cyan().bold(),
+        pkg.name.bold(),
+        pkg.version.bright_white(),
+        pkg.architecture.dimmed());
+
+    println!("  {}", "─".repeat(70).dimmed());
+
+    // ── Status ──────────────────────────────────────────────
+    match &inst {
+        Some(i) => {
+            let same_ver = i.version == pkg.version;
+            if same_ver {
+                println!("  {:<22} {} ({})",
+                    "Status:".bold(),
+                    "installed".bright_green(),
+                    i.installed_at.format("%Y-%m-%d").to_string().dimmed());
+            } else {
+                println!("  {:<22} {} {} → {} available",
+                    "Status:".bold(),
+                    "installed".bright_green(),
+                    i.version.dimmed(),
+                    pkg.version.bright_yellow());
+            }
+            match i.reason {
+                crate::db::InstallReason::User       =>
+                    println!("  {:<22} {}", "Install reason:".bold(), "explicit"),
+                crate::db::InstallReason::Dependency =>
+                    println!("  {:<22} {}", "Install reason:".bold(), "dependency".dimmed()),
+            }
+        }
+        None => println!("  {:<22} {}", "Status:".bold(), "not installed".dimmed()),
     }
+
+    // ── Description ─────────────────────────────────────────
+    println!();
+    if let Some(ref s) = pkg.description_short {
+        println!("  {}", s.bold());
+    }
+    if verbose {
+        if let Some(ref l) = pkg.description_long {
+            for line in l.lines() {
+                println!("  {}", line);
+            }
+        }
+    }
+
+    println!();
+    println!("  {}", "─".repeat(70).dimmed());
+
+    // ── Package metadata ─────────────────────────────────────
+    let row = |label: &str, val: &str| {
+        println!("  {:<22} {}", format!("{}:", label).bold(), val);
+    };
+
+    if let Some(ref m)  = pkg.maintainer    { row("Maintainer",    m); }
+    if let Some(ref h)  = pkg.homepage      { row("Homepage",      h); }
+    if let Some(ref s)  = pkg.section       { row("Section",       s); }
+    if let Some(ref p)  = pkg.priority      { row("Priority",      p); }
+    if let Some(sz)     = pkg.installed_size_kb {
+        row("Installed size", &crate::ui::human_size(sz * 1024));
+    }
+    if let Some(sz) = pkg.download_size {
+        row("Download size",  &crate::ui::human_size(sz));
+    }
+    if let Some(ref f) = pkg.filename { row("Filename", f); }
+    if let Some(ref h) = pkg.sha256   { row("SHA256",   &format!("{}…", &h[..16])); }
+
+    // ── Dependencies ─────────────────────────────────────────
+    println!();
+    for (label, dep_str) in [
+        ("Pre-Depends",  pkg.pre_depends.as_deref()),
+        ("Depends",      pkg.depends.as_deref()),
+        ("Recommends",   pkg.recommends.as_deref()),
+        ("Suggests",     pkg.suggests.as_deref()),
+        ("Conflicts",    pkg.conflicts.as_deref()),
+        ("Breaks",       pkg.breaks.as_deref()),
+        ("Provides",     pkg.provides.as_deref()),
+        ("Replaces",     pkg.replaces.as_deref()),
+        ("Enhances",     pkg.enhances.as_deref()),
+    ] {
+        if let Some(s) = dep_str {
+            if verbose || matches!(label, "Pre-Depends" | "Depends" | "Conflicts" | "Breaks") {
+                let parsed = crate::package::parse_dep_field(s);
+                let parts: Vec<String> = parsed.iter().map(|g| {
+                    let alts: Vec<String> = g.alternatives.iter().map(|a| {
+                        let installed = db.is_installed(&a.name);
+                        let vc = a.constraint.as_ref()
+                            .map(|c| format!(" ({})", c)).unwrap_or_default();
+                        if installed {
+                            format!("{}{}", a.name.bright_green(), vc.dimmed())
+                        } else {
+                            format!("{}{}", a.name, vc.dimmed())
+                        }
+                    }).collect();
+                    alts.join(" | ")
+                }).collect();
+                println!("  {:<22} {}", format!("{}:", label).bold(),
+                    parts.join(", "));
+            }
+        }
+    }
+
+    // ── Files hint ───────────────────────────────────────────
+    if inst.is_some() {
+        println!();
+        println!("  {} {}",
+            "Files:".bold(),
+            format!("hammer files {}", pkg.name).cyan());
+        println!("  {} {}",
+            "Changelog:".bold(),
+            format!("hammer changelog {}", pkg.name).cyan());
+        println!("  {} {}",
+            "Reverse deps:".bold(),
+            format!("hammer rdepends {}", pkg.name).cyan());
+    } else {
+        println!();
+        println!("  {} {}",
+            "Install:".bold(),
+            format!("hammer install {}", pkg.name).cyan());
+    }
+
+    println!();
     Ok(())
 }
 
