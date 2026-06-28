@@ -1,6 +1,7 @@
 use crate::cache::PackageCache;
 use anyhow::{bail, Result};
 use owo_colors::OwoColorize;
+use serde_json;
 
 use crate::cache::detect_arch;
 use crate::cli_types::has_flag;
@@ -67,10 +68,160 @@ fn count_active_bins() -> usize {
     count
 }
 
-pub fn cmd_history() -> Result<()> {
-    let db = InstalledDb::open()?;
-    ui::print_history(&db.history(50)?);
+pub fn cmd_history(args: &[String]) -> Result<()> {
+    use owo_colors::OwoColorize;
+
+    let limit: usize = args.windows(2)
+        .find(|w| w[0] == "-n")
+        .and_then(|w| w[1].parse().ok())
+        .unwrap_or(50);
+    let json_out = args.iter().any(|a| a == "--json");
+
+    // ── hammer history --diff <gen-A> <gen-B> ────────────────
+    if let Some(diff_idx) = args.iter().position(|a| a == "--diff") {
+        let a_str = args.get(diff_idx + 1)
+            .ok_or_else(|| anyhow::anyhow!("Usage: hammer history --diff <gen-A> <gen-B>"))?;
+        let b_str = args.get(diff_idx + 2)
+            .ok_or_else(|| anyhow::anyhow!("Usage: hammer history --diff <gen-A> <gen-B>"))?;
+
+        let parse_gen = |s: &str| -> Result<u32> {
+            let n = s.strip_prefix("gen-").unwrap_or(s);
+            n.parse::<u32>().map_err(|_| anyhow::anyhow!("Invalid generation: {}", s))
+        };
+        let gen_a = parse_gen(a_str)?;
+        let gen_b = parse_gen(b_str)?;
+
+        let gdb = crate::profile::GenerationsDb::load()?;
+        let a = gdb.generations.iter().find(|g| g.number == gen_a)
+            .ok_or_else(|| anyhow::anyhow!("Generation gen-{} not found", gen_a))?;
+        let b = gdb.generations.iter().find(|g| g.number == gen_b)
+            .ok_or_else(|| anyhow::anyhow!("Generation gen-{} not found", gen_b))?;
+
+        let a_pkgs: std::collections::HashSet<&str> =
+            a.packages.iter().map(|p| p.name.as_str()).collect();
+        let b_pkgs: std::collections::HashSet<&str> =
+            b.packages.iter().map(|p| p.name.as_str()).collect();
+
+        let added:   Vec<&str> = b_pkgs.difference(&a_pkgs).copied().collect();
+        let removed: Vec<&str> = a_pkgs.difference(&b_pkgs).copied().collect();
+        let mut changed: Vec<String> = Vec::new();
+
+        for pkg in a.packages.iter() {
+            if let Some(bp) = b.packages.iter().find(|p| p.name == pkg.name) {
+                if bp.version != pkg.version {
+                    changed.push(format!("{}: {} → {}", pkg.name, pkg.version, bp.version));
+                }
+            }
+        }
+
+        if json_out {
+            let mut added_s:   Vec<&str> = added.clone();
+            let mut removed_s: Vec<&str> = removed.clone();
+            added_s.sort();
+            removed_s.sort();
+            println!("{}", serde_json::json!({
+                "gen_a": gen_a, "gen_b": gen_b,
+                "added":   added_s,
+                "removed": removed_s,
+                "changed": changed,
+            }));
+            return Ok(());
+        }
+
+        println!("\n  {}  Diff: gen-{} → gen-{}", "⬡".bright_cyan().bold(), gen_a, gen_b);
+        println!("  {}", "─".repeat(70).dimmed());
+        let mut added_s = added.clone(); added_s.sort();
+        let mut removed_s = removed.clone(); removed_s.sort();
+        for p in &added_s   { println!("  {} {}", "+".bright_green(), p.bright_green()); }
+        for p in &removed_s { println!("  {} {}", "−".red(), p.red()); }
+        for c in &changed   { println!("  {} {}", "↑".bright_yellow(), c.bright_yellow()); }
+        if added_s.is_empty() && removed_s.is_empty() && changed.is_empty() {
+            println!("  {} No differences between gen-{} and gen-{}.", "·".dimmed(), gen_a, gen_b);
+        }
+        println!();
+        return Ok(());
+    }
+
+    // ── hammer history --search <package> ────────────────────
+    if let Some(search_idx) = args.iter().position(|a| a == "--search") {
+        let pkg_name = args.get(search_idx + 1)
+            .ok_or_else(|| anyhow::anyhow!("Usage: hammer history --search <package>"))?;
+        let db = crate::db::InstalledDb::open()?;
+        let all = db.history(10000)?;
+        let matches: Vec<_> = all.iter()
+            .filter(|e| e.package.contains(pkg_name.as_str()))
+            .collect();
+
+        if json_out {
+            let json_entries: Vec<_> = matches.iter().map(|e| serde_json::json!({
+                "id": e.id, "action": e.action, "package": e.package,
+                "old_ver": e.old_ver, "new_ver": e.new_ver,
+                "generation": e.generation,
+                "timestamp": e.timestamp.to_rfc3339(),
+            })).collect();
+            println!("{}", serde_json::to_string_pretty(&json_entries)?);
+            return Ok(());
+        }
+
+        println!("\n  {}  History for '{}'", "⬡".bright_cyan().bold(), pkg_name.bold());
+        println!("  {}", "─".repeat(70).dimmed());
+        if matches.is_empty() {
+            println!("  {} No history found for '{}'.", "·".dimmed(), pkg_name);
+        } else {
+            for e in matches {
+                print_history_entry(e);
+            }
+        }
+        println!();
+        return Ok(());
+    }
+
+    // ── Default: show last N entries ──────────────────────────
+    let db = crate::db::InstalledDb::open()?;
+    let entries = db.history(limit)?;
+
+    if json_out {
+        let json_entries: Vec<_> = entries.iter().map(|e| serde_json::json!({
+            "id": e.id, "action": e.action, "package": e.package,
+            "old_ver": e.old_ver, "new_ver": e.new_ver,
+            "generation": e.generation,
+            "timestamp": e.timestamp.to_rfc3339(),
+        })).collect();
+        println!("{}", serde_json::to_string_pretty(&json_entries)?);
+        return Ok(());
+    }
+
+    crate::ui::print_history(&entries);
     Ok(())
+}
+
+fn print_history_entry(e: &crate::db::HistoryEntry) {
+    use owo_colors::OwoColorize;
+    let (sym, col) = match e.action.as_str() {
+        "install" => ("↓", "green"),
+        "remove"  => ("✗", "red"),
+        "upgrade" => ("↑", "yellow"),
+        _         => ("·", "dim"),
+    };
+    let ver_info = match (&e.old_ver, &e.new_ver) {
+        (Some(o), Some(n)) => format!("{} → {}", o.dimmed(), n.bright_white()),
+        (None,    Some(n)) => n.clone(),
+        (Some(o), None)    => o.dimmed().to_string(),
+        _                  => String::new(),
+    };
+    let sym_col = match col {
+        "green"  => sym.bright_green().bold().to_string(),
+        "red"    => sym.red().bold().to_string(),
+        "yellow" => sym.bright_yellow().bold().to_string(),
+        _        => sym.dimmed().to_string(),
+    };
+    println!("  {}  {:<32} {:<26} gen-{}  {}",
+        sym_col,
+        e.package.bold(),
+        ver_info,
+        e.generation.to_string().dimmed(),
+        e.timestamp.format("%Y-%m-%d %H:%M").to_string().dimmed(),
+    );
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -155,27 +306,56 @@ pub async fn cmd_gen(args: &[String]) -> Result<()> {
             let _ = grub::update_grub(&gdb2);
             println!("  {} Now running gen-{}.", "✔".bright_green(), n);
         }
-        other => bail!("Unknown gen subcommand: '{}'. Try: list, switch", other),
+        "gc" => {
+            // hammer gen gc [--keep=N]  (default keep=20)
+            let keep: u32 = args.iter()
+                .find(|a| a.starts_with("--keep="))
+                .and_then(|a| a.strip_prefix("--keep="))
+                .and_then(|n| n.parse().ok())
+                .or_else(|| args.get(1).and_then(|n| n.parse().ok()))
+                .unwrap_or(20);
+            let mut gdb = GenerationsDb::load()?;
+            let before = gdb.generations.len();
+            // Keep the N most recent + current
+            let mut gens = gdb.generations.clone();
+            gens.sort_by(|a, b| b.number.cmp(&a.number));
+            let to_keep: std::collections::HashSet<u32> = gens.iter()
+                .take(keep as usize)
+                .map(|g| g.number)
+                .chain(std::iter::once(gdb.current))
+                .collect();
+            let to_remove: Vec<_> = gdb.generations.iter()
+                .filter(|g| !to_keep.contains(&g.number))
+                .map(|g| g.profile_path())
+                .collect();
+            for path in &to_remove {
+                let _ = std::fs::remove_dir_all(path);
+            }
+            gdb.generations.retain(|g| to_keep.contains(&g.number));
+            gdb.save()?;
+            let removed = before.saturating_sub(gdb.generations.len());
+            println!("  {} GC complete: removed {} generation(s), kept {}.",
+                "✔".bright_green(), removed, gdb.generations.len());
+        }
+        "delete" => {
+            let n: u32 = args.get(1).ok_or_else(|| anyhow::anyhow!("Usage: hammer gen delete <N>"))?.parse()?;
+            let mut gdb = GenerationsDb::load()?;
+            if n == gdb.current {
+                anyhow::bail!("Cannot delete the currently active generation ({}).", n);
+            }
+            let gen = gdb.get(n).ok_or_else(|| anyhow::anyhow!("Generation {} not found.", n))?.clone();
+            let _ = std::fs::remove_dir_all(gen.profile_path());
+            gdb.generations.retain(|g| g.number != n);
+            gdb.save()?;
+            println!("  {} Deleted gen-{}.", "✔".bright_green(), n);
+        }
+        other => bail!("Unknown gen subcommand: '{}'. Try: list, switch, gc [--keep=N], delete <N>", other),
     }
     Ok(())
 }
 
-pub fn cmd_rollback() -> Result<()> {
-    let _lock = lock::system_lock()?;
-    let gdb   = GenerationsDb::load()?;
-    let mut prev: Vec<_> = gdb.generations.iter()
-    .filter(|g| g.number < gdb.current).collect();
-    prev.sort_by(|a, b| b.number.cmp(&a.number));
-    let p = prev.first().ok_or_else(|| anyhow::anyhow!("No previous generation."))?;
-    println!("  Rolling back: gen-{} → gen-{}…", gdb.current, p.number);
-    profile::switch_active(p)?;
-    profile::relink_bins(&p.profile_path())?;
-    let mut gdb2 = GenerationsDb::load()?;
-    gdb2.current = p.number; gdb2.pending = None;
-    clear_pending().ok(); gdb2.save()?;
-    let _ = grub::update_grub(&gdb2);
-    println!("  {} Rolled back to gen-{}. Binaries relinked.", "✔".bright_green(), p.number);
-    Ok(())
+pub fn cmd_rollback(args: &[String]) -> Result<()> {
+    crate::undo::cmd_undo(args)
 }
 
 pub fn cmd_pending(args: &[String]) -> Result<()> {
@@ -841,5 +1021,198 @@ pub fn cmd_why_not(args: &[String]) -> Result<()> {
 
     let explanation = solver.explain_failure(name);
     println!("{}", explanation);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_daemon — control the background daemon
+// ─────────────────────────────────────────────────────────────
+
+pub async fn cmd_daemon(args: &[String]) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use crate::hammerd::ipc::DaemonRequest;
+    use crate::hammerd::client::send_request;
+    use crate::hammerd::server::run_daemon;
+    use crate::hammerd::service::{install_hammerd_service, is_running};
+
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("status");
+
+    match sub {
+        "start" => {
+            if is_running() {
+                println!("  {} hammerd is already running.", "ℹ".cyan());
+                return Ok(());
+            }
+            println!("  {} Starting hammerd…", "·".dimmed());
+            run_daemon().await?;
+        }
+
+        "stop" => {
+            let resp = send_request(DaemonRequest::Shutdown).await?;
+            println!("  {} {}", if resp.ok { "✔" } else { "✗" }, resp.message);
+        }
+
+        "status" => {
+            let resp = send_request(DaemonRequest::Status).await?;
+            println!();
+            println!("  {}  hammerd status", "⬡".bright_cyan().bold());
+            println!("  {}", "─".repeat(40).dimmed());
+            if let Some(data) = &resp.data {
+                println!("  {:<22} {}", "Running:".bold(),
+                    data["running"].as_bool().map(|b| if b { "yes".green().to_string() } else { "no".red().to_string() }).unwrap_or_default());
+                println!("  {:<22} {}", "Updates available:".bold(),
+                    data["n_updates"].as_u64().unwrap_or(0).to_string().yellow());
+                if let Some(ts) = data["last_sync"].as_u64() {
+                    println!("  {:<22} {}", "Last sync:".bold(), format_epoch(ts).dimmed());
+                }
+                if let Some(ts) = data["last_check"].as_u64() {
+                    println!("  {:<22} {}", "Last check:".bold(), format_epoch(ts).dimmed());
+                }
+                if let Some(ts) = data["last_verify"].as_u64() {
+                    println!("  {:<22} {}", "Last verify:".bold(), format_epoch(ts).dimmed());
+                }
+            } else {
+                println!("  {} Could not reach hammerd: {}", "✗".red(), resp.message);
+            }
+            println!();
+        }
+
+        "reload" => {
+            let resp = send_request(DaemonRequest::Reload).await?;
+            println!("  {} {}", if resp.ok { "✔" } else { "✗" }, resp.message);
+        }
+
+        "sync" => {
+            let resp = send_request(DaemonRequest::Sync).await?;
+            println!("  {} {}", if resp.ok { "✔" } else { "✗" }, resp.message);
+        }
+
+        "check" => {
+            let resp = send_request(DaemonRequest::Check).await?;
+            println!("  {} {}", if resp.ok { "✔" } else { "✗" }, resp.message);
+        }
+
+        "verify" => {
+            let resp = send_request(DaemonRequest::Verify).await?;
+            println!("  {} {}", if resp.ok { "✔" } else { "✗" }, resp.message);
+        }
+
+        "security-upgrade" | "security" => {
+            let resp = send_request(DaemonRequest::SecurityUpgrade).await?;
+            println!("  {} {}", if resp.ok { "✔" } else { "✗" }, resp.message);
+        }
+
+        "gc" => {
+            let keep: u32 = args.iter()
+                .find(|a| a.starts_with("--keep="))
+                .and_then(|a| a.strip_prefix("--keep="))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(20);
+            let resp = send_request(DaemonRequest::GcGenerations { keep }).await?;
+            println!("  {} {}", if resp.ok { "✔" } else { "✗" }, resp.message);
+        }
+
+        "install-service" => {
+            install_hammerd_service()?;
+            println!("  {} hammerd.service installed and enabled.", "✔".bright_green());
+        }
+
+        other => {
+            anyhow::bail!(
+                "Unknown daemon subcommand: '{}'\n  \
+                 Usage: hammer daemon <start|stop|status|reload|sync|check|verify|gc [--keep=N]|security-upgrade|install-service>",
+                other
+            );
+        }
+    }
+    Ok(())
+}
+
+fn format_epoch(secs: u64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let t = UNIX_EPOCH + Duration::from_secs(secs);
+    let dt: chrono::DateTime<chrono::Local> = t.into();
+    dt.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+// ─────────────────────────────────────────────────────────────
+//  cmd_db — database utilities (validate-json, export, import, recover)
+// ─────────────────────────────────────────────────────────────
+
+pub async fn cmd_db(args: &[String]) -> Result<()> {
+    use owo_colors::OwoColorize;
+    use crate::db::{InstalledDb, JSON_PATH};
+
+    let sub = args.first().map(|s| s.as_str()).unwrap_or("help");
+
+    match sub {
+        "validate-json" | "validate" => {
+            let db = InstalledDb::open()?;
+            println!();
+            println!("  {}  DB Integrity check", "⬡".bright_cyan().bold());
+            println!("  {}", "─".repeat(40).dimmed());
+            match db.validate_json_sync() {
+                Err(e) => {
+                    println!("  {} Could not validate: {}", "✗".red(), e);
+                }
+                Ok((only_sqlite, only_json)) => {
+                    if only_sqlite.is_empty() && only_json.is_empty() {
+                        println!("  {} SQLite and JSON are in sync ({} packages).",
+                            "✔".bright_green(),
+                            db.count().to_string().bold());
+                    } else {
+                        if !only_sqlite.is_empty() {
+                            println!("  {} Only in SQLite ({}):", "⚠".yellow(), only_sqlite.len());
+                            for n in &only_sqlite { println!("       {}", n.yellow()); }
+                        }
+                        if !only_json.is_empty() {
+                            println!("  {} Only in JSON ({}):", "⚠".yellow(), only_json.len());
+                            for n in &only_json { println!("       {}", n.yellow()); }
+                        }
+                        println!();
+                        println!("  Run {} to fix.", "hammer db export-json".cyan());
+                    }
+                }
+            }
+            println!();
+        }
+
+        "export-json" | "export" => {
+            let db = InstalledDb::open()?;
+            db.export_json()?;
+            let n = db.count();
+            println!("  {} Exported {} packages to {}.",
+                "✔".bright_green(), n.to_string().bold(), JSON_PATH.cyan());
+        }
+
+        "import-json" | "import" => {
+            let path = args.get(1).map(|s| s.as_str()).unwrap_or(JSON_PATH);
+            let db = InstalledDb::open()?;
+            let n = db.import_json(path)?;
+            println!("  {} Imported {} packages from {}.",
+                "✔".bright_green(), n.to_string().bold(), path.cyan());
+        }
+
+        "recover" => {
+            let n = InstalledDb::recover_from_json()?;
+            if n == 0 {
+                println!("  {} SQLite is healthy — no recovery needed.", "✔".bright_green());
+            } else {
+                println!("  {} Recovered {} packages from JSON snapshot.",
+                    "✔".bright_green(), n.to_string().bold());
+            }
+        }
+
+        "help" | "--help" | "-h" | _ => {
+            println!();
+            println!("  {}  hammer db — database utilities", "⬡".bright_cyan().bold());
+            println!();
+            println!("  {}  Validate SQLite↔JSON sync", "validate-json".cyan());
+            println!("  {}    Export SQLite → JSON snapshot", "export-json".cyan());
+            println!("  {}    Import JSON snapshot → SQLite", "import-json [path]".cyan());
+            println!("  {}         Recover SQLite from JSON backup", "recover".cyan());
+            println!();
+        }
+    }
     Ok(())
 }
