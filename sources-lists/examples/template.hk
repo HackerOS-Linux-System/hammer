@@ -1,0 +1,53 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! SZABLON — wszystkie dostępne klucze z objaśnieniami
+! Skopiuj i edytuj według potrzeb.
+!
+! Dokumentacja formatu:
+!   https://hackeros-linux-system.github.io/HackerOS-Website/tools-docs/hk.html
+!
+! Klucze (wszystkie za wyjątkiem name, baseurl, suite, components są opcjonalne):
+!
+!   name          Nazwa wyświetlana w hammer i hammer-store
+!   baseurl       URL katalogu głównego repozytorium (bez /dists/)
+!   suite         Nazwa dystrybucji, np. trixie, stable, forky
+!   components    Lista składowych: ["main"], ["main","contrib","non-free"]
+!   arch          Docelowe architektury: ["amd64"], ["amd64","arm64","i386"]
+!                 Pominięcie = arch wykryta automatycznie z dpkg --print-architecture
+!   enabled       true | false  (domyślnie: true)
+!   gpgkey        URL lub ścieżka bezwzględna do klucza GPG (.asc lub .gpg)
+!                 hammer automatycznie importuje klucz przy hammer sync
+!   type          "deb" | "deb-src"  (domyślnie: deb)
+!                 deb-src: pobieranie pakietów źródłowych (hammer source <pkg>)
+!   priority      Liczba całkowita, APT pinning (domyślnie: 500)
+!                 Wyższy numer = wyższy priorytet przy konfliktach wersji
+
+! ── Przykład minimalny ────────────────────────────────────────────────
+[moje-repo]
+-> name       => moje-repo
+-> baseurl    => http://repozytorium.example.com/debian
+-> suite      => trixie
+-> components => ["main"]
+-> enabled    => true
+
+! ── Przykład pełny ───────────────────────────────────────────────────
+[pelny-przyklad]
+-> name       => pelny-przyklad
+-> baseurl    => http://repozytorium.example.com/debian
+-> suite      => trixie
+-> components => ["main", "contrib", "non-free"]
+-> arch       => ["amd64", "arm64"]
+-> enabled    => false
+-> gpgkey     => http://repozytorium.example.com/klucz.asc
+-> type       => deb
+-> priority   => 500
+
+! ── Źródła źródłowe (deb-src) ────────────────────────────────────────
+! Potrzebne do: hammer source firefox  lub  hammer build-dep firefox
+[debian-trixie-src]
+-> name       => debian-trixie-src
+-> baseurl    => http://deb.debian.org/debian
+-> suite      => trixie
+-> components => ["main"]
+-> type       => deb-src
+-> enabled    => false
