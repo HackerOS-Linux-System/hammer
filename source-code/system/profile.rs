@@ -9,13 +9,24 @@ use crate::postinst::PostinstTranslator;
 use crate::store::{StoreEntry, ACTIVE_LINK, PROFILES_DIR};
 
 // ─────────────────────────────────────────────────────────────
-//  Paths
+//  Paths — resolved at runtime for normal-mode compatibility
 // ─────────────────────────────────────────────────────────────
 
+#[cfg(not(feature = "normal-mode"))]
 pub const GENERATIONS_FILE: &str = "/hammer/db/generations.json";
+#[cfg(not(feature = "normal-mode"))]
 pub const PENDING_LINK:     &str = "/hammer/pending";
-pub const BOOT_GEN_FILE:    &str = "/boot/hammer-boot-gen";
+#[cfg(not(feature = "normal-mode"))]
 pub const ACTIVATION_LOG:   &str = "/hammer/db/activation.log";
+
+#[cfg(feature = "normal-mode")]
+pub const GENERATIONS_FILE: &str = "/var/lib/hammer/db/generations.json";
+#[cfg(feature = "normal-mode")]
+pub const PENDING_LINK:     &str = "/var/lib/hammer/pending";
+#[cfg(feature = "normal-mode")]
+pub const ACTIVATION_LOG:   &str = "/var/lib/hammer/db/activation.log";
+
+pub const BOOT_GEN_FILE: &str = "/boot/hammer-boot-gen";
 
 const BIN_SOURCE_DIRS: &[&str] = &[
     "usr/bin", "usr/local/bin", "usr/sbin",
@@ -318,12 +329,41 @@ pub fn run_postinst(pkg_name: &str, script_path: &Path) -> Result<()> {
     let script  = std::fs::read_to_string(script_path)?;
     let trans   = PostinstTranslator::new(pkg_name);
     let actions = trans.translate(&script);
-    let results = trans.execute_all(&actions);
+    let (results, summary) = trans.run(&actions);
+
+    // Log services that were enabled/started
+    if !summary.services_enabled.is_empty() {
+        crate::log::info(&format!(
+            "postinst [{}]: enabled services: {}",
+            pkg_name,
+            summary.services_enabled.join(", ")
+        ));
+    }
+    if !summary.services_started.is_empty() {
+        crate::log::info(&format!(
+            "postinst [{}]: started services: {}",
+            pkg_name,
+            summary.services_started.join(", ")
+        ));
+    }
+    if !summary.conffiles_created.is_empty() {
+        crate::log::info(&format!(
+            "postinst [{}]: created conffiles: {}",
+            pkg_name,
+            summary.conffiles_created.join(", ")
+        ));
+    }
+    if !summary.warnings.is_empty() {
+        for w in &summary.warnings {
+            crate::log::warn(&format!("postinst [{}]: {}", pkg_name, w));
+        }
+    }
+
     let failed: Vec<_> = results.iter()
-    .filter(|r| !r.success && r.action != "skip").collect();
+        .filter(|r| !r.success && r.action != "skip").collect();
     if !failed.is_empty() {
         let msgs: Vec<String> = failed.iter()
-        .map(|r| format!("  {} failed: {}", r.action, r.message)).collect();
+            .map(|r| format!("  {} failed: {}", r.action, r.message)).collect();
         anyhow::bail!("postinst actions failed:\n{}", msgs.join("\n"));
     }
     Ok(())
