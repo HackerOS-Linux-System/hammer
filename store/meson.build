@@ -1,5 +1,5 @@
 project('hammer-store', 'vala', 'c',
-  version: '0.4.0',
+  version: '0.6.0',
   license: 'Apache-2.0',
   meson_version: '>= 0.59',
   default_options: ['warning_level=2']
@@ -13,6 +13,7 @@ deps = [
   dependency('libadwaita-1',   version: '>= 1.4'),
   dependency('glib-2.0',       version: '>= 2.76'),
   dependency('json-glib-1.0',  version: '>= 1.6'),
+  dependency('libsoup-3.0',    version: '>= 3.0', required: false),
 ]
 
 # GResources (icons, UI files)
@@ -34,6 +35,10 @@ sources = files(
 executable('hammer-store',
   [sources, resources],
   dependencies: deps,
+  vala_args: [
+    '--disable-warnings',
+    '--pkg', 'libsoup-3.0',
+  ],
   install: true,
   install_dir: get_option('bindir'),
 )
