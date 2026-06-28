@@ -1,0 +1,60 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! Przykład: Raspberry Pi OS (arm64 + armhf) + oficjalne repo Raspberry Pi
+!
+! Raspberry Pi OS bazuje na Debian Bookworm (≈ trixie w cyklu).
+! Obsługuje arm64 (Pi 4/5, 400) i armhf (Pi 3 i starsze).
+!
+! Użycie:
+!   hammer arch add arm64
+!   hammer arch add armhf
+!   hammer sources --add raspberrypi.hk
+!   hammer sync
+
+! ── Raspberry Pi OS base (arm64) ─────────────────────────────────────
+[raspberrypi-os-arm64]
+-> name       => raspberrypi-os-arm64
+-> baseurl    => http://archive.raspberrypi.com/debian
+-> suite      => bookworm
+-> components => ["main"]
+-> arch       => ["arm64"]
+-> enabled    => true
+-> gpgkey     => https://archive.raspberrypi.com/debian/raspberrypi.gpg.key
+
+! ── Raspberry Pi OS base (armhf) ─────────────────────────────────────
+[raspberrypi-os-armhf]
+-> name       => raspberrypi-os-armhf
+-> baseurl    => http://archive.raspberrypi.com/debian
+-> suite      => bookworm
+-> components => ["main"]
+-> arch       => ["armhf"]
+-> enabled    => false
+-> gpgkey     => https://archive.raspberrypi.com/debian/raspberrypi.gpg.key
+
+! ── Debian Bookworm arm64 (base system) ──────────────────────────────
+[debian-bookworm-arm64]
+-> name       => debian-bookworm-arm64
+-> baseurl    => http://deb.debian.org/debian
+-> suite      => bookworm
+-> components => ["main", "contrib", "non-free", "non-free-firmware"]
+-> arch       => ["arm64"]
+-> enabled    => true
+
+[debian-bookworm-arm64-security]
+-> name       => debian-bookworm-arm64-security
+-> baseurl    => http://security.debian.org/debian-security
+-> suite      => bookworm-security
+-> components => ["main", "contrib", "non-free"]
+-> arch       => ["arm64"]
+-> enabled    => true
+
+! ── Raspberry Pi firmware / GPU userland ──────────────────────────────
+! Paczki: raspberrypi-firmware, libraspberrypi-dev, raspi-config…
+[raspberrypi-firmware]
+-> name       => raspberrypi-firmware
+-> baseurl    => http://archive.raspberrypi.com/debian
+-> suite      => bookworm
+-> components => ["main", "contrib"]
+-> arch       => ["arm64", "armhf"]
+-> enabled    => true
+-> gpgkey     => https://archive.raspberrypi.com/debian/raspberrypi.gpg.key
