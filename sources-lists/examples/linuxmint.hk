@@ -1,0 +1,35 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! Przykład: Linux Mint repozytoria
+!
+! Linux Mint bazuje na Ubuntu LTS. Repozytoria Mint zawierają:
+!   • mintinstall, mintupdate, mintsystem (narzędzia Mint)
+!   • Cinnamon desktop i jego komponenty
+!   • Poprawki i backporty specyficzne dla Mint
+!
+! Mint wymaga też aktywnych repozytoriów Ubuntu (ubuntu-noble-jammy.hk).
+!
+! Wersje:
+!   wilma    → Linux Mint 22 (bazuje na Ubuntu Noble 24.04)
+!   virginia → Linux Mint 21 (bazuje na Ubuntu Jammy 22.04) [LTS do 2027]
+
+! ── Linux Mint 22 "Wilma" ────────────────────────────────────────────
+[linuxmint-wilma]
+-> name       => linuxmint-wilma
+-> baseurl    => http://packages.linuxmint.com
+-> suite      => wilma
+-> components => ["main", "upstream", "import", "backport"]
+-> arch       => ["amd64", "arm64"]
+-> enabled    => true
+-> gpgkey     => https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xA6616109451BBBF2
+
+! ── Linux Mint 21 "Virginia" (LTS) ───────────────────────────────────
+[linuxmint-virginia]
+-> name       => linuxmint-virginia
+-> baseurl    => http://packages.linuxmint.com
+-> suite      => virginia
+-> components => ["main", "upstream", "import", "backport"]
+-> arch       => ["amd64"]
+-> enabled    => false
+-> gpgkey     => https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xA6616109451BBBF2
+-> priority   => 400
