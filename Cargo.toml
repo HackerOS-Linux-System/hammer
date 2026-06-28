@@ -1,6 +1,10 @@
+[workspace]
+members = [".", "libhammer"]
+resolver = "2"
+
 [package]
 name        = "hammer"
-version     = "0.4.0"
+version     = "0.5.0"
 edition     = "2021"
 authors     = ["HackerOS Team <hackeros068@gmail.com>"]
 description = "Atomic Debian package manager — HackerOS"
