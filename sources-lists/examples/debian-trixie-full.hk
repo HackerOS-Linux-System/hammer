@@ -1,0 +1,44 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! Przykład: pełna konfiguracja Debian Trixie
+! Zawiera: main + security + backports + non-free-firmware
+!
+! Użycie:
+!   Skopiuj do /hammer/db/sources-list.hk lub połącz z:
+!   hammer sources --add debian-trixie-full.hk
+!   hammer sync
+
+[debian-trixie]
+-> name       => debian-trixie
+-> baseurl    => http://deb.debian.org/debian
+-> suite      => trixie
+-> components => ["main", "contrib", "non-free", "non-free-firmware"]
+-> arch       => ["amd64"]
+-> enabled    => true
+-> gpgkey     => https://ftp-master.debian.org/keys/archive-key-12.asc
+
+[debian-trixie-security]
+-> name       => debian-trixie-security
+-> baseurl    => http://security.debian.org/debian-security
+-> suite      => trixie-security
+-> components => ["main", "contrib", "non-free", "non-free-firmware"]
+-> arch       => ["amd64"]
+-> enabled    => true
+-> gpgkey     => https://ftp-master.debian.org/keys/archive-key-12-security.asc
+
+[debian-trixie-updates]
+-> name       => debian-trixie-updates
+-> baseurl    => http://deb.debian.org/debian
+-> suite      => trixie-updates
+-> components => ["main", "contrib", "non-free", "non-free-firmware"]
+-> arch       => ["amd64"]
+-> enabled    => true
+
+! Backports — paczki nowsze niż w stable, np. Linux kernel, Mesa
+[debian-trixie-backports]
+-> name       => debian-trixie-backports
+-> baseurl    => http://deb.debian.org/debian
+-> suite      => trixie-backports
+-> components => ["main", "contrib", "non-free", "non-free-firmware"]
+-> arch       => ["amd64"]
+-> enabled    => false
