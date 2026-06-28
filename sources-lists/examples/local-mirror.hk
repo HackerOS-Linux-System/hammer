@@ -1,0 +1,38 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! Przykład: lokalne repozytorium / offline mirror
+! Przydatne w środowiskach bez dostępu do internetu,
+! laboratoriach, CI/CD lub przy lokalnym mirror Debiana.
+!
+! Użycie:
+!   Ustaw LOCAL_REPO_PATH na katalog z plikami Packages.gz
+!   hammer sources --add local-mirror.hk
+!   hammer sync
+
+! ── Lokalny mirror na tym samym hoście ──────────────────────────────
+[local-main]
+-> name       => local-main
+-> baseurl    => file:///srv/apt-mirror/debian
+-> suite      => trixie
+-> components => ["main"]
+-> arch       => ["amd64"]
+-> enabled    => true
+
+! ── Mirror w sieci LAN (np. serwer CI) ──────────────────────────────
+[lan-mirror]
+-> name       => lan-mirror
+-> baseurl    => http://192.168.1.10:8080/debian
+-> suite      => trixie
+-> components => ["main", "contrib"]
+-> arch       => ["amd64"]
+-> enabled    => false
+
+! ── Własne paczki HackerOS (repo-HackerOS/) ─────────────────────────
+! Paczki z katalogu repo-HackerOS/ tego projektu
+[hackeros-local]
+-> name       => hackeros-local
+-> baseurl    => file:///opt/hackeros-repo
+-> suite      => hackeros
+-> components => ["main"]
+-> arch       => ["amd64"]
+-> enabled    => false
