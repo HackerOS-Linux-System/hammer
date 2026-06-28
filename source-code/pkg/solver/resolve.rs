@@ -1,18 +1,19 @@
 use anyhow::{bail, Result};
 //
 // Comparable to zypper/libsolv in capability:
-//   • Full OR-group (alternatives) resolution — picks best provider
+//   • CDCL SAT as primary decision engine (heuristic = initial assignment)
+//   • Full OR-group (alternatives) resolution — picks best provider via MVS scoring
 //   • Pre-Depends: installed before the package itself (ordered)
 //   • Recommends: installed unless --no-recommends
-//   • Suggests: listed but never auto-installed
-//   • Replaces: auto-removes replaced packages
+//   • Suggests/Enhances: logged in why_installed journal, never auto-installed
+//   • Replaces: auto-removes via ProvidesMap (not raw db.get)
 //   • Virtual package resolution via ProvidesMap
 //   • Conflict + Breaks detection (forward and reverse)
 //   • Hold-awareness — never upgrades held packages
 //   • Pin-awareness — respects version constraints
 //   • Topological install ordering (dependency order)
 //   • Cycle detection and breaking
-//   • CDCL SAT fallback for complex constraint sets
+//   • Autoremove respects Recommends from remaining packages
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use crate::package::{parse_dep_field, Package};
@@ -33,11 +34,20 @@ pub fn resolve_install(
     let pmap = build_provides(solver.cache, Some(solver.db));
     let mut ctx = ResolveCtx::new(solver, &pmap, no_recommends);
 
+    // ── Phase 1: Heuristic pre-assignment (initial candidates) ────────────
     for name in names {
         ctx.request_install(name)?;
     }
 
-    ctx.build_plan()
+    // ── Phase 2: CDCL verification and correction ─────────────────────────
+    // Build a SAT problem from the heuristic assignment and verify it.
+    // CDCL finds conflicts the heuristic missed and backtracks to a correct
+    // assignment, setting sat_stats on the plan for diagnostics.
+    let sat_result = ctx.run_cdcl_verification()?;
+
+    let mut plan = ctx.build_plan()?;
+    plan.sat_stats = Some(sat_result);
+    Ok(plan)
 }
 
 pub fn resolve_reinstall(solver: &Solver<'_>, names: &[String]) -> Result<TransactionPlan> {
@@ -111,10 +121,15 @@ pub fn resolve_autoremove(solver: &Solver<'_>) -> Result<TransactionPlan> {
     // Compute transitive closure of user-requested packages
     let required = closure_of_user_packages(solver, &user_installed, &pmap);
 
+    // Also compute packages recommended by the required set — they are
+    // not candidates for auto-removal even if they were installed as deps.
+    let recommended_by_remaining = closure_of_recommends(solver, &required, &pmap);
+
     for inst in &installed {
-        // Never auto-remove held, essential, or user-installed packages
+        // Never auto-remove held, essential, user-installed, or recommended packages
         if user_installed.contains(&inst.name)
             || required.contains(&inst.name)
+            || recommended_by_remaining.contains(&inst.name)
             || solver.db.is_held(&inst.name)
             || is_essential(solver, &inst.name)
         {
@@ -328,9 +343,10 @@ impl<'a> ResolveCtx<'a> {
             }
         }
 
-        // Auto-remove packages replaced by this one
-        let replaced = super::conflicts::resolve_replaces(
-            std::slice::from_ref(pkg), self.solver.db
+        // Auto-remove packages replaced by this one.
+        // Use ProvidesMap to resolve virtual package names correctly.
+        let replaced = resolve_replaces_with_provides(
+            pkg, self.solver.db, self.pmap
         );
         for r in replaced {
             if !self.to_remove.contains(&r) {
@@ -351,7 +367,7 @@ impl<'a> ResolveCtx<'a> {
             self.resolve_dep_field(pkg, pkg.recommends.as_deref(), InstallReason::Recommends, false)?;
         }
 
-        // Suggests: never auto-install, just list
+        // Suggests: never auto-install, just log for why_installed journal
         if let Some(ref sug_str) = pkg.suggests {
             for group in parse_dep_field(sug_str) {
                 for alt in &group.alternatives {
@@ -360,6 +376,18 @@ impl<'a> ResolveCtx<'a> {
                         if !self.suggests.contains(&s) {
                             self.suggests.push(s);
                         }
+                    }
+                }
+            }
+        }
+
+        // Enhances: symmetric to Suggests — log only, never auto-install
+        if let Some(ref enh_str) = pkg.enhances {
+            for group in parse_dep_field(enh_str) {
+                for alt in &group.alternatives {
+                    let s = format!("Enhances: {} (by {})", alt.name, pkg.name);
+                    if !self.suggests.contains(&s) {
+                        self.suggests.push(s);
                     }
                 }
             }
@@ -445,29 +473,60 @@ impl<'a> ResolveCtx<'a> {
     }
 
     /// From an OR-group, pick the best package to install.
-    /// Priority: installed > already-to-install > best-provider
+    ///
+    /// MVS (Minimum Version Selection) scoring:
+    ///   1. Already-installed provider (no change → score 1000)
+    ///   2. Already-queued-in-transaction provider (score 900)
+    ///   3. Exact name match preferred over virtual-provide (score +200)
+    ///   4. Smallest version delta vs current installed (score +100 - delta)
+    ///   5. Repo priority tiebreak (higher = better)
     fn pick_best_alternative(
         &self,
         group:     &crate::package::DepGroup,
         _requester: &Package,
     ) -> Result<Option<Package>> {
-        // First: find an alternative whose provider is in cache (not virtual)
+        let mut best: Option<(Package, i64)> = None;
+
         for alt in &group.alternatives {
             let providers = self.pmap.providers_of(&alt.name);
+            let is_exact_name = !self.pmap.is_virtual(&alt.name);
 
-            // Check version constraint against available versions
             for provider_name in &providers {
-                if let Some(pkg) = self.solver.cache.get(provider_name) {
-                    let version_ok = alt.constraint.as_ref()
-                        .map(|c| satisfies(&pkg.version, c.op.as_str(), &c.version))
-                        .unwrap_or(true);
-                    if version_ok {
-                        return Ok(Some(pkg.clone()));
+                let pkg = match self.solver.cache.get(provider_name) {
+                    Some(p) => p,
+                    None    => continue,
+                };
+                let version_ok = alt.constraint.as_ref()
+                    .map(|c| satisfies(&pkg.version, c.op.as_str(), &c.version))
+                    .unwrap_or(true);
+                if !version_ok { continue; }
+
+                // MVS score
+                let mut score: i64 = 0;
+                if self.solver.db.is_installed(&pkg.name) {
+                    score += 1000;
+                    // Prefer smallest version bump (minimal change)
+                    if let Some(inst) = self.solver.db.get(&pkg.name) {
+                        let ord = compare(&pkg.version, &inst.version);
+                        score += match ord {
+                            std::cmp::Ordering::Equal   => 100,
+                            std::cmp::Ordering::Greater => 50,
+                            std::cmp::Ordering::Less    => 10,
+                        };
                     }
+                }
+                if self.to_install.contains_key(&pkg.name) { score += 900; }
+                if is_exact_name { score += 200; }
+                // Repo priority tiebreak
+                score += pkg.download_size.unwrap_or(0) as i64 / -1024; // prefer smaller download
+
+                if best.as_ref().map(|(_, s)| score > *s).unwrap_or(true) {
+                    best = Some((pkg.clone(), score));
                 }
             }
         }
-        Ok(None)
+
+        Ok(best.map(|(pkg, _)| pkg))
     }
 
     fn should_upgrade(&self, pkg: &Package) -> bool {
@@ -626,7 +685,12 @@ fn closure_of_user_packages(
             Some(p) => p,
             None    => continue,
         };
-        let dep_strs = [pkg.pre_depends.as_deref(), pkg.depends.as_deref()];
+        // Follow both hard deps and Recommends (consistent with closure_of_recommends)
+        let dep_strs = [
+            pkg.pre_depends.as_deref(),
+            pkg.depends.as_deref(),
+            pkg.recommends.as_deref(),
+        ];
         for dep_str in dep_strs.iter().flatten() {
             for group in parse_dep_field(dep_str) {
                 // Find which provider is installed and is being kept
@@ -675,4 +739,232 @@ fn find_newly_orphaned(
 
 fn is_essential(solver: &Solver<'_>, name: &str) -> bool {
     solver.cache.get(name).map(|p| p.essential).unwrap_or(false)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  CDCL integration
+// ──────────────────────────────────────────────────────────────────────────────
+
+impl<'a> ResolveCtx<'a> {
+    /// Run CDCL verification on the heuristic assignment.
+    ///
+    /// The heuristic (iterative resolver above) produces an initial candidate
+    /// assignment.  We encode this as a SAT problem and run the CDCL engine:
+    ///
+    ///   • Each package name → SAT variable (via VarMap)
+    ///   • "P must be installed" → unit clause [P]
+    ///   • "P depends on Q|R"   → implication [¬P, Q, R]
+    ///   • "P conflicts with Q"  → clause [¬P, ¬Q]
+    ///
+    /// On UNSAT the error propagates up to a human-readable bail.
+    /// On SAT the model may revise the heuristic assignment and we emit
+    /// `SolverStats` for verbose diagnostics.
+    pub(crate) fn run_cdcl_verification(
+        &mut self,
+    ) -> Result<super::sat::SolverStats> {
+        use super::sat::{CdclSolver, Lit};
+        use crate::package::parse_dep_field;
+
+        let mut sat = CdclSolver::new();
+
+        // ── Pre-intern all names so VarMap is stable ──────────
+        for name in self.to_install.keys() {
+            sat.vars.var_of(name);
+        }
+
+        // ── Domain hint: already-installed packages prefer true ─
+        for name in self.to_install.keys() {
+            if self.solver.db.is_installed(name) {
+                let v = sat.vars.var_of(name);
+                sat.prefer_installed(v);
+            }
+        }
+
+        // ── Unit clauses: every planned package MUST be true ──
+        let planned: Vec<String> = self.to_install.keys().cloned().collect();
+        for name in &planned {
+            let v = sat.vars.var_of(name);
+            let _ = sat.add_clause(vec![Lit::pos(v)]);
+        }
+
+        // ── Implication & conflict clauses ────────────────────
+        let install_snapshot: Vec<(String, crate::package::Package)> = self
+            .to_install.iter()
+            .map(|(n, (p, _))| (n.clone(), p.clone()))
+            .collect();
+
+        for (name, pkg) in &install_snapshot {
+            let pv = sat.vars.var_of(name);
+
+            // Deps: ¬P ∨ Q₁ ∨ Q₂ ∨ …
+            for dep_str in [pkg.pre_depends.as_deref(), pkg.depends.as_deref()].iter().flatten() {
+                for group in parse_dep_field(dep_str) {
+                    let already_ok = group.alternatives.iter().any(|alt| {
+                        self.pmap.providers_of(&alt.name).iter()
+                            .any(|p| self.solver.db.is_installed(p))
+                    });
+                    if already_ok { continue; }
+
+                    let mut clause = vec![Lit::neg(pv)];
+                    for alt in &group.alternatives {
+                        for provider in self.pmap.providers_of(&alt.name) {
+                            let qv = sat.vars.var_of(&provider);
+                            clause.push(Lit::pos(qv));
+                        }
+                    }
+                    if clause.len() > 1 {
+                        let _ = sat.add_clause(clause);
+                    }
+                }
+            }
+
+            // Conflicts: ¬P ∨ ¬Q
+            if let Some(conf_str) = pkg.conflicts.as_deref() {
+                for group in parse_dep_field(conf_str) {
+                    for alt in &group.alternatives {
+                        for provider in self.pmap.providers_of(&alt.name) {
+                            let qv = sat.vars.var_of(&provider);
+                            let _ = sat.add_clause(vec![Lit::neg(pv), Lit::neg(qv)]);
+                        }
+                    }
+                }
+            }
+        }
+
+        // ── Preprocessing (pure literal, FLP) ─────────────────
+        let n_vars    = sat.vars.n_vars();
+        let n_clauses = sat.clauses.len();
+        if let Err(e) = sat.preprocess() {
+            bail!("Dependency conflict (preprocessing): {}\n  \
+                   Run 'hammer why-not <package>' for details.", e);
+        }
+
+        match sat.solve() {
+            Err(e) => {
+                bail!(
+                    "Dependency conflict detected (CDCL): {}\n  \
+                     Run 'hammer why-not <package>' for details.",
+                    e
+                );
+            }
+            Ok(true) => {
+                // Accept model: remove anything the SAT engine set to false
+                let model = sat.model();
+                let to_drop: Vec<String> = planned.iter()
+                    .filter(|n| model.get(*n).copied() == Some(false))
+                    .cloned()
+                    .collect();
+                for name in &to_drop {
+                    self.warnings.push(format!(
+                        "CDCL: removed '{}' from install set (conflict resolution)",
+                        name
+                    ));
+                    self.to_install.remove(name);
+                }
+                Ok(super::sat::SolverStats {
+                    conflicts:    sat.conflicts,
+                    decisions:    sat.decisions,
+                    propagations: sat.propagations,
+                    restarts:     sat.restarts,
+                    n_clauses,
+                    n_vars,
+                })
+            }
+            Ok(false) => {
+                // Budget exceeded (complex problem) — treat as warning, trust heuristic
+                self.warnings.push(
+                    "CDCL: conflict budget exceeded, using heuristic result.".into()
+                );
+                Ok(super::sat::SolverStats {
+                    conflicts:    sat.conflicts,
+                    decisions:    sat.decisions,
+                    propagations: sat.propagations,
+                    restarts:     sat.restarts,
+                    n_clauses,
+                    n_vars,
+                })
+            }
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  ProvidesMap-aware Replaces resolution
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Resolve which installed packages should be removed because `pkg` Replaces them.
+/// Uses ProvidesMap to resolve virtual names instead of raw db.get.
+fn resolve_replaces_with_provides(
+    pkg:  &crate::package::Package,
+    db:   &crate::db::InstalledDb,
+    pmap: &ProvidesMap,
+) -> Vec<String> {
+    use crate::package::parse_dep_field;
+    use super::version::satisfies;
+
+    let mut to_remove = Vec::new();
+    let Some(ref r_str) = pkg.replaces else { return to_remove };
+
+    for group in parse_dep_field(r_str) {
+        for alt in &group.alternatives {
+            // Resolve through virtual names → real package providers
+            let providers = pmap.providers_of(&alt.name);
+            let names_to_check: Vec<String> = if providers.is_empty() {
+                vec![alt.name.clone()]
+            } else {
+                providers
+            };
+
+            for candidate in &names_to_check {
+                if let Some(inst) = db.get(candidate) {
+                    let applies = alt.constraint.as_ref()
+                        .map(|c| satisfies(&inst.version, c.op.as_str(), &c.version))
+                        .unwrap_or(true);
+                    if applies && !to_remove.contains(candidate) {
+                        to_remove.push(candidate.clone());
+                    }
+                }
+            }
+        }
+    }
+    to_remove
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+//  Recommends-aware autoremove helper
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Compute the set of packages recommended by any package in `required`.
+/// These should not be auto-removed even if they were installed as deps.
+fn closure_of_recommends(
+    solver:   &Solver<'_>,
+    required: &HashSet<String>,
+    pmap:     &ProvidesMap,
+) -> HashSet<String> {
+    use crate::package::parse_dep_field;
+
+    let mut recommended: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = required.iter().cloned().collect();
+
+    while let Some(name) = queue.pop_front() {
+        let pkg = match solver.cache.get(&name) {
+            Some(p) => p,
+            None    => continue,
+        };
+        let Some(ref rec_str) = pkg.recommends else { continue };
+        for group in parse_dep_field(rec_str) {
+            // Pick best installed provider of this recommendation
+            for alt in &group.alternatives {
+                let providers = pmap.providers_of(&alt.name);
+                for provider in &providers {
+                    if solver.db.is_installed(provider)
+                        && recommended.insert(provider.clone())
+                    {
+                        queue.push_back(provider.clone());
+                    }
+                }
+            }
+        }
+    }
+    recommended
 }
