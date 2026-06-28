@@ -134,7 +134,7 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
     if !plan.to_remove.is_empty() {
         for name in &plan.to_remove {
             if let Some(inst) = db.get(name) {
-                db.record_remove(name, &inst.version, gdb.current)
+                db.record_remove_and_sync(name, &inst.version, gdb.current)
                 .with_context(|| format!("Recording removal of {}", name))?;
             }
         }
@@ -157,7 +157,7 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
             InstallReason::Dependency
         };
 
-        db.record_install(pkg, reason, &entry.hash, gen_num)
+        db.record_install_and_sync(pkg, reason, &entry.hash, gen_num)
         .with_context(|| format!("Recording install of {}", entry.name))?;
     }
 
@@ -200,7 +200,35 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
     .collect();
 
     let mut all_entries = existing_entries;
-    all_entries.extend(store_entries);
+    all_entries.extend(store_entries.clone());
+
+    // ── Livepatch analysis ────────────────────────────────────
+    // Determine whether the new packages can be applied live (symlink swap)
+    // or require a reboot. Only check for installs/upgrades, not removals.
+    let live_patch_result: Option<crate::livepatch::PatchAnalysis> = if !store_entries.is_empty() {
+        let store_files = crate::livepatch::collect_files(&store_entries);
+        let analysis    = crate::livepatch::analyse(&store_files);
+
+        if analysis.can_live_patch {
+            println!(
+                "  {}  Live-patch eligible — applying without reboot…",
+                "⚡".bright_yellow().bold()
+            );
+        } else {
+            println!(
+                "  {}  Reboot required after this transaction.",
+                "⚠".yellow().bold()
+            );
+            if !analysis.reboot_reasons.is_empty() {
+                for reason in &analysis.reboot_reasons {
+                    println!("    {} {}", "·".dimmed(), reason.dimmed());
+                }
+            }
+        }
+        Some(analysis)
+    } else {
+        None
+    };
 
     // ── Compose new generation profile ───────────────────────
     println!("  {}  Composing gen-{}…", "⬡".bright_cyan().bold(), gen_num);
@@ -215,13 +243,51 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
     // ── Set pending symlink ───────────────────────────────────
     profile::set_pending(&gen)?;
 
+    // ── Live-patch: apply immediately if eligible ─────────────
+    if let Some(ref analysis) = live_patch_result {
+        if analysis.can_live_patch && !store_entries.is_empty() {
+            let active = PathBuf::from(crate::store::ACTIVE_LINK);
+            match crate::livepatch::apply_live(&store_entries, &active) {
+                Ok(result) => {
+                    // Immediately promote this generation — no reboot needed
+                    gdb.current = gen_num;
+                    gdb.pending = None;
+                    gdb.save()?;
+                    profile::clear_pending()
+                        .unwrap_or_else(|e| log::warn(&format!("clear_pending: {}", e)));
+                    profile::relink_bins(&gen.profile_path())?;
+                    println!(
+                        "  {}  Live patch applied ({} file{} updated) — no reboot needed.",
+                        "✔".bright_green().bold(),
+                        result.updated_files,
+                        if result.updated_files == 1 { "" } else { "s" }
+                    );
+                    log::info(&format!(
+                        "transaction: gen-{} applied live ({} files) — {}",
+                        gen_num, result.updated_files, note
+                    ));
+                }
+                Err(e) => {
+                    log::warn(&format!(
+                        "transaction: live-patch failed ({}), falling back to staged mode", e
+                    ));
+                    println!(
+                        "  {}  Live patch failed — staged as gen-{}, reboot to activate.",
+                        "⚠".yellow().bold(), gen_num
+                    );
+                }
+            }
+        }
+    }
+
     // ── Run sandboxed postinst scripts (live installs) ────────
     // Only for packages that are new (not just upgraded) and have postinst
     for dl in &downloads {
         let is_new = !plan.upgrade_from.contains_key(&dl.package.name);
         if !is_new { continue; }
 
-        let script_path = Path::new("/hammer/db/postinst")
+        let script_path = crate::build_mode::db_dir()
+        .join("postinst")
         .join(format!("{}.postinst", dl.package.name));
         if !script_path.exists() { continue; }
 
@@ -259,9 +325,26 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
         log::warn(&format!("transaction: GRUB update failed: {}", e));
     }
 
-    println!("  {}  Staged as gen-{} — reboot to activate",
-             "✔".bright_green().bold(), gen_num);
-    log::info(&format!("transaction: gen-{} staged — {}", gen_num, note));
+    // ── LRU cache eviction (keep ≤ 2 GiB of .deb files) ──────
+    const CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+    match crate::download::evict_cache_lru(CACHE_MAX_BYTES) {
+        Ok(n) if n > 0 => log::info(&format!(
+            "transaction: evicted {} stale cache file(s)", n)),
+        Ok(_) => {}
+        Err(e) => log::warn(&format!("transaction: cache eviction failed: {}", e)),
+    }
+
+    // Only print "staged" notice if we didn't already apply live
+    let already_live = live_patch_result
+        .as_ref()
+        .map(|a| a.can_live_patch && !store_entries.is_empty())
+        .unwrap_or(false);
+
+    if !already_live {
+        println!("  {}  Staged as gen-{} — reboot to activate",
+                 "✔".bright_green().bold(), gen_num);
+        log::info(&format!("transaction: gen-{} staged — {}", gen_num, note));
+    }
 
     Ok(gen_num)
 }
@@ -271,8 +354,8 @@ pub async fn execute_transaction(ctx: TransactionContext<'_>, note: &str) -> Res
 // ─────────────────────────────────────────────────────────────
 
 fn save_postinst_script(pkg_name: &str, script: &str) -> Result<PathBuf> {
-    let dir  = Path::new("/hammer/db/postinst");
-    std::fs::create_dir_all(dir)?;
+    let dir  = crate::build_mode::db_dir().join("postinst");
+    std::fs::create_dir_all(&dir)?;
     let dest = dir.join(format!("{}.postinst", pkg_name));
     std::fs::write(&dest, script)?;
     Ok(dest)
@@ -314,10 +397,10 @@ pub async fn execute_transaction_normal(ctx: TransactionContext<'_>, note: &str)
             .await.context("Download")?;
 
         // ── Verify signatures ─────────────────────────────────
-        for (pkg, path) in &downloads {
-            if let Err(e) = crate::audit::verify_package_signature(path) {
-                eprintln!("  {} Signature verification failed for {}: {}", "!".red().bold(), pkg.name, e);
-                anyhow::bail!("Aborting: signature verification failed for '{}'", pkg.name);
+        for dl in &downloads {
+            if let Err(e) = crate::audit::verify_package_signature(&dl.path) {
+                eprintln!("  {} Signature verification failed for {}: {}", "!".red().bold(), dl.package.name, e);
+                anyhow::bail!("Aborting: signature verification failed for '{}'", dl.package.name);
             }
         }
 
@@ -325,10 +408,27 @@ pub async fn execute_transaction_normal(ctx: TransactionContext<'_>, note: &str)
         let staging = staging_dir();
         std::fs::create_dir_all(&staging)?;
 
+        // ── Per-package progress bar ──────────────────────────
+        let n_pkgs = downloads.len() as u64;
+        let pb = indicatif::ProgressBar::new(n_pkgs);
+        pb.set_style(
+            indicatif::ProgressStyle::with_template(
+                "  {spinner:.cyan} [{bar:38.cyan/blue}] {pos}/{len} {wide_msg}"
+            )
+            .unwrap()
+            .progress_chars("▰▱▱")
+        );
+        pb.enable_steady_tick(std::time::Duration::from_millis(80));
+
         let sandbox = crate::sandbox::PostinstSandbox::new();
-        for (pkg, deb_path) in downloads {
-            println!("  {} Unpacking {}…", "↓".cyan(), pkg.name.bold());
-            let deb  = DebPackage::read(&deb_path).context("Read .deb")?;
+        for dl in downloads {
+            let pkg      = &dl.package;
+            let deb_path = &dl.path;
+            pb.set_message(format!("Unpacking {}…", pkg.name.bold()));
+            pb.inc(1);
+            let deb_bytes = std::fs::read(deb_path)
+                .with_context(|| format!("Reading {}", deb_path.display()))?;
+            let deb  = DebPackage::parse(&deb_bytes).context("Parse .deb")?;
 
             // prerm for upgrades
             if db.is_installed(&pkg.name) {
@@ -354,27 +454,15 @@ pub async fn execute_transaction_normal(ctx: TransactionContext<'_>, note: &str)
             confdb.register_package_conffiles(&pkg.name, &deb)?;
 
             // Record in DB
-            let entry = crate::db::InstalledPackage {
-                name:              pkg.name.clone(),
-                version:           pkg.version.clone(),
-                architecture:      pkg.architecture.clone().unwrap_or_else(|| "amd64".into()),
-                installed_size_kb: pkg.installed_size_kb.unwrap_or(0),
-                section:           pkg.section.clone(),
-                maintainer:        pkg.maintainer.clone(),
-                description_short: pkg.description.as_ref()
-                                      .and_then(|d| d.lines().next().map(|l| l.to_string())),
-                installed_at:      chrono::Utc::now(),
-                reason:            if ctx.explicit.contains(&pkg.name) {
-                                       crate::db::InstallReason::User
-                                   } else {
-                                       crate::db::InstallReason::Dependency
-                                   },
-                store_hash:        String::new(),  // no store in normal mode
-                depends:           pkg.depends.clone(),
-                recommends:        pkg.recommends.clone(),
+            let reason = if ctx.explicit.contains(&pkg.name) {
+                crate::db::InstallReason::User
+            } else {
+                crate::db::InstallReason::Dependency
             };
-            db.upsert(&entry)?;
+            db.record_install_and_sync(pkg, reason, "", 0)?;
         }
+        pb.finish_and_clear();
+        println!("  {} Installed {} package(s).", "✔".bright_green(), n_pkgs.to_string().bold());
     }
 
     // ── Removals ──────────────────────────────────────────────
