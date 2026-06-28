@@ -36,8 +36,6 @@ impl ConflictKind {
 
 pub fn check_install(candidate: &Package, db: &InstalledDb) -> Vec<ConflictInfo> {
     let mut out = Vec::new();
-
-    // 1. Conflicts: (hard)
     if let Some(ref c_str) = candidate.conflicts {
         for group in parse_dep_field(c_str) {
             for alt in &group.alternatives {
@@ -111,6 +109,9 @@ pub fn check_install(candidate: &Package, db: &InstalledDb) -> Vec<ConflictInfo>
             }
         }
     }
+
+    // 3. Multi-arch conflicts (Conflicts: pkg:arch + Multi-Arch: Same version check)
+    check_multi_arch(candidate, db, &mut out);
 
     out
 }
@@ -261,4 +262,93 @@ pub fn format_conflict_explanation(conflicts: &[ConflictInfo]) -> String {
         }
     }
     lines.join("\n")
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Multi-arch conflict detection hooked into check_install (0.5)
+//
+//  Integrates crate::multi_arch::check_multi_arch_conflicts()
+//  as an additional pass inside check_install so the SAT solver
+//  sees multi-arch violations the same way as Conflicts:/Breaks:.
+// ─────────────────────────────────────────────────────────────
+
+/// Adapter: implement InstalledView for InstalledDb
+struct DbInstalledView<'a>(&'a InstalledDb);
+
+impl<'a> crate::multi_arch::InstalledView for DbInstalledView<'a> {
+    fn installed_arches(&self, name: &str) -> Vec<(String, String)> {
+        // Our DB stores one arch per row; for foreign-arch entries the name is
+        // stored as "pkg:arch" (dpkg multi-arch convention).
+        let native = self.0.get(name);
+        let mut out = Vec::new();
+        if let Some(ref inst) = native {
+            out.push((inst.architecture.clone(), inst.version.clone()));
+        }
+        // Also check "name:i386", "name:arm64" etc.
+        for foreign_arch in ["i386", "arm64", "armhf", "armel", "ppc64el", "s390x"] {
+            let key = format!("{}:{}", name, foreign_arch);
+            if let Some(inst) = self.0.get(&key) {
+                out.push((inst.architecture.clone(), inst.version.clone()));
+            }
+        }
+        out
+    }
+}
+
+/// Run multi-arch conflict check and append results to `out`.
+pub fn check_multi_arch(candidate: &Package, db: &InstalledDb, out: &mut Vec<ConflictInfo>) {
+    let ma_db = crate::multi_arch::MultiArchDb::load();
+
+    // Determine Multi-Arch mode: "all" architecture packages act as Foreign.
+    let ma_mode = if candidate.architecture == "all" {
+        crate::multi_arch::MultiArchMode::Foreign
+    } else {
+        ma_db.get_mode(&candidate.name)
+            .unwrap_or(crate::multi_arch::MultiArchMode::No)
+    };
+
+    // Build conflict list from Conflicts: field (name, optional arch qualifier)
+    let conflicts: Vec<(String, Option<String>)> = candidate.conflicts
+        .as_deref()
+        .map(|s| {
+            crate::package::parse_dep_field(s)
+                .into_iter()
+                .flat_map(|g| g.alternatives)
+                .map(|a| {
+                    if let Some((n, arch)) = a.name.split_once(':') {
+                        (n.to_string(), Some(arch.to_string()))
+                    } else {
+                        (a.name, None)
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let view = DbInstalledView(db);
+    let ma_conflicts = crate::multi_arch::check_multi_arch_conflicts(
+        &candidate.name,
+        &candidate.architecture,
+        &candidate.version,
+        &ma_mode,
+        &conflicts,
+        &view,
+    );
+
+    for c in ma_conflicts {
+        // Only report if the conflicting arch is actually enabled
+        let arch_ok = c.conflicting_arch.as_deref()
+            .map(|a| ma_db.supports_arch(a))
+            .unwrap_or(true);
+        if !arch_ok { continue; }
+
+        out.push(ConflictInfo {
+            message:  crate::multi_arch::format_conflicts(std::slice::from_ref(&c)),
+            kind:     ConflictKind::Conflicts,
+            pkg_name: c.requirer.clone(),
+            with:     c.conflicting.clone(),
+            hard:     true,
+            detail:   c.conflicting_arch.map(|a| format!("Architecture: {}", a)),
+        });
+    }
 }
