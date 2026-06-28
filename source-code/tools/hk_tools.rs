@@ -50,7 +50,7 @@ pub struct HkToolSpec {
 
 impl HkToolSpec {
     pub fn load(path: &Path) -> Result<Self> {
-        let mut config = load_hk_file(path.to_str().unwrap_or(""))
+        let mut config = load_hk_file_full(path)
         .with_context(|| format!("Parsing {}", path.display()))?;
         resolve_interpolations(&mut config)
         .with_context(|| format!("Resolving interpolations in {}", path.display()))?;
@@ -455,4 +455,433 @@ fn extract_json_string(json: &str, key: &str) -> Option<String> {
 
 fn normalize_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Multiline .hk preprocessor (0.6)
+//
+//  The `hk-parser` crate parses single-line values like:
+//    components => ["main", "contrib"]
+//
+//  But real files often span multiple lines:
+//    components => ["main",
+//                   "contrib",
+//                   "non-free"]
+//
+//  AND use line-continuation with trailing backslash:
+//    description => This is a very \
+//                   long description
+//
+//  This preprocessor normalises the file to single-line values
+//  before handing it to `hk_parser::load_hk_file`.
+//  It writes a temp file, returns its path.
+// ─────────────────────────────────────────────────────────────
+
+use std::io::Write;
+
+/// Join multiline array literals and backslash-continued lines.
+/// Returns the normalised source as a String.
+pub fn preprocess_hk_source(source: &str) -> String {
+    let mut out  = String::with_capacity(source.len());
+    let mut buf  = String::new();
+    let mut depth = 0i32;       // bracket nesting depth
+    let mut in_continuation = false;
+
+    for raw_line in source.lines() {
+        let line = raw_line.trim_end();
+
+        // Line continuation with trailing backslash
+        if in_continuation {
+            buf.push(' ');
+            if line.ends_with('\\') {
+                buf.push_str(line.trim_start().trim_end_matches('\\'));
+                // stay in continuation
+            } else {
+                buf.push_str(line.trim_start());
+                in_continuation = false;
+                depth = 0;
+                out.push_str(&buf);
+                out.push('\n');
+                buf.clear();
+            }
+            continue;
+        }
+
+        // Count bracket depth changes in this line
+        for ch in line.chars() {
+            match ch {
+                '[' | '(' => depth += 1,
+                ']' | ')' => { depth -= 1; if depth < 0 { depth = 0; } }
+                _ => {}
+            }
+        }
+
+        // Trailing backslash continuation (non-array)
+        if depth == 0 && line.ends_with('\\') {
+            buf.push_str(line.trim_end_matches('\\'));
+            in_continuation = true;
+            continue;
+        }
+
+        if depth > 0 {
+            // We're inside an unclosed bracket — accumulate
+            buf.push_str(line.trim_start());
+            buf.push(' ');
+        } else {
+            // Bracket closed (depth <= 0) or never opened
+            if !buf.is_empty() {
+                buf.push_str(line.trim_start());
+                out.push_str(&buf);
+                out.push('\n');
+                buf.clear();
+                depth = 0;
+            } else {
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+
+    // Flush any remaining buffer (file ended inside brackets)
+    if !buf.is_empty() {
+        out.push_str(&buf);
+        out.push('\n');
+    }
+
+    out
+}
+
+/// Write preprocessed source to a temp file and return its path.
+/// Caller is responsible for deleting the file.
+pub fn write_preprocessed_hk(source: &str, suffix: &str) -> Result<std::path::PathBuf> {
+    let normalised = preprocess_hk_source(source);
+    let tmp_path = std::env::temp_dir().join(format!("hammer_hk_{}.hk", suffix));
+    let mut f = std::fs::File::create(&tmp_path)?;
+    f.write_all(normalised.as_bytes())?;
+    Ok(tmp_path)
+}
+
+/// Drop-in for `hk_parser::load_hk_file` with multiline support.
+pub fn load_hk_file_multiline(
+    path: &Path
+) -> Result<indexmap::IndexMap<String, hk_parser::HkValue>> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("Reading {}", path.display()))?;
+    let normalised = preprocess_hk_source(&source);
+    let tmp = write_preprocessed_hk(&normalised, &path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "tmp".to_string()))?;
+    let result = load_hk_file(tmp.to_str().unwrap_or(""))
+        .with_context(|| format!("Parsing (preprocessed) {}", path.display()))?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(result)
+}
+
+#[cfg(test)]
+mod multiline_tests {
+    use super::*;
+
+    #[test]
+    fn test_single_line_unchanged() {
+        let src = "components => [\"main\", \"contrib\"]\n";
+        assert_eq!(preprocess_hk_source(src), src);
+    }
+
+    #[test]
+    fn test_multiline_array() {
+        let src = "components => [\"main\",\n               \"contrib\",\n               \"non-free\"]\n";
+        let out = preprocess_hk_source(src);
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("non-free"));
+    }
+
+    #[test]
+    fn test_backslash_continuation() {
+        let src = "description => very long \\\n              value here\n";
+        let out = preprocess_hk_source(src);
+        assert_eq!(out.lines().count(), 1);
+        assert!(out.contains("value here"));
+    }
+
+    #[test]
+    fn test_comments_preserved() {
+        let src = "! comment line\nname => hello\n";
+        let out = preprocess_hk_source(src);
+        assert!(out.contains("! comment line"));
+        assert!(out.contains("name => hello"));
+    }
+
+    #[test]
+    fn test_nested_brackets() {
+        let src = "opts => {\"a\": [1,\n2,\n3]}\n";
+        let out = preprocess_hk_source(src);
+        assert_eq!(out.lines().filter(|l| !l.trim().is_empty()).count(), 1);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  .hk schema validation (0.5)
+//
+//  Every .hk file for a tool spec is validated against the
+//  HkToolSchema: required keys must be present and non-empty,
+//  unknown keys produce a warning (never a hard error so that
+//  future keys don't break older hammer versions).
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug)]
+pub struct SchemaError {
+    pub file:    std::path::PathBuf,
+    pub errors:  Vec<String>,
+    pub warnings: Vec<String>,
+}
+
+impl std::fmt::Display for SchemaError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Schema errors in {}:\n{}", self.file.display(),
+               self.errors.iter()
+                   .map(|e| format!("  ERROR: {}", e))
+                   .chain(self.warnings.iter().map(|w| format!("  WARN:  {}", w)))
+                   .collect::<Vec<_>>().join("\n"))
+    }
+}
+
+/// Known keys for a tool .hk file (used for unknown-key warnings).
+const KNOWN_TOOL_KEYS: &[&str] = &[
+    "name", "description", "github_repo", "releases_url",
+    "binary", "binary_glob", "hidden", "is_gui", "desktop_file",
+    "default_install_dir", "verify_sha256", "post_install",
+    "pre_install", "depends_on",
+];
+
+/// Known keys for a sources-list .hk entry.
+const KNOWN_SOURCES_KEYS: &[&str] = &[
+    "name", "baseurl", "suite", "components", "arch", "enabled",
+    "gpgkey", "type", "priority",
+];
+
+/// Required keys for a tool .hk file.
+const REQUIRED_TOOL_KEYS: &[&str] = &["name", "github_repo"];
+
+/// Required keys per source entry.
+const REQUIRED_SOURCES_KEYS: &[&str] = &["name", "baseurl", "suite", "components"];
+
+/// Validate a tool .hk file. Returns Ok if no hard errors, Err otherwise.
+pub fn validate_tool_hk(path: &Path) -> Result<SchemaError> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("Reading {}", path.display()))?;
+    let normalised = preprocess_hk_source(&source);
+    let tmp = write_preprocessed_hk(&normalised, "validate")?;
+    let config = load_hk_file(tmp.to_str().unwrap_or(""))
+        .with_context(|| "Parsing .hk")?;
+    let _ = std::fs::remove_file(&tmp);
+
+    let mut errors   = Vec::new();
+    let mut warnings = Vec::new();
+    let keys: Vec<&str> = config.keys().map(String::as_str).collect();
+
+    for req in REQUIRED_TOOL_KEYS {
+        let missing = match config.get(*req) {
+            None => true,
+            Some(v) => match v {
+                hk_parser::HkValue::String(s) => s.trim().is_empty(),
+                _ => false,
+            },
+        };
+        if missing {
+            errors.push(format!("Missing required key: '{}'", req));
+        }
+    }
+
+    for key in &keys {
+        if !KNOWN_TOOL_KEYS.contains(key) {
+            warnings.push(format!("Unknown key '{}' (will be ignored)", key));
+        }
+    }
+
+    Ok(SchemaError { file: path.to_path_buf(), errors, warnings })
+}
+
+/// Validate a sources-list .hk file (may contain multiple sections).
+pub fn validate_sources_hk(path: &Path) -> Result<SchemaError> {
+    let source = std::fs::read_to_string(path)
+        .with_context(|| format!("Reading {}", path.display()))?;
+
+    let mut errors   = Vec::new();
+    let mut warnings = Vec::new();
+    let mut current_section: Option<String> = None;
+    let mut section_keys: std::collections::HashSet<String> = Default::default();
+
+    let flush = |section: &str,
+                 keys: &std::collections::HashSet<String>,
+                 errors: &mut Vec<String>,
+                 warnings: &mut Vec<String>| {
+        for req in REQUIRED_SOURCES_KEYS {
+            if !keys.contains(*req) {
+                errors.push(format!("[{}] missing required key '{}'", section, req));
+            }
+        }
+        for key in keys {
+            if !KNOWN_SOURCES_KEYS.contains(&key.as_str()) {
+                warnings.push(format!("[{}] unknown key '{}' (ignored)", section, key));
+            }
+        }
+    };
+
+    for raw in source.lines() {
+        let line = raw.trim();
+        if line.starts_with('!') || line.is_empty() { continue; }
+        if line.starts_with('[') && line.ends_with(']') {
+            if let Some(ref sec) = current_section.clone() {
+                flush(sec, &section_keys, &mut errors, &mut warnings);
+            }
+            current_section = Some(line[1..line.len()-1].to_string());
+            section_keys.clear();
+            continue;
+        }
+        if line.contains("=>") {
+            let key = line.split("=>").next().unwrap_or("").trim()
+                .trim_start_matches("->").trim().to_string();
+            section_keys.insert(key);
+        }
+    }
+    if let Some(ref sec) = current_section {
+        flush(sec, &section_keys, &mut errors, &mut warnings);
+    }
+
+    Ok(SchemaError { file: path.to_path_buf(), errors, warnings })
+}
+
+/// Hammer CLI: `hammer hk validate <file.hk>`
+pub fn cmd_validate_hk(args: &[String]) -> anyhow::Result<()> {
+    use owo_colors::OwoColorize;
+    let path_str = args.first()
+        .ok_or_else(|| anyhow::anyhow!("Usage: hammer hk validate <file.hk>"))?;
+    let path = Path::new(path_str);
+
+    // Detect file type by content (look for section headers → sources-list)
+    let source = std::fs::read_to_string(path)?;
+    let result = if source.lines().any(|l| l.trim().starts_with("->")) {
+        validate_sources_hk(path)?
+    } else {
+        validate_tool_hk(path)?
+    };
+
+    if result.errors.is_empty() && result.warnings.is_empty() {
+        println!("  {}  {} — valid", "✔".bright_green().bold(), path.display());
+        return Ok(());
+    }
+
+    for w in &result.warnings {
+        println!("  {}  {}", "⚠".yellow(), w.yellow());
+    }
+    for e in &result.errors {
+        println!("  {}  {}", "✗".red().bold(), e.red());
+    }
+    if !result.errors.is_empty() {
+        anyhow::bail!("Schema validation failed for {}", path.display());
+    }
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  !include support for .hk files (0.5)
+//
+//  Allows composable configs:
+//    !include base.hk
+//    !include ../common/gpg.hk
+//
+//  Includes are relative to the including file.
+//  Circular include detection via a visited set.
+// ─────────────────────────────────────────────────────────────
+
+/// Resolve all `!include` directives recursively and return merged source.
+pub fn resolve_includes(path: &Path) -> anyhow::Result<String> {
+    let mut visited = std::collections::HashSet::new();
+    resolve_includes_inner(path, &mut visited)
+}
+
+fn resolve_includes_inner(
+    path:    &Path,
+    visited: &mut std::collections::HashSet<std::path::PathBuf>,
+) -> anyhow::Result<String> {
+    let canonical = path.canonicalize()
+        .with_context(|| format!("Resolving path {}", path.display()))?;
+
+    if visited.contains(&canonical) {
+        anyhow::bail!("Circular !include detected: {}", canonical.display());
+    }
+    visited.insert(canonical.clone());
+
+    let dir    = canonical.parent().unwrap_or(Path::new("."));
+    let source = std::fs::read_to_string(&canonical)
+        .with_context(|| format!("Reading {}", canonical.display()))?;
+
+    let mut out = String::with_capacity(source.len());
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("!include ") {
+            let include_path = dir.join(rest.trim());
+            let included = resolve_includes_inner(&include_path, visited)
+                .with_context(|| format!("In !include from {}", canonical.display()))?;
+            out.push_str(&included);
+            out.push('\n');
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    visited.remove(&canonical);
+    Ok(out)
+}
+
+/// Load a .hk file with both !include resolution AND multiline preprocessing.
+pub fn load_hk_file_full(path: &Path) -> anyhow::Result<indexmap::IndexMap<String, hk_parser::HkValue>> {
+    let source    = resolve_includes(path)?;
+    let normalised = preprocess_hk_source(&source);
+    let tmp = write_preprocessed_hk(&normalised, "full")?;
+    let result = load_hk_file(tmp.to_str().unwrap_or(""))
+        .with_context(|| format!("Parsing (full) {}", path.display()))?;
+    let _ = std::fs::remove_file(&tmp);
+    Ok(result)
+}
+
+#[cfg(test)]
+mod include_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_no_includes() {
+        let src = "name => hello\nversion => 1.0\n";
+        let tmp = std::env::temp_dir().join("test_no_include.hk");
+        let mut f = std::fs::File::create(&tmp).unwrap();
+        f.write_all(src.as_bytes()).unwrap();
+        let out = resolve_includes(&tmp).unwrap();
+        assert!(out.contains("name => hello"));
+        std::fs::remove_file(tmp).ok();
+    }
+
+    #[test]
+    fn test_include_resolves() {
+        let dir = std::env::temp_dir();
+        let base = dir.join("base_inc.hk");
+        let main = dir.join("main_inc.hk");
+        std::fs::write(&base, "base_key => base_value\n").unwrap();
+        std::fs::write(&main, "!include base_inc.hk\nname => main\n").unwrap();
+        let out = resolve_includes(&main).unwrap();
+        assert!(out.contains("base_key => base_value"));
+        assert!(out.contains("name => main"));
+        std::fs::remove_file(base).ok();
+        std::fs::remove_file(main).ok();
+    }
+
+    #[test]
+    fn test_validate_tool_missing_required() {
+        let tmp = std::env::temp_dir().join("test_schema.hk");
+        std::fs::write(&tmp, "description => Something\n").unwrap();
+        let res = validate_tool_hk(&tmp).unwrap();
+        assert!(res.errors.iter().any(|e| e.contains("name")));
+        std::fs::remove_file(tmp).ok();
+    }
 }
