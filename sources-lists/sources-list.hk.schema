@@ -1,0 +1,40 @@
+! sources-list.hk.schema — definicja dozwolonych kluczy formatu .hk
+! ─────────────────────────────────────────────────────────────────────
+! Ten plik jest odczytywany przez:
+!   hammer hk validate <plik.hk>
+!
+! Format sekcji schema:
+!   [<nazwa-sekcji>]
+!   -> key    => <typ>  ! <opis>
+!   -> key?   => <typ>  ! klucz opcjonalny (znak ? na końcu nazwy)
+!
+! Typy: string | bool | string-list | int | url | path
+
+! ── Schemat wpisu sources-list ───────────────────────────────────────
+[sources-entry-schema]
+-> name        => string       ! Nazwa źródła (wymagane)
+-> baseurl     => url          ! URL bazowy repozytorium (wymagane)
+-> suite       => string       ! Nazwa suite, np. trixie, noble (wymagane)
+-> components  => string-list  ! Lista składowych, np. ["main", "contrib"] (wymagane)
+-> arch?       => string-list  ! Docelowe architektury, np. ["amd64", "arm64"]
+-> enabled?    => bool         ! Czy źródło aktywne (domyślnie: true)
+-> gpgkey?     => url          ! URL lub ścieżka do klucza GPG
+-> type?       => string       ! "deb" lub "deb-src" (domyślnie: deb)
+-> priority?   => int          ! Priorytet APT pinning (domyślnie: 500)
+
+! ── Schemat pliku narzędzia .hk ──────────────────────────────────────
+[hk-tool-schema]
+-> name           => string   ! Nazwa narzędzia (wymagane)
+-> github_repo    => string   ! user/repo na GitHub (wymagane, np. "BurntSushi/ripgrep")
+-> description?   => string   ! Krótki opis
+-> releases_url?  => url      ! Alternatywny URL do releases (jeśli nie GitHub)
+-> binary?        => string   ! Nazwa binarki w archiwum (jeśli inna niż name)
+-> binary_glob?   => string   ! Glob do znalezienia binarki, np. "*/rg"
+-> hidden?        => bool     ! Ukryj w `hammer tools list` (domyślnie: false)
+-> is_gui?        => bool     ! Czy aplikacja GUI (domyślnie: false)
+-> desktop_file?  => string   ! Nazwa pliku .desktop do stworzenia
+-> default_install_dir? => path ! Katalog instalacji (domyślnie: /usr/local/bin)
+-> verify_sha256? => bool     ! Weryfikuj SHA256 po pobraniu (domyślnie: true)
+-> post_install?  => string   ! Polecenie do uruchomienia po instalacji
+-> pre_install?   => string   ! Polecenie do uruchomienia przed instalacją
+-> depends_on?    => string-list ! Inne narzędzia hk wymagane przed instalacją
