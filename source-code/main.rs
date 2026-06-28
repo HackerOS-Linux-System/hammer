@@ -12,12 +12,16 @@
 #[path = "pkg/pins.rs"]            mod pins;
 #[path = "pkg/query.rs"]           mod query;
 #[path = "pkg/store_integrity.rs"] mod store_integrity;
+// ── 0.5: nowe moduły ──────────────────────────────────────────
+#[path = "pkg/file_index.rs"]      mod file_index;
+#[path = "pkg/size.rs"]            mod size;
+#[path = "pkg/undo.rs"]            mod undo;
 
 // ── system/ ───────────────────────────────────────────────────
 #[path = "system/gpg.rs"]          mod gpg;
 #[path = "system/gpg_verify.rs"]   mod gpg_verify;
 #[path = "system/grub.rs"]         mod grub;
-#[path = "system/immuntable.rs"]   mod immutable;
+#[path = "system/immutable.rs"]    mod immutable;
 #[path = "system/livepatch.rs"]    mod livepatch;
 #[path = "system/postinst.rs"]     mod postinst;
 #[path = "system/profile.rs"]      mod profile;
@@ -46,12 +50,20 @@
 #[path = "ui/download.rs"]         mod download;
 #[path = "ui/ui.rs"]               mod ui;
 #[path = "ui/json_output.rs"]      mod json_output;
+// ── 0.5: install summary ──────────────────────────────────────
+#[path = "ui/install_summary.rs"]  mod install_summary;
 
 // ── cli/ ──────────────────────────────────────────────────────
 #[path = "cli/types.rs"]           mod cli_types;
 #[path = "cli/pkg.rs"]             mod cli_pkg;
 #[path = "cli/sys.rs"]             mod cli_sys;
 #[path = "cli/cli.rs"]             mod cli;
+
+// ── hammerd/ (daemon modules) ─────────────────────────────────
+// Loaded via hammerd.rs which re-exports all submodules.
+// This avoids the double-path bug with inline mod + #[path].
+#[path = "hammerd.rs"]
+mod hammerd;
 
 // ── top-level ─────────────────────────────────────────────────
 mod repo;
