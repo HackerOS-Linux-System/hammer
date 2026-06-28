@@ -1,0 +1,55 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! Przykład: Ubuntu Launchpad PPA (Personal Package Archive)
+!
+! PPA to repozytoria tworzone przez społeczność na Launchpad.
+! Wymagają klucza GPG z serwera kluczy Ubuntu Keyserver.
+!
+! UWAGA: PPA nie są oficjalnie weryfikowane przez Ubuntu ani HackerOS.
+!        Używaj tylko z zaufanych źródeł.
+!
+! Jak znaleźć gpgkey dla PPA:
+!   Otwórz https://launchpad.net/~<user>/+archive/ubuntu/<ppaname>
+!   Kliknij "Technical details" → skopiuj fingerprint
+!   URL klucza: https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x<fingerprint>
+
+! ── Neovim stable PPA (neovim-ppa/stable) ───────────────────────────
+[ppa-neovim-stable]
+-> name       => ppa-neovim-stable
+-> baseurl    => https://ppa.launchpadcontent.net/neovim-ppa/stable/ubuntu
+-> suite      => noble
+-> components => ["main"]
+-> arch       => ["amd64", "arm64"]
+-> enabled    => true
+-> gpgkey     => https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x9DBB0BE9366964F134855E2255F96FCF8231B6DD
+
+! ── git-core PPA (najnowszy git) ─────────────────────────────────────
+[ppa-git-core]
+-> name       => ppa-git-core
+-> baseurl    => https://ppa.launchpadcontent.net/git-core/ppa/ubuntu
+-> suite      => noble
+-> components => ["main"]
+-> arch       => ["amd64", "arm64"]
+-> enabled    => false
+-> gpgkey     => https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xE1DD270288B4E6030699E45FA1715D88E1DF1F24
+
+! ── deadsnakes PPA (Python 3.12, 3.13…) ──────────────────────────────
+[ppa-deadsnakes]
+-> name       => ppa-deadsnakes
+-> baseurl    => https://ppa.launchpadcontent.net/deadsnakes/ppa/ubuntu
+-> suite      => noble
+-> components => ["main"]
+-> arch       => ["amd64", "arm64"]
+-> enabled    => false
+-> gpgkey     => https://keyserver.ubuntu.com/pks/lookup?op=get&search=0xF23C5A6CF475977595C89F51BA6932366A755776
+
+! ── SZABLON: Własne PPA ──────────────────────────────────────────────
+! Skopiuj i dostosuj poniższy blok dla swojego PPA:
+! [moje-ppa]
+! -> name    => moje-ppa
+! -> baseurl => https://ppa.launchpadcontent.net/<launchpad-user>/<ppa-name>/ubuntu
+! -> suite   => noble
+! -> components => ["main"]
+! -> arch    => ["amd64"]
+! -> enabled => false
+! -> gpgkey  => https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x<FINGERPRINT>
