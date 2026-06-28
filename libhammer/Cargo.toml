@@ -1,1 +1,58 @@
+[package]
+name        = "libhammer"
+version     = "0.5.0"
+edition     = "2021"
+authors     = ["HackerOS Team <hackeros068@gmail.com>"]
+description = "Library crate for Hammer — Debian package management primitives"
+license     = "Apache-2.0"
+repository  = "https://github.com/HackerOS-Linux-System/hammer"
+homepage    = "https://github.com/HackerOS-Linux-System/hammer"
+documentation = "https://docs.rs/libhammer"
+keywords    = ["package-manager", "debian", "deb", "apt", "dependency-solver"]
+categories  = ["os", "parser-implementations", "algorithms"]
+readme      = "README.md"
+exclude     = ["tests/fixtures/large_*"]
 
+# ── Feature flags ─────────────────────────────────────────────
+#
+#   default  — types + version + dep parser + sat solver (no I/O)
+#   db       — SQLite installed-packages database (adds rusqlite)
+#   fetch    — async HTTP fetching of package indexes (adds reqwest)
+#   full     — everything
+
+[features]
+default = []
+db      = ["dep:rusqlite", "dep:chrono"]
+fetch   = ["dep:reqwest", "dep:tokio"]
+full    = ["db", "fetch"]
+
+# ── Dependencies ───────────────────────────────────────────────
+
+[dependencies]
+anyhow       = "1"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+sha2         = "0.10"
+hex          = "0.4"
+tar          = "0.4"
+flate2       = "1"
+xz2          = "0.1"
+bzip2        = "0.4"
+zstd         = "0.13"
+indexmap     = { version = "2", features = ["serde"] }
+
+# optional — only pulled in with `db` or `fetch` feature
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
+chrono   = { version = "0.4",  features = ["serde"],  optional = true }
+reqwest  = { version = "0.11", default-features = false,
+             features = ["json", "gzip", "stream", "rustls-tls"],
+             optional = true }
+tokio    = { version = "1",    features = ["full"],    optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+tokio    = { version = "1", features = ["full"] }
+
+# ── Build script (publish helper) ─────────────────────────────
+# Run  `cargo build --features full`     to build the full library.
+# Run  `cargo publish --features full`   to publish to crates.io.
