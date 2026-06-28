@@ -78,9 +78,22 @@ pub async fn run(mut args: Vec<String>) -> Result<()> {
         "build-dep" => crate::build_dep::cmd_build_dep(&rest).await,
         "download"  => pkg::cmd_download(&rest).await,
 
+        // ── .hk file tools ───────────────────────────────────
+        "hk" => {
+            let sub2  = rest.first().map(|s| s.as_str()).unwrap_or("help").to_string();
+            let rest2 = rest.get(1..).map(|s| s.to_vec()).unwrap_or_default();
+            match sub2.as_str() {
+                "validate" => crate::hk_tools::cmd_validate_hk(&rest2),
+                _ => {
+                    eprintln!("  Unknown hk subcommand '{}'. Available: validate", sub2);
+                    Ok(())
+                }
+            }
+        }
+
         // ── Status ────────────────────────────────────────────
         "status"  | "st" => sys::cmd_status(),
-        "history" | "hi" => sys::cmd_history(),
+        "history" | "hi" => sys::cmd_history(&rest),
 
         // ── Generations (atomic only) ─────────────────────────
         "gen" => {
@@ -89,10 +102,19 @@ pub async fn run(mut args: Vec<String>) -> Result<()> {
         }
         "rollback" | "rb" => {
             build_mode::require_atomic("hammer rollback")?;
-            sys::cmd_rollback()
+            sys::cmd_rollback(&rest)
         }
         "diff"    => sys::cmd_diff(&rest),
         "pending" => sys::cmd_pending(&rest),
+
+        // ── Query v0.5 ────────────────────────────────────────
+        "what"     => crate::file_index::cmd_what(&rest),
+        "what-rebuild" => crate::file_index::cmd_what_rebuild(),
+        "size"     => crate::size::cmd_size(&rest),
+        "undo"     => crate::undo::cmd_undo(&rest),
+        "show-deps" => crate::query::cmd_show_deps(&rest),
+        "owns"     => crate::query::cmd_owns(&rest),
+        "stats"    => crate::query::cmd_stats(),
 
         // ── Diagnostics ───────────────────────────────────────
         "verify"   => sys::cmd_verify(&rest),
@@ -150,6 +172,12 @@ pub async fn run(mut args: Vec<String>) -> Result<()> {
         "completion" => crate::completion::cmd_completion(&rest),
         "boot"       => sys::cmd_boot(&rest),
 
+        // ── Daemon ────────────────────────────────────────────
+        "daemon" => sys::cmd_daemon(&rest).await,
+
+        // ── Database ──────────────────────────────────────────
+        "db" => sys::cmd_db(&rest).await,
+
         other => {
             eprintln!("  {} Unknown command: '{}'. Try {}.",
                       "!".red().bold(), other, "hammer help".cyan());
@@ -204,6 +232,14 @@ fn print_help() {
     println!("    {}    [--installed|--available|--upgradable]", "list".cyan());
     println!("    {} depends  rdepends  files  which  policy  changelog", "".cyan());
     println!();
+    println!("  {}", "Query v0.5 (nowe):".bold());
+    println!("    {}   <ścieżka>          — która paczka dostarcza ten plik", "what".cyan());
+    println!("    {}    <pkg…>            — rozmiar na dysku paczek", "size".cyan());
+    println!("    {}     [--yes]          — cofnij ostatnią operację", "undo".cyan());
+    println!("    {}  <pkg>        — wizualizacja drzewa zależności", "show-deps".cyan());
+    println!("    {}    <ścieżka>         — kto posiada plik (szybka, przez indeks)", "owns".cyan());
+    println!("    {}   what-rebuild      — przebuduj indeks plik→paczka", "".cyan());
+    println!();
     println!("  {}", "Pinning & holds:".bold());
     println!("    {} pin  unpin  hold  unhold  mark", "".cyan());
     println!();
@@ -228,6 +264,12 @@ fn print_help() {
     println!();
     println!("  {}", "Maintenance:".bold());
     println!("    {} gc  clean  init  relink  store  completion  boot", "".cyan());
+    println!();
+    println!("  {}", "Daemon:".bold());
+    println!("    {}  start|stop|status|reload|sync|check|verify|gc [--keep=N]", "daemon".cyan());
+    println!();
+    println!("  {}", "Database:".bold());
+    println!("    {}  validate-json|export-json|import-json|recover", "db".cyan());
     println!();
     println!("  {}", "User packages (no root):".bold());
     println!("    {}  install|remove|list|status|init", "--user".yellow());
