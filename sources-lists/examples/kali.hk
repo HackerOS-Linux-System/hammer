@@ -1,0 +1,43 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! Przykład: Kali Linux repozytoria
+!
+! UWAGA: Kali Linux jest dystrybucją specjalizowaną do testów penetracyjnych.
+! Mieszanie Kali z Debian/HackerOS może powodować konflikty zależności.
+! Zalecane użycie: tylko w izolowanym środowisku (VM, chroot, container).
+!
+! Użycie:
+!   hammer sources --add kali.hk
+!   hammer sync
+
+! ── Kali Rolling (główne repozytorium) ───────────────────────────────
+[kali-rolling]
+-> name       => kali-rolling
+-> baseurl    => http://http.kali.org/kali
+-> suite      => kali-rolling
+-> components => ["main", "contrib", "non-free"]
+-> arch       => ["amd64", "arm64", "armhf"]
+-> enabled    => true
+-> gpgkey     => https://archive.kali.org/archive-key.asc
+-> priority   => 400
+
+! ── Kali Security ────────────────────────────────────────────────────
+[kali-security]
+-> name       => kali-security
+-> baseurl    => http://http.kali.org/kali
+-> suite      => kali-rolling/updates
+-> components => ["main", "contrib", "non-free"]
+-> arch       => ["amd64", "arm64"]
+-> enabled    => true
+-> gpgkey     => https://archive.kali.org/archive-key.asc
+-> priority   => 410
+
+! ── Kali Last-Snapshot (stabilna kopia rolling) ──────────────────────
+! Używaj gdy potrzebujesz powtarzalnych buildów
+[kali-last-snapshot]
+-> name       => kali-last-snapshot
+-> baseurl    => http://old.kali.org/kali
+-> suite      => kali-last-snapshot
+-> components => ["main", "contrib", "non-free"]
+-> arch       => ["amd64"]
+-> enabled    => false
