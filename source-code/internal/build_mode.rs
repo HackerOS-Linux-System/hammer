@@ -152,3 +152,92 @@ impl Features {
         println!("    {} System doctor & self-repair", mark(self.doctor));
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+//  Central path resolver (0.6)
+//
+//  All /hammer/... constants MUST go through here so that
+//  --features normal-mode builds work on a live system or any
+//  machine without /hammer/ mounted.
+//
+//  atomic build   → /hammer/db/...   (HackerOS installed system)
+//  normal-mode    → /var/lib/hammer/... (standard FHS path, no root FS req.)
+//
+//  Live-boot note: normal-mode also checks $HAMMER_ROOT env var so
+//  the caller can override the root, e.g. from a chroot:
+//    HAMMER_ROOT=/mnt/target hammer install curl
+// ─────────────────────────────────────────────────────────────
+
+/// Returns the base directory for all hammer state.
+/// Atomic: /hammer  |  Normal: /var/lib/hammer  |  Override: $HAMMER_ROOT
+pub fn base_dir() -> std::path::PathBuf {
+    if let Ok(root) = std::env::var("HAMMER_ROOT") {
+        if !root.is_empty() {
+            return std::path::PathBuf::from(root);
+        }
+    }
+    if cfg!(feature = "normal-mode") {
+        std::path::PathBuf::from("/var/lib/hammer")
+    } else {
+        std::path::PathBuf::from("/hammer")
+    }
+}
+
+/// /hammer/db  or  /var/lib/hammer/db
+pub fn db_dir() -> std::path::PathBuf {
+    base_dir().join("db")
+}
+
+/// Path to the store (immutable package objects).
+pub fn store_dir() -> std::path::PathBuf {
+    base_dir().join("store")
+}
+
+/// Path to generation profiles.
+pub fn profiles_dir() -> std::path::PathBuf {
+    base_dir().join("profiles")
+}
+
+/// Path to conffiles database.
+pub fn conffiles_dir() -> std::path::PathBuf {
+    db_dir().join("conffiles")
+}
+
+/// Path to generations.json.
+pub fn generations_file() -> std::path::PathBuf {
+    db_dir().join("generations.json")
+}
+
+/// Path to boot hash registry.
+pub fn boot_hash_file() -> std::path::PathBuf {
+    db_dir().join("boot-hashes.json")
+}
+
+/// Path to boot attempt counter.
+pub fn boot_attempts_file() -> std::path::PathBuf {
+    db_dir().join("boot-attempts.json")
+}
+
+/// Path to sources-list.hk
+pub fn sources_file() -> std::path::PathBuf {
+    db_dir().join("sources-list.hk")
+}
+
+/// Ensure the full hammer directory hierarchy exists.
+/// Call this from `hammer init` or lazily on first use.
+pub fn ensure_dirs() -> anyhow::Result<()> {
+    for dir in &[
+        base_dir(),
+        db_dir(),
+        store_dir(),
+        profiles_dir(),
+        conffiles_dir(),
+        base_dir().join("cache"),
+        base_dir().join("tmp"),
+        base_dir().join("hk_store"),
+    ] {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| anyhow::anyhow!("Cannot create {}: {}", dir.display(), e))?;
+    }
+    Ok(())
+}
