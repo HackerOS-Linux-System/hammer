@@ -1,0 +1,60 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! Przykład: Ubuntu Noble Numbat (24.04 LTS) + Jammy Jellyfish (22.04 LTS)
+!
+! Użycie w mixed-system lub przy targetowaniu paczek Ubuntu:
+!   hammer sources --add ubuntu-noble.hk
+!   hammer sync
+
+! ── Ubuntu Noble Numbat 24.04 LTS ────────────────────────────────────
+[ubuntu-noble]
+-> name       => ubuntu-noble
+-> baseurl    => http://archive.ubuntu.com/ubuntu
+-> suite      => noble
+-> components => ["main", "restricted", "universe", "multiverse"]
+-> arch       => ["amd64"]
+-> enabled    => true
+
+[ubuntu-noble-security]
+-> name       => ubuntu-noble-security
+-> baseurl    => http://security.ubuntu.com/ubuntu
+-> suite      => noble-security
+-> components => ["main", "restricted", "universe", "multiverse"]
+-> arch       => ["amd64"]
+-> enabled    => true
+
+[ubuntu-noble-updates]
+-> name       => ubuntu-noble-updates
+-> baseurl    => http://archive.ubuntu.com/ubuntu
+-> suite      => noble-updates
+-> components => ["main", "restricted", "universe", "multiverse"]
+-> arch       => ["amd64"]
+-> enabled    => true
+
+[ubuntu-noble-backports]
+-> name       => ubuntu-noble-backports
+-> baseurl    => http://archive.ubuntu.com/ubuntu
+-> suite      => noble-backports
+-> components => ["main", "restricted", "universe"]
+-> arch       => ["amd64"]
+-> enabled    => false
+
+! ── Ubuntu Jammy Jellyfish 22.04 LTS (legacy) ────────────────────────
+! Przydatne gdy potrzeba starszego ABI (np. CUDA, niektóre proprietarne lib)
+[ubuntu-jammy]
+-> name       => ubuntu-jammy
+-> baseurl    => http://archive.ubuntu.com/ubuntu
+-> suite      => jammy
+-> components => ["main", "universe"]
+-> arch       => ["amd64"]
+-> enabled    => false
+-> priority   => 400
+
+[ubuntu-jammy-security]
+-> name       => ubuntu-jammy-security
+-> baseurl    => http://security.ubuntu.com/ubuntu
+-> suite      => jammy-security
+-> components => ["main", "universe"]
+-> arch       => ["amd64"]
+-> enabled    => false
+-> priority   => 400
