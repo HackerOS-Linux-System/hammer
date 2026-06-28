@@ -1,0 +1,72 @@
+! Hammer sources list  —  format: .hk  (HackerOS key-value format)
+! ─────────────────────────────────────────────────────────────────────
+! Przykład: arm64-only repozytoria
+! Przydatne przy:
+!   - cross-kompilacji dla aarch64 na x86_64 (qemu-user lub chroot)
+!   - natywnym HackerOS ARM na Pi 4/5, PINE64, Rockchip, etc.
+!   - Mixed-arch: amd64 host + arm64 foreign libs
+!
+! Użycie:
+!   hammer arch add arm64
+!   hammer sources --add arm64-only.hk
+!   hammer sync
+
+! ── Debian Trixie arm64 ───────────────────────────────────────────────
+[debian-trixie-arm64]
+-> name       => debian-trixie-arm64
+-> baseurl    => http://deb.debian.org/debian
+-> suite      => trixie
+-> components => ["main", "contrib", "non-free", "non-free-firmware"]
+-> arch       => ["arm64"]
+-> enabled    => true
+
+[debian-trixie-arm64-security]
+-> name       => debian-trixie-arm64-security
+-> baseurl    => http://security.debian.org/debian-security
+-> suite      => trixie-security
+-> components => ["main", "non-free"]
+-> arch       => ["arm64"]
+-> enabled    => true
+
+! ── ARM64 CUDA (NVIDIA Jetson / Grace) ───────────────────────────────
+! Dla urządzeń NVIDIA Jetson Orin/Xavier z JetPack
+[nvidia-jetson-arm64]
+-> name       => nvidia-jetson-arm64
+-> baseurl    => https://repo.download.nvidia.com/jetson/common
+-> suite      => r36.4
+-> components => ["main"]
+-> arch       => ["arm64"]
+-> enabled    => false
+-> gpgkey     => https://repo.download.nvidia.com/jetson/jetson-ota-public.asc
+
+! ── Rockchip BSP (RK3588 / RK3399 boards) ────────────────────────────
+! Armbian kernel + BSP for Rockchip-based SBCs
+[armbian-rockchip-arm64]
+-> name       => armbian-rockchip-arm64
+-> baseurl    => https://apt.armbian.com
+-> suite      => noble
+-> components => ["main", "utils", "backport"]
+-> arch       => ["arm64"]
+-> enabled    => false
+-> gpgkey     => https://apt.armbian.com/armbian.key
+
+! ── Linaro cross-toolchain ────────────────────────────────────────────
+! Kompilatory aarch64-linux-gnu-gcc / aarch64-linux-gnu-g++
+[linaro-toolchain]
+-> name       => linaro-toolchain
+-> baseurl    => https://apt.armbian.com
+-> suite      => jammy
+-> components => ["main"]
+-> arch       => ["amd64"]
+-> enabled    => false
+-> priority   => 600
+
+! ── Ports mirror (arm64 native, nie cross) ────────────────────────────
+! Użyj gdy budujesz na natywnym arm64 hardware
+[debian-ports-arm64]
+-> name       => debian-ports-arm64
+-> baseurl    => http://ftp.ports.debian.org/debian-ports
+-> suite      => trixie
+-> components => ["main"]
+-> arch       => ["arm64"]
+-> enabled    => false
