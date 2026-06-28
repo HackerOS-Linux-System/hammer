@@ -5,6 +5,8 @@ pub(crate) mod provides;
 pub(crate) mod resolve;
 pub(crate) mod sat;
 pub(crate) mod version;
+#[cfg(test)]
+pub(crate) mod tests;
 
 use anyhow::Result;
 use owo_colors::OwoColorize;
