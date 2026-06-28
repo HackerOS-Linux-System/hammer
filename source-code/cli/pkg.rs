@@ -307,11 +307,50 @@ pub fn cmd_info(args: &[String], flags: &GlobalFlags) -> Result<()> {
 }
 
 pub fn cmd_list(args: &[String]) -> Result<()> {
-    let _json_mode     = has_flag(args, "--json");
+    let json_mode      = has_flag(args, "--json");
     let installed_only = has_flag(args, "--installed") || has_flag(args, "-i");
-    let upgrades_only  = has_flag(args, "--upgrades")  || has_flag(args, "-u");
+    let upgrades_only  = has_flag(args, "--upgrades")  || has_flag(args, "-u")
+                      || has_flag(args, "--upgradable");
     let db    = InstalledDb::open()?;
     let cache = PackageCache::load()?;
+
+    if json_mode {
+        let mut out = Vec::new();
+        if installed_only || upgrades_only {
+            for inst in db.list_all()? {
+                let av = cache.get(&inst.name);
+                let new_ver = av.filter(|av| {
+                    crate::package::version_cmp(&av.version, &inst.version) == std::cmp::Ordering::Greater
+                }).map(|av| av.version.as_str().to_string());
+                if upgrades_only && new_ver.is_none() { continue; }
+                out.push(serde_json::json!({
+                    "name":        inst.name,
+                    "version":     inst.version,
+                    "arch":        inst.architecture,
+                    "installed":   true,
+                    "new_version": new_ver,
+                    "reason":      inst.reason.as_str(),
+                    "section":     inst.section,
+                }));
+            }
+        } else {
+            for pkg in cache.all_packages() {
+                let inst = db.get(&pkg.name);
+                out.push(serde_json::json!({
+                    "name":        pkg.name,
+                    "version":     pkg.version,
+                    "arch":        pkg.architecture,
+                    "installed":   inst.is_some(),
+                    "new_version": serde_json::Value::Null,
+                    "section":     pkg.section,
+                    "description": pkg.description_short,
+                }));
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
     if installed_only || upgrades_only {
         for inst in db.list_all()? {
             let nv = cache.get(&inst.name)
