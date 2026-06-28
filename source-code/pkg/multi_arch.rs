@@ -100,6 +100,14 @@ impl MultiArchDb {
         let native = crate::cache::detect_arch();
         arch == "all" || arch == native || self.foreign_arches.iter().any(|a| a == arch)
     }
+
+    /// Return the Multi-Arch mode for a package name.
+    /// Currently returns None (defaults to No) unless the package declares
+    /// a known multi-arch architecture ("all" → Foreign).
+    pub fn get_mode(&self, _pkg_name: &str) -> Option<MultiArchMode> {
+        // TODO: read from extended DB field once InstalledPackage gains multi_arch
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -256,4 +264,197 @@ pub fn cmd_dpkg_arch(args: &[String]) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────
+//  Conflict resolution for multi-arch packages (0.6)
+//
+//  Debian multi-arch conflict semantics:
+//    `Conflicts: pkg`         → conflicts with pkg of ANY architecture
+//    `Conflicts: pkg:amd64`   → conflicts only with pkg:amd64
+//    `Conflicts: pkg:any`     → conflicts with pkg of the same arch as requirer
+//
+//  `Multi-Arch: Same` packages additionally conflict with themselves
+//  installed for a different architecture (co-install requires same version).
+// ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct MultiArchConflict {
+    /// Package that has the Conflicts: field
+    pub requirer:      String,
+    pub requirer_arch: String,
+    /// Package that is conflicted with
+    pub conflicting:      String,
+    pub conflicting_arch: Option<String>,
+    pub reason:           ConflictReason,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictReason {
+    /// Conflicts: pkg (any-arch conflict)
+    AnyArch,
+    /// Conflicts: pkg:amd64 (specific arch)
+    SpecificArch,
+    /// Multi-Arch: Same, different version installed for another arch
+    SameVersionRequired { installed_version: String, required_version: String },
+}
+
+/// Installed package view used for conflict checking (minimal interface).
+pub trait InstalledView {
+    fn installed_arches(&self, name: &str) -> Vec<(String, String)>; // (arch, version)
+}
+
+/// Check whether installing `new_pkg` (with its conflict list) would
+/// violate any multi-arch constraint against `installed`.
+///
+/// Returns a list of conflicts found. Empty = no conflicts.
+pub fn check_multi_arch_conflicts(
+    new_name:     &str,
+    new_arch:     &str,
+    new_version:  &str,
+    new_ma_mode:  &MultiArchMode,
+    new_conflicts: &[(String, Option<String>)], // (pkg_name, optional_arch)
+    installed:    &dyn InstalledView,
+) -> Vec<MultiArchConflict> {
+    let mut found = Vec::new();
+
+    for (conf_name, conf_arch) in new_conflicts {
+        let installed_for_pkg = installed.installed_arches(conf_name);
+        for (inst_arch, _inst_ver) in &installed_for_pkg {
+            let conflicts = match conf_arch.as_deref() {
+                // `Conflicts: pkg` — conflicts with any arch
+                None | Some("any") => true,
+                // `Conflicts: pkg:amd64` — only that specific arch
+                Some(specific) => inst_arch == specific,
+            };
+            if conflicts {
+                found.push(MultiArchConflict {
+                    requirer:         new_name.to_string(),
+                    requirer_arch:    new_arch.to_string(),
+                    conflicting:      conf_name.clone(),
+                    conflicting_arch: Some(inst_arch.clone()),
+                    reason: match conf_arch.as_deref() {
+                        None        => ConflictReason::AnyArch,
+                        Some("any") => ConflictReason::AnyArch,
+                        _           => ConflictReason::SpecificArch,
+                    },
+                });
+            }
+        }
+    }
+
+    // Multi-Arch: Same — all installed arches must have the same version
+    if *new_ma_mode == MultiArchMode::Same {
+        let installed_arches = installed.installed_arches(new_name);
+        for (inst_arch, inst_ver) in &installed_arches {
+            if inst_arch == new_arch { continue; } // same arch, different install = upgrade
+            if inst_ver != new_version {
+                found.push(MultiArchConflict {
+                    requirer:         new_name.to_string(),
+                    requirer_arch:    new_arch.to_string(),
+                    conflicting:      new_name.to_string(),
+                    conflicting_arch: Some(inst_arch.clone()),
+                    reason: ConflictReason::SameVersionRequired {
+                        installed_version: inst_ver.clone(),
+                        required_version:  new_version.to_string(),
+                    },
+                });
+            }
+        }
+    }
+
+    found
+}
+
+/// Format a conflict list for display (used by solver/transaction).
+pub fn format_conflicts(conflicts: &[MultiArchConflict]) -> String {
+    conflicts.iter().map(|c| {
+        match &c.reason {
+            ConflictReason::AnyArch | ConflictReason::SpecificArch => {
+                format!(
+                    "  {}:{} conflicts with {}:{}",
+                    c.requirer,
+                    c.requirer_arch,
+                    c.conflicting,
+                    c.conflicting_arch.as_deref().unwrap_or("*")
+                )
+            }
+            ConflictReason::SameVersionRequired { installed_version, required_version } => {
+                format!(
+                    "  {}:{} (Multi-Arch: Same) requires version {} but {}:{} has {}",
+                    c.requirer, c.requirer_arch,
+                    required_version,
+                    c.conflicting,
+                    c.conflicting_arch.as_deref().unwrap_or("?"),
+                    installed_version
+                )
+            }
+        }
+    }).collect::<Vec<_>>().join("\n")
+}
+
+#[cfg(test)]
+mod multi_arch_conflict_tests {
+    use super::*;
+
+    struct MockInstalled(Vec<(String, String, String)>); // (name, arch, version)
+
+    impl InstalledView for MockInstalled {
+        fn installed_arches(&self, name: &str) -> Vec<(String, String)> {
+            self.0.iter()
+                .filter(|(n, _, _)| n == name)
+                .map(|(_, a, v)| (a.clone(), v.clone()))
+                .collect()
+        }
+    }
+
+    #[test]
+    fn test_any_arch_conflict() {
+        let installed = MockInstalled(vec![
+            ("libssl1.1".to_string(), "i386".to_string(), "1.1.1".to_string()),
+        ]);
+        let conflicts = check_multi_arch_conflicts(
+            "libssl1.1", "amd64", "1.1.1",
+            &MultiArchMode::No,
+            &[("libssl1.1".to_string(), None)],
+            &installed,
+        );
+        assert!(!conflicts.is_empty());
+        assert_eq!(conflicts[0].reason, ConflictReason::AnyArch);
+    }
+
+    #[test]
+    fn test_same_version_conflict() {
+        let installed = MockInstalled(vec![
+            ("curl".to_string(), "i386".to_string(), "7.88.0".to_string()),
+        ]);
+        let conflicts = check_multi_arch_conflicts(
+            "curl", "amd64", "8.0.0",
+            &MultiArchMode::Same,
+            &[],
+            &installed,
+        );
+        assert!(!conflicts.is_empty());
+        match &conflicts[0].reason {
+            ConflictReason::SameVersionRequired { installed_version, required_version } => {
+                assert_eq!(installed_version, "7.88.0");
+                assert_eq!(required_version, "8.0.0");
+            }
+            _ => panic!("Expected SameVersionRequired"),
+        }
+    }
+
+    #[test]
+    fn test_no_conflict_when_same_version() {
+        let installed = MockInstalled(vec![
+            ("curl".to_string(), "i386".to_string(), "8.0.0".to_string()),
+        ]);
+        let conflicts = check_multi_arch_conflicts(
+            "curl", "amd64", "8.0.0",
+            &MultiArchMode::Same,
+            &[],
+            &installed,
+        );
+        assert!(conflicts.is_empty());
+    }
 }
