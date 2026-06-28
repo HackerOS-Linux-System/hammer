@@ -6,7 +6,6 @@ use reqwest::{Client, StatusCode};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
 use crate::package::Package;
@@ -215,8 +214,9 @@ pub async fn download_packages(
         };
 
         let url  = format!("{}/{}", base_uri.trim_end_matches('/'), filename);
-        let dest = pkg_dest_path(pkg);
-        let size = pkg.download_size.unwrap_or(0);
+        let dest   = pkg_dest_path(pkg);
+        let size   = pkg.download_size.unwrap_or(0);
+        let sha256 = pkg.sha256.clone();
 
         // Label: "name version" padded to 40 chars
         let label = format!("{} {}", pkg.name, pkg.version);
@@ -233,7 +233,8 @@ pub async fn download_packages(
         let handle: tokio::task::JoinHandle<Result<DownloadResult>> =
         tokio::spawn(async move {
             let _permit = sem_c.acquire().await.expect("semaphore closed");
-            let res = download_with_retry(&client_c, &url, &dest, &pb, &overall_c).await;
+            let sha_ref = sha256.as_deref();
+            let res = download_with_retry(&client_c, &url, &dest, &pb, &overall_c, sha_ref).await;
             match &res {
                 Ok(()) => {
                     let sz = std::fs::metadata(&dest).map(|m| m.len()).unwrap_or(0);
@@ -283,12 +284,24 @@ async fn download_with_retry(
     dest:    &Path,
     pb:      &ProgressBar,
     overall: &ProgressBar,
+    expected_sha256: Option<&str>,
 ) -> Result<()> {
+    // Already downloaded and SHA256 matches — skip entirely
     if let Ok(meta) = std::fs::metadata(dest) {
         if meta.len() > 0 {
-            pb.inc(meta.len());
-            overall.inc(meta.len());
-            return Ok(());
+            if let Some(sha) = expected_sha256 {
+                if file_sha256_matches(dest, sha) {
+                    pb.inc(meta.len());
+                    overall.inc(meta.len());
+                    return Ok(());
+                }
+                // Hash mismatch → re-download
+                let _ = std::fs::remove_file(dest);
+            } else {
+                pb.inc(meta.len());
+                overall.inc(meta.len());
+                return Ok(());
+            }
         }
     }
     let mut last_err = anyhow::anyhow!("No attempts made");
@@ -298,7 +311,17 @@ async fn download_with_retry(
             pb.reset();
         }
         match download_one(client, url, dest, pb, overall).await {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                // Verify SHA256 after download
+                if let Some(sha) = expected_sha256 {
+                    if !file_sha256_matches(dest, sha) {
+                        let _ = std::fs::remove_file(dest);
+                        last_err = anyhow::anyhow!("SHA256 mismatch for {}", url);
+                        continue;
+                    }
+                }
+                return Ok(());
+            }
             Err(e) => {
                 last_err = e;
                 if last_err.to_string().contains("404") { break; }
@@ -308,6 +331,13 @@ async fn download_with_retry(
     Err(last_err)
 }
 
+fn file_sha256_matches(path: &Path, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let Ok(bytes) = std::fs::read(path) else { return false };
+    let computed = format!("{:x}", Sha256::digest(&bytes));
+    computed.eq_ignore_ascii_case(expected)
+}
+
 async fn download_one(
     client:  &HttpClient,
     url:     &str,
@@ -315,19 +345,66 @@ async fn download_one(
     pb:      &ProgressBar,
     overall: &ProgressBar,
 ) -> Result<()> {
-    let resp = client.inner.get(url).send().await
-    .with_context(|| format!("GET {}", url))?;
-    if resp.status() == StatusCode::NOT_FOUND { bail!("404 Not Found: {}", url); }
-    if !resp.status().is_success() { bail!("HTTP {} for {}", resp.status(), url); }
-
-    if let Some(len) = resp.content_length() { pb.set_length(len); }
+    use reqwest::header::{RANGE, CONTENT_RANGE};
 
     let tmp = dest.with_extension("part");
-    let _ = tokio::fs::remove_file(&tmp).await;
-    let mut file = tokio::fs::File::create(&tmp).await
-    .with_context(|| format!("Cannot create {:?}", tmp))?;
 
+    // Check if partial file exists — attempt to resume
+    let already: u64 = tokio::fs::metadata(&tmp).await
+        .map(|m| m.len())
+        .unwrap_or(0);
+
+    let (resp, file) = if already > 0 {
+        // Send Range request
+        let range_val = format!("bytes={}-", already);
+        let resp = client.inner.get(url)
+            .header(RANGE, &range_val)
+            .send().await
+            .with_context(|| format!("GET (resume) {}", url))?;
+
+        let status = resp.status();
+        if status == StatusCode::RANGE_NOT_SATISFIABLE {
+            // Server says range invalid — start fresh
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Box::pin(download_one(client, url, dest, pb, overall)).await;
+        }
+        if status == StatusCode::NOT_FOUND { bail!("404 Not Found: {}", url); }
+
+        // 206 Partial Content → resume; 200 OK → server ignored Range, restart
+        let resume = status == reqwest::StatusCode::PARTIAL_CONTENT &&
+            resp.headers().contains_key(CONTENT_RANGE);
+
+        if resume {
+            if let Some(total) = resp.content_length() {
+                pb.set_length(already + total);
+            }
+            pb.set_position(already);
+            overall.inc(already);
+            let f = tokio::fs::OpenOptions::new().append(true).open(&tmp).await
+                .with_context(|| format!("Cannot open partial file {:?}", tmp))?;
+            (resp, f)
+        } else {
+            if !status.is_success() { bail!("HTTP {} for {}", status, url); }
+            let _ = tokio::fs::remove_file(&tmp).await;
+            if let Some(len) = resp.content_length() { pb.set_length(len); }
+            let f = tokio::fs::File::create(&tmp).await
+                .with_context(|| format!("Cannot create {:?}", tmp))?;
+            (resp, f)
+        }
+    } else {
+        let resp = client.inner.get(url).send().await
+            .with_context(|| format!("GET {}", url))?;
+        if resp.status() == StatusCode::NOT_FOUND { bail!("404 Not Found: {}", url); }
+        if !resp.status().is_success() { bail!("HTTP {} for {}", resp.status(), url); }
+        if let Some(len) = resp.content_length() { pb.set_length(len); }
+        let f = tokio::fs::File::create(&tmp).await
+            .with_context(|| format!("Cannot create {:?}", tmp))?;
+        (resp, f)
+    };
+
+    let mut file   = file;
     let mut stream = resp.bytes_stream();
+    use tokio::io::AsyncWriteExt;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("Stream error")?;
         file.write_all(&chunk).await?;
@@ -338,7 +415,7 @@ async fn download_one(
     file.flush().await?;
     drop(file);
     tokio::fs::rename(&tmp, dest).await
-    .with_context(|| format!("Cannot rename {:?} → {:?}", tmp, dest))?;
+        .with_context(|| format!("Cannot rename {:?} → {:?}", tmp, dest))?;
     Ok(())
 }
 
@@ -363,6 +440,44 @@ pub fn clean_cache() -> anyhow::Result<usize> {
         }
     }
     Ok(count)
+}
+
+/// Evict least-recently-used cache entries until total size is under `max_bytes`.
+/// Returns number of files removed.
+pub fn evict_cache_lru(max_bytes: u64) -> anyhow::Result<usize> {
+    let dir = Path::new(DL_DIR);
+    if !dir.exists() { return Ok(0); }
+
+    // Collect all .deb files with their atime + size
+    struct Entry { path: std::path::PathBuf, atime: std::time::SystemTime, size: u64 }
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut total: u64 = 0;
+
+    for e in std::fs::read_dir(dir)? {
+        let e    = e?;
+        let path = e.path();
+        if !path.extension().map_or(false, |x| x == "deb") { continue; }
+        let meta  = std::fs::metadata(&path)?;
+        let atime = meta.accessed().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let size  = meta.len();
+        total += size;
+        entries.push(Entry { path, atime, size });
+    }
+
+    if total <= max_bytes { return Ok(0); }
+
+    // Sort by atime ascending (oldest first)
+    entries.sort_by_key(|e| e.atime);
+
+    let mut removed = 0;
+    for entry in entries {
+        if total <= max_bytes { break; }
+        if let Ok(()) = std::fs::remove_file(&entry.path) {
+            total   -= entry.size;
+            removed += 1;
+        }
+    }
+    Ok(removed)
 }
 
 // ─────────────────────────────────────────────────────────────
