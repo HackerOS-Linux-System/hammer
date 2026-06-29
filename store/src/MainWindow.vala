@@ -368,7 +368,7 @@ namespace HammerStore {
                 }
                 return false;
             });
-            add_controller (ctrl);
+            ((Gtk.Widget) this).add_controller ((Gtk.EventController) ctrl);
         }
 
         private string _last_view = "featured";
