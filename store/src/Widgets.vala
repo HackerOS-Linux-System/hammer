@@ -383,6 +383,9 @@ namespace HammerStore {
         }
 
         private void on_action_clicked () {
+        }
+    } // end class OldPackageDetails
+
     // ────────────────────────────────────────────────────────────
     //  ProgressTerminal — scrolling log output during install (0.6)
     //  Shows real-time output from `hammer install` subprocess.
@@ -460,7 +463,8 @@ namespace HammerStore {
         }
 
         public void append_line (string line) {
-            var end = buffer.get_end_iter ();
+            Gtk.TextIter end;
+            buffer.get_end_iter (out end);
             buffer.insert (ref end, line + "\n", -1);
             // Scroll to bottom
             var adj = text_view.get_vadjustment ();
