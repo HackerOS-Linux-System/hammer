@@ -194,7 +194,7 @@ namespace HammerStore {
                                 !name.has_suffix (".appdata.xml") &&
                                 !name.has_suffix (".metainfo.xml")) continue;
 
-                            string path = Path.build_filename (dir_path, name);
+                            string path = GLib.Path.build_filename (dir_path, name);
                             yield parse_appstream_file (path);
                         }
                     }
