@@ -14,6 +14,7 @@ deps = [
   dependency('glib-2.0',       version: '>= 2.76'),
   dependency('json-glib-1.0',  version: '>= 1.6'),
   dependency('libsoup-3.0',    version: '>= 3.0', required: false),
+  meson.get_compiler('c').find_library('m', required: true),
 ]
 
 # GResources (icons, UI files)
