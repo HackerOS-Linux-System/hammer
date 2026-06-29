@@ -334,29 +334,29 @@ namespace HammerStore {
             }
 
             // Sort
-            pkgs.sort ((a, b) => {
-                switch (_sort) {
-                    case "Name Z–A":
-                        return b.name.collate (a.name);
-                    case "Size ↓":
-                        return (int)(b.installed_size - a.installed_size);
-                    case "Size ↑":
-                        return (int)(a.installed_size - b.installed_size);
-                    case "Category":
-                        int cv = a.category.collate (b.category);
-                        return cv != 0 ? cv : a.name.collate (b.name);
-                    case "Newest installed":
-                        // Reverse name as proxy (no timestamp in PackageInfo)
-                        return b.name.collate (a.name);
-                    default: // Name A–Z
-                        return a.name.collate (b.name);
+            string sort_key = _sort;
+            pkgs.sort_with_data ((a, b) => {
+                if (sort_key == "Name Z–A") {
+                    return b.name.collate (a.name);
+                } else if (sort_key == "Size ↓") {
+                    return (int)(b.installed_size - a.installed_size);
+                } else if (sort_key == "Size ↑") {
+                    return (int)(a.installed_size - b.installed_size);
+                } else if (sort_key == "Category") {
+                    int cv = a.category.collate (b.category);
+                    return cv != 0 ? cv : a.name.collate (b.name);
+                } else if (sort_key == "Newest installed") {
+                    // Reverse name as proxy (no timestamp in PackageInfo)
+                    return b.name.collate (a.name);
+                } else { // Name A–Z
+                    return a.name.collate (b.name);
                 }
             });
 
             // Group by category when sorting by Category
             string last_cat = "";
             pkgs.@foreach ((pkg) => {
-                if (_sort == "Category" && pkg.category != last_cat) {
+                if (sort_key == "Category" && pkg.category != last_cat) {
                     last_cat = pkg.category;
                     string cap = last_cat != "" ?
                         "%s%s".printf (last_cat.substring (0,1).up (), last_cat.substring (1)) :
@@ -763,13 +763,18 @@ namespace HammerStore {
             }
 
             // Sort
-            pkgs.sort ((a, b) => {
-                switch (_sort) {
-                    case "Name A–Z": return a.name.collate (b.name);
-                    case "Name Z–A": return b.name.collate (a.name);
-                    case "Size ↑":   return (int)(a.installed_size - b.installed_size);
-                    case "Size ↓":   return (int)(b.installed_size - a.installed_size);
-                    default:         return 0; // relevance = original order
+            string sort_key = _sort;
+            pkgs.sort_with_data ((a, b) => {
+                if (sort_key == "Name A–Z") {
+                    return a.name.collate (b.name);
+                } else if (sort_key == "Name Z–A") {
+                    return b.name.collate (a.name);
+                } else if (sort_key == "Size ↑") {
+                    return (int)(a.installed_size - b.installed_size);
+                } else if (sort_key == "Size ↓") {
+                    return (int)(b.installed_size - a.installed_size);
+                } else {
+                    return 0; // relevance = original order
                 }
             });
 
