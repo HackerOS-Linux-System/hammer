@@ -1,0 +1,8 @@
+// cargo
+// rustc
+
+;; testy > cargo test
+;; > cargo publish --dry-run
+
+> cargo login <twoj token>
+> cargo publish
