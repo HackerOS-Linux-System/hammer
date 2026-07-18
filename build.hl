@@ -1,10 +1,6 @@
 // cargo
-// valac
-// meson
-// ninja
+// rustc
 
 > cargo build --release
 ;; for normal version: > cargo build --release --features normal-mode
-> cd store
-> meson setup build
-> ninja -C build
+;; for oci version: > cargo build --release --features oci-mode
