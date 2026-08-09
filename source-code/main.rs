@@ -69,6 +69,11 @@ mod hammerd;
 mod repo;
 mod userenv;
 
+// ── oci/ (only compiled with --features oci-mode) ───────────────
+#[cfg(feature = "oci-mode")]
+#[path = "oci/mod.rs"]
+mod oci;
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
