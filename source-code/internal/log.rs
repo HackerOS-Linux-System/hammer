@@ -84,7 +84,25 @@ fn write_entry(level: Level, msg: &str) {
     }
 }
 
+/// Whether journald actually looks reachable on this system — checked
+/// once and cached, via a direct filesystem check (no subprocess spawn)
+/// rather than probing by trying to run `systemd-cat` and seeing if it
+/// fails. `/run/systemd/journal/socket` only exists when journald is
+/// actually running, which is a reliable, near-zero-cost signal — and,
+/// critically, it lets us skip spawning `systemd-cat` at all (rather than
+/// spawning it, waiting for it, and discovering it failed) in the very
+/// common case of running inside a plain container with no systemd.
+fn journald_available() -> bool {
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        std::path::Path::new("/run/systemd/journal/socket").exists()
+    })
+}
+
 fn try_journald(level: Level, msg: &str) {
+    if !journald_available() {
+        return;
+    }
     // Use systemd-cat as a simple journald bridge
     let priority = match level {
         Level::Error => "3",
@@ -92,10 +110,17 @@ fn try_journald(level: Level, msg: &str) {
         Level::Info | Level::Pkg | Level::File => "6",
         Level::Debug => "7",
     };
-    // Fire-and-forget, ignore errors
+    // Fire-and-forget, ignore errors. `.stdout(Stdio::null())` and
+    // `.stderr(Stdio::null())` matter even here (journald looked
+    // available a moment ago) — without them, any transient failure
+    // (journald restarting, socket permission issue, etc.) prints
+    // systemd-cat's own raw error text straight to the user's terminal,
+    // interleaved with hammer's own output, on every single log call.
     let _ = std::process::Command::new("systemd-cat")
         .args(["--identifier=hammer", &format!("--priority={}", priority)])
         .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .spawn()
         .and_then(|mut c| {
             if let Some(stdin) = c.stdin.as_mut() {
