@@ -121,15 +121,9 @@ pub fn check_install(candidate: &Package, db: &InstalledDb) -> Vec<ConflictInfo>
 //  broken if `candidate` were installed?
 // ─────────────────────────────────────────────────────────────
 
-pub fn check_reverse_breaks(candidate: &Package, db: &InstalledDb) -> Vec<ConflictInfo> {
+pub fn check_reverse_breaks(candidate: &Package, db: &InstalledDb, cache: &crate::cache::PackageCache) -> Vec<ConflictInfo> {
     let mut out = Vec::new();
     let all = match db.list_all() { Ok(v) => v, Err(_) => return out };
-
-    // Load cache to get dependency fields of installed packages
-    let cache = match crate::cache::PackageCache::load() {
-        Ok(c) => c,
-        Err(_) => return out,
-    };
 
     for inst in &all {
         // Get the cached package to access its Conflicts: field
