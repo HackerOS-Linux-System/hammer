@@ -87,8 +87,8 @@ fn compare_version_string(a: &str, b: &str) -> Ordering {
 
     loop {
         // Non-digit segment
-        let (na, ra) = take_nondigit(&mut ai);
-        let (nb, rb) = take_nondigit(&mut bi);
+        let (na, _ra) = take_nondigit(&mut ai);
+        let (nb, _rb) = take_nondigit(&mut bi);
         match compare_nondigit_segs(&na, &nb) {
             Ordering::Equal => {}
             other           => return other,
