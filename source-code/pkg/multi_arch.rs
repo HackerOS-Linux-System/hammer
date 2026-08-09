@@ -101,12 +101,16 @@ impl MultiArchDb {
         arch == "all" || arch == native || self.foreign_arches.iter().any(|a| a == arch)
     }
 
-    /// Return the Multi-Arch mode for a package name.
-    /// Currently returns None (defaults to No) unless the package declares
-    /// a known multi-arch architecture ("all" → Foreign).
-    pub fn get_mode(&self, _pkg_name: &str) -> Option<MultiArchMode> {
-        // TODO: read from extended DB field once InstalledPackage gains multi_arch
-        None
+    /// Return the Multi-Arch mode for a package name, read from its
+    /// `multi_arch` DB column (populated from the `Multi-Arch:` control
+    /// field at install time). Returns `None` if the package isn't
+    /// installed or has no `Multi-Arch:` field (which means "no" per
+    /// Debian policy — callers should treat `None` the same as
+    /// `Some(MultiArchMode::No)`).
+    pub fn get_mode(&self, pkg_name: &str) -> Option<MultiArchMode> {
+        let db = crate::db::InstalledDb::open().ok()?;
+        let installed = db.get(pkg_name)?;
+        installed.multi_arch.map(|v| MultiArchMode::parse(&v))
     }
 }
 
