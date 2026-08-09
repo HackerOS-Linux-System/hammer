@@ -35,6 +35,9 @@ pub struct InstalledPackage {
     pub store_hash:        String,
     pub depends:           Option<String>,
     pub recommends:        Option<String>,
+    /// `Multi-Arch:` value as published by the package (`same`, `foreign`,
+    /// `allowed`, or `None` meaning "no"/absent). See `pkg::multi_arch`.
+    pub multi_arch:        Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -103,6 +106,17 @@ impl InstalledDb {
         Ok(db)
     }
 
+    /// Opens a private, in-memory database — never touches disk. Used by
+    /// tests that need a real `InstalledDb` (migrations run, real SQL)
+    /// without side effects on the host filesystem or interference between
+    /// parallel test runs sharing a single on-disk DB path.
+    pub fn open_in_memory() -> Result<Self> {
+        let conn = rusqlite::Connection::open_in_memory()?;
+        let db = InstalledDb { conn };
+        db.migrate()?;
+        Ok(db)
+    }
+
 
     // ── Queries ───────────────────────────────────────────────
 
@@ -116,7 +130,7 @@ impl InstalledDb {
     pub fn get(&self, name: &str) -> Option<InstalledPackage> {
         self.conn.query_row(
             "SELECT name,version,architecture,installed_size_kb,section,maintainer,
-            description_short,installed_at,reason,store_hash,depends,recommends
+            description_short,installed_at,reason,store_hash,depends,recommends,multi_arch
             FROM installed WHERE name = ?1",
             params![name], row_to_installed,
         ).ok()
@@ -125,7 +139,7 @@ impl InstalledDb {
     pub fn list_all(&self) -> Result<Vec<InstalledPackage>> {
         let mut stmt = self.conn.prepare(
             "SELECT name,version,architecture,installed_size_kb,section,maintainer,
-            description_short,installed_at,reason,store_hash,depends,recommends
+            description_short,installed_at,reason,store_hash,depends,recommends,multi_arch
             FROM installed ORDER BY name"
         )?;
         let rows = stmt.query_map([], row_to_installed)?;
@@ -135,7 +149,7 @@ impl InstalledDb {
     pub fn list_user_installed(&self) -> Result<Vec<InstalledPackage>> {
         let mut stmt = self.conn.prepare(
             "SELECT name,version,architecture,installed_size_kb,section,maintainer,
-            description_short,installed_at,reason,store_hash,depends,recommends
+            description_short,installed_at,reason,store_hash,depends,recommends,multi_arch
             FROM installed WHERE reason = 'user' ORDER BY name"
         )?;
         let rows = stmt.query_map([], row_to_installed)?;
@@ -160,14 +174,14 @@ impl InstalledDb {
         self.conn.execute(
             "INSERT OR REPLACE INTO installed
             (name,version,architecture,installed_size_kb,section,maintainer,
-                          description_short,installed_at,reason,store_hash,depends,recommends)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+                          description_short,installed_at,reason,store_hash,depends,recommends,multi_arch)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
                           params![
                               pkg.name, pkg.version, pkg.architecture,
                           pkg.installed_size_kb.unwrap_or(0),
                           pkg.section, pkg.maintainer, pkg.description_short,
                           now, reason.as_str(), store_hash,
-                          pkg.depends, pkg.recommends,
+                          pkg.depends, pkg.recommends, pkg.multi_arch,
                           ],
         )?;
         self.conn.execute(
@@ -183,15 +197,15 @@ impl InstalledDb {
         self.conn.execute(
             "INSERT OR REPLACE INTO installed
             (name,version,architecture,installed_size_kb,section,maintainer,
-                          description_short,installed_at,reason,store_hash,depends,recommends)
+                          description_short,installed_at,reason,store_hash,depends,recommends,multi_arch)
         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,
                           COALESCE((SELECT reason FROM installed WHERE name=?1),'user'),
-                          ?9,?10,?11)",
+                          ?9,?10,?11,?12)",
                           params![
                               pkg.name, pkg.version, pkg.architecture,
                           pkg.installed_size_kb.unwrap_or(0),
                           pkg.section, pkg.maintainer, pkg.description_short,
-                          now, store_hash, pkg.depends, pkg.recommends,
+                          now, store_hash, pkg.depends, pkg.recommends, pkg.multi_arch,
                           ],
         )?;
         self.conn.execute(
@@ -253,6 +267,7 @@ fn row_to_installed(row: &rusqlite::Row) -> rusqlite::Result<InstalledPackage> {
        store_hash:        row.get(9)?,
        depends:           row.get(10)?,
        recommends:        row.get(11)?,
+       multi_arch:        row.get(12).ok(),
     })
 }
 
@@ -260,7 +275,7 @@ fn row_to_installed(row: &rusqlite::Row) -> rusqlite::Result<InstalledPackage> {
 //  Schema migrations
 // ─────────────────────────────────────────────────────────────
 
-const CURRENT_SCHEMA_VERSION: u32 = 5;
+const CURRENT_SCHEMA_VERSION: u32 = 6;
 
 impl InstalledDb {
     /// Run all pending schema migrations. Called on every open().
@@ -281,6 +296,7 @@ impl InstalledDb {
         if version < 3 { self.migrate_v3()?; }
         if version < 4 { self.migrate_v4()?; }
         if version < 5 { self.migrate_v5()?; }
+        if version < 6 { self.migrate_v6()?; }
 
         // Write current version
         self.conn.execute_batch(&format!(
@@ -325,10 +341,10 @@ impl InstalledDb {
     fn migrate_v2(&self) -> Result<()> {
         self.conn.execute_batch("
             CREATE TABLE IF NOT EXISTS pins (
-                name       TEXT PRIMARY KEY,
-                constraint TEXT NOT NULL,
-                priority   INTEGER NOT NULL DEFAULT 100,
-                note       TEXT
+                name        TEXT PRIMARY KEY,
+                \"constraint\" TEXT NOT NULL,
+                priority    INTEGER NOT NULL DEFAULT 100,
+                note        TEXT
             );
             CREATE TABLE IF NOT EXISTS holds (
                 name       TEXT PRIMARY KEY,
@@ -381,11 +397,32 @@ impl InstalledDb {
         Ok(())
     }
 
+    /// v6 — add multi_arch column to `installed` (Multi-Arch: same/foreign/
+    /// allowed support, see `pkg::multi_arch`).
+    fn migrate_v6(&self) -> Result<()> {
+        // SQLite has no `ADD COLUMN IF NOT EXISTS` on older versions still
+        // in the wild, so probe `pragma_table_info` first — this migration
+        // must stay idempotent like the others (schema_version is only
+        // bumped after all migrations run, so a crash mid-migration could
+        // otherwise re-run this and hit "duplicate column name").
+        let has_column: bool = self.conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('installed') WHERE name = 'multi_arch'",
+            [], |r| r.get::<_, i64>(0),
+        ).map(|c| c > 0).unwrap_or(false);
+
+        if !has_column {
+            self.conn.execute_batch(
+                "ALTER TABLE installed ADD COLUMN multi_arch TEXT;"
+            )?;
+        }
+        Ok(())
+    }
+
     // ── Pin management (via DB) ───────────────────────────────
 
     pub fn pin_package(&self, name: &str, constraint: &str, priority: i32) -> Result<()> {
         self.conn.execute(
-            "INSERT OR REPLACE INTO pins (name, constraint, priority, note)
+            "INSERT OR REPLACE INTO pins (name, \"constraint\", priority, note)
              VALUES (?1, ?2, ?3, NULL)",
             params![name, constraint, priority],
         )?;
@@ -399,7 +436,7 @@ impl InstalledDb {
 
     pub fn get_pin(&self, name: &str) -> Option<(String, i32)> {
         self.conn.query_row(
-            "SELECT constraint, priority FROM pins WHERE name = ?1",
+            "SELECT \"constraint\", priority FROM pins WHERE name = ?1",
             params![name],
             |r| Ok((r.get::<_, String>(0)?, r.get::<_, i32>(1)?)),
         ).ok()
@@ -407,7 +444,7 @@ impl InstalledDb {
 
     pub fn list_pins(&self) -> Result<Vec<(String, String, i32)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT name, constraint, priority FROM pins ORDER BY name"
+            "SELECT name, \"constraint\", priority FROM pins ORDER BY name"
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?, r.get::<_,i32>(2)?))
@@ -531,6 +568,7 @@ impl InstalledDb {
             store_hash:        r.get(9).unwrap_or_default(),
             depends:           r.get(10).ok(),
             recommends:        r.get(11).ok(),
+            multi_arch:        r.get(12).ok(),
         })
     }
 
@@ -554,6 +592,17 @@ impl InstalledDb {
 
 pub const JSON_PATH: &str = "/hammer/db/installed.json";
 
+/// Mode-aware counterpart of [`JSON_PATH`] — `/hammer/db/installed.json`
+/// in atomic mode, `/var/lib/hammer/db/installed.json` in normal-mode
+/// (via `build_mode::db_dir()`, the same directory the sqlite DB itself
+/// lives in for that mode). [`JSON_PATH`] is kept as-is since it's part
+/// of the public "used by external tooling" contract documented above
+/// and atomic mode is the default; this is what [`InstalledDb::export_json`]
+/// actually uses.
+pub fn json_path() -> std::path::PathBuf {
+    crate::build_mode::db_dir().join("installed.json")
+}
+
 /// Snapshot written to / read from the JSON file.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DbSnapshot {
@@ -568,7 +617,8 @@ impl InstalledDb {
     /// Export all installed packages to the JSON side-car file.
     /// Called automatically after every mutation.
     pub fn export_json(&self) -> Result<()> {
-        self.export_json_to(JSON_PATH)
+        let path = json_path();
+        self.export_json_to(&path.to_string_lossy())
     }
 
     pub fn export_json_to(&self, path: &str) -> Result<()> {
@@ -579,7 +629,19 @@ impl InstalledDb {
             packages,
         };
         let json = serde_json::to_string_pretty(&snap)?;
-        // Atomic write: write to *.tmp then rename
+        // Atomic write: write to *.tmp then rename. `JSON_PATH` defaults
+        // to the atomic-mode layout ("/hammer/db/...") — in normal-mode
+        // (or any mode where that directory was never created) the write
+        // below would otherwise fail with "No such file or directory" on
+        // every single call, since std::fs::write doesn't create parent
+        // directories. This is a pure export/recovery side-car, so it's
+        // safe and correct to just ensure its directory exists here
+        // rather than making every one of export_json's callers reason
+        // about which mode's directory layout applies.
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Creating {}", parent.display()))?;
+        }
         let tmp = format!("{}.tmp", path);
         std::fs::write(&tmp, json)?;
         std::fs::rename(&tmp, path)?;
