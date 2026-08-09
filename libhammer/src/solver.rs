@@ -74,13 +74,28 @@ impl VarMap {
 #[derive(Debug, Clone, Copy)]
 enum LitVal { True, False, Undef }
 
+/// A single clause: a disjunction of literals, plus solver bookkeeping
+/// used for clause-learning and activity-based deletion. Exposed for
+/// introspection (e.g. printing an unsat core or explaining a decision) —
+/// mutating it directly outside the solver's own methods is not supported.
 #[derive(Debug, Clone)]
-struct Clause {
-    lits:     Vec<Lit>,
-    learnt:   bool,
-    activity: f64,
-    lbd:      u32,
-    deleted:  bool,
+pub struct Clause {
+    /// The literals in this clause (disjunction — clause is satisfied if
+    /// any one of them is true under the current assignment).
+    pub lits:     Vec<Lit>,
+    /// `true` if this clause was learned during conflict analysis rather
+    /// than being part of the original problem.
+    pub learnt:   bool,
+    /// VSIDS-style activity score, used to decide which learned clauses
+    /// to keep during periodic clause-database reduction.
+    pub activity: f64,
+    /// Literal Block Distance — a quality metric for learned clauses
+    /// (lower is "better"/more likely to be kept).
+    pub lbd:      u32,
+    /// `true` once this clause has been removed during clause-database
+    /// reduction; kept as a tombstone rather than physically removed to
+    /// avoid invalidating indices held elsewhere (e.g. in `Reason`).
+    pub deleted:  bool,
 }
 
 impl Clause {
@@ -188,6 +203,12 @@ pub struct CdclSolver {
     pub clauses:      Vec<Clause>,
     watches:          Vec<Vec<usize>>,
     assigned:         Vec<Option<bool>>,
+    /// Decision level at which each variable was assigned — O(1) lookup
+    /// for `var_level()`, which used to do a linear scan of `trail` on
+    /// every call (called once per learnt-clause literal per conflict —
+    /// on larger dependency graphs this made conflict analysis
+    /// effectively quadratic).
+    var_level_arr:    Vec<u32>,
     saved_phase:      Vec<bool>,
     prefer_true:      HashSet<Var>,
     trail:            Vec<TrailEntry>,
@@ -214,6 +235,7 @@ impl CdclSolver {
         CdclSolver {
             vars: VarMap::new(), clauses: Vec::new(),
             watches: Vec::new(), assigned: Vec::new(),
+            var_level_arr: Vec::new(),
             saved_phase: Vec::new(), prefer_true: HashSet::new(),
             trail: Vec::new(), trail_lim: Vec::new(),
             prop_queue: VecDeque::new(), level: 0,
@@ -238,6 +260,7 @@ impl CdclSolver {
     fn grow(&mut self, v: Var) {
         let n = v as usize + 1;
         while self.assigned.len()    < n { self.assigned.push(None); }
+        while self.var_level_arr.len() < n { self.var_level_arr.push(0); }
         while self.saved_phase.len() < n { self.saved_phase.push(false); }
         while self.watches.len()     < n * 2 + 4 { self.watches.push(Vec::new()); }
         self.vsids.grow(v);
@@ -261,13 +284,20 @@ impl CdclSolver {
     /// Add a clause. Returns `Err` if the clause creates an immediate contradiction.
     pub fn add_clause(&mut self, mut lits: Vec<Lit>) -> Result<(), SolverError> {
         lits.sort_unstable(); lits.dedup();
+        // Register every variable mentioned in this clause with the solver
+        // *before* any early-return path (tautology, already-satisfied)
+        // below — otherwise a variable that only ever appears in a
+        // trivially-true clause would never be grown into `assigned`/
+        // `watches`/the VSIDS heap, and a `prefer_installed()` hint on it
+        // would silently have no effect (the variable would just default
+        // to `false` in `model()` without ever being decided).
+        for &l in &lits { self.grow(l.var()); }
         // Tautology check
         for i in 0..lits.len() {
             if i+1 < lits.len() && lits[i].var() == lits[i+1].var() { return Ok(()); }
         }
         lits.retain(|l| !matches!(self.lit_val(*l), LitVal::False));
         if lits.iter().any(|l| matches!(self.lit_val(*l), LitVal::True)) { return Ok(()); }
-        for &l in &lits { self.grow(l.var()); }
 
         let idx = self.clauses.len();
         match lits.len() {
@@ -374,6 +404,7 @@ impl CdclSolver {
             Some(_)                        => Err(()),
             None => {
                 self.assigned[v] = Some(!lit.is_neg());
+                self.var_level_arr[v] = self.level;
                 self.trail.push(TrailEntry { lit, level: self.level, reason });
                 self.prop_queue.push_back(lit);
                 Ok(())
@@ -442,12 +473,14 @@ impl CdclSolver {
                     else if self.var_level(q.var()) > 0   { learnt.push(q.negate()); }
                 }
             }
+            let mut found_next = false;
             loop {
                 if trail_pos == 0 { break; }
                 trail_pos -= 1;
                 let t = &self.trail[trail_pos];
                 if t.level == cur_lvl && seen.contains(&t.lit.var()) {
                     counter -= 1;
+                    found_next = true;
                     if counter == 0 {
                         uip = t.lit; reason_lits = vec![];
                     } else {
@@ -459,6 +492,16 @@ impl CdclSolver {
                 }
             }
             if counter <= 0 { break; }
+            if !found_next {
+                // Ran off the start of the trail without resolving the UIP
+                // counter to 0 — should be unreachable in a correct run,
+                // but the previous code would loop here forever doing no
+                // work (every literal in `reason_lits` already `seen`, so
+                // the outer `for` becomes a no-op, and the inner walk
+                // immediately re-hits `trail_pos == 0` every time). Bail
+                // out with the partial UIP instead of hanging.
+                break;
+            }
         }
         learnt[0] = uip.negate();
 
@@ -471,8 +514,7 @@ impl CdclSolver {
     }
 
     fn var_level(&self, v: Var) -> u32 {
-        self.trail.iter().rev().find(|t| t.lit.var() == v)
-            .map(|t| t.level).unwrap_or(0)
+        self.var_level_arr.get(v as usize).copied().unwrap_or(0)
     }
 
     // ── Backtracking ───────────────────────────────────────────
@@ -679,8 +721,16 @@ mod tests {
         let mut s = CdclSolver::new();
         let a = s.vars.var_of("a");
         s.add_clause(vec![Lit::pos(a)]).unwrap();
-        s.add_clause(vec![Lit::neg(a)]).unwrap();
-        assert!(s.solve().is_err());
+        // A well-behaved solver is allowed to detect a root-level conflict
+        // as early as `add_clause()` (this one does, via unit propagation
+        // at add time) rather than deferring detection to `solve()` — both
+        // are correct; the contract is only that the contradiction is
+        // reported as an error somewhere before a (nonexistent) model is
+        // returned.
+        match s.add_clause(vec![Lit::neg(a)]) {
+            Err(_) => {} // detected at add-time — correct
+            Ok(())  => assert!(s.solve().is_err(), "contradiction must surface by solve() time"),
+        }
     }
 
     #[test]
