@@ -1,4 +1,4 @@
-use std::io::{self, Cursor, Read};
+use std::io::{Cursor, Read};
 use anyhow::{bail, Context, Result};
 
 use crate::package::Package;
