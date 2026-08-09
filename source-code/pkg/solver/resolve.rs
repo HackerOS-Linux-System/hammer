@@ -333,7 +333,7 @@ impl<'a> ResolveCtx<'a> {
         }
 
         // Reverse conflict check (what installed packages conflict with us?)
-        let rev_breaks = super::conflicts::check_reverse_breaks(pkg, self.solver.db);
+        let rev_breaks = super::conflicts::check_reverse_breaks(pkg, self.solver.db, self.solver.cache);
         for c in &rev_breaks {
             if c.hard {
                 return Err(anyhow::anyhow!(
@@ -765,17 +765,27 @@ impl<'a> ResolveCtx<'a> {
         use super::sat::{CdclSolver, Lit};
         use crate::package::parse_dep_field;
 
-        let mut sat = CdclSolver::new();
+        // Hard safety cap: real-world dependency graphs (hundreds of
+        // packages, many `Provides:`/alternative-heavy ones like editors
+        // or build toolchains) can occasionally need a large search, but
+        // a CDCL solver should resolve any realistic apt-style dependency
+        // set in at most a few tens of thousands of conflicts. Capping
+        // this means a pathological input (or an as-yet-undiscovered
+        // solver bug) fails fast with a clear message instead of hanging
+        // the CLI indefinitely — which is strictly worse for a package
+        // manager than an occasional "couldn't fully verify, falling
+        // back" for a handful of exotic package sets.
+        let mut sat = CdclSolver::new().with_conflict_limit(200_000);
 
         // ── Pre-intern all names so VarMap is stable ──────────
         for name in self.to_install.keys() {
-            sat.vars.var_of(name);
+            sat.intern(name);
         }
 
         // ── Domain hint: already-installed packages prefer true ─
         for name in self.to_install.keys() {
             if self.solver.db.is_installed(name) {
-                let v = sat.vars.var_of(name);
+                let v = sat.intern(name);
                 sat.prefer_installed(v);
             }
         }
@@ -783,8 +793,14 @@ impl<'a> ResolveCtx<'a> {
         // ── Unit clauses: every planned package MUST be true ──
         let planned: Vec<String> = self.to_install.keys().cloned().collect();
         for name in &planned {
-            let v = sat.vars.var_of(name);
-            let _ = sat.add_clause(vec![Lit::pos(v)]);
+            let v = sat.intern(name);
+            if let Err(e) = sat.add_clause(vec![Lit::pos(v)]) {
+                bail!(
+                    "Dependency conflict detected (CDCL): {}\n  \
+                     Run 'hammer why-not <package>' for details.",
+                    e
+                );
+            }
         }
 
         // ── Implication & conflict clauses ────────────────────
@@ -794,7 +810,7 @@ impl<'a> ResolveCtx<'a> {
             .collect();
 
         for (name, pkg) in &install_snapshot {
-            let pv = sat.vars.var_of(name);
+            let pv = sat.intern(name);
 
             // Deps: ¬P ∨ Q₁ ∨ Q₂ ∨ …
             for dep_str in [pkg.pre_depends.as_deref(), pkg.depends.as_deref()].iter().flatten() {
@@ -808,12 +824,18 @@ impl<'a> ResolveCtx<'a> {
                     let mut clause = vec![Lit::neg(pv)];
                     for alt in &group.alternatives {
                         for provider in self.pmap.providers_of(&alt.name) {
-                            let qv = sat.vars.var_of(&provider);
+                            let qv = sat.intern(&provider);
                             clause.push(Lit::pos(qv));
                         }
                     }
                     if clause.len() > 1 {
-                        let _ = sat.add_clause(clause);
+                        if let Err(e) = sat.add_clause(clause) {
+                            bail!(
+                                "Dependency conflict detected (CDCL): {}\n  \
+                                 Run 'hammer why-not <package>' for details.",
+                                e
+                            );
+                        }
                     }
                 }
             }
@@ -823,8 +845,47 @@ impl<'a> ResolveCtx<'a> {
                 for group in parse_dep_field(conf_str) {
                     for alt in &group.alternatives {
                         for provider in self.pmap.providers_of(&alt.name) {
-                            let qv = sat.vars.var_of(&provider);
-                            let _ = sat.add_clause(vec![Lit::neg(pv), Lit::neg(qv)]);
+                            // A package conflicting with a virtual name it
+                            // itself provides does NOT conflict with
+                            // itself — this is the extremely common
+                            // "package renamed: Provides+Conflicts+Replaces
+                            // old-name" pattern (Debian Policy §7.4), e.g.
+                            // linux-libc-dev provides AND conflicts with
+                            // linux-kernel-headers, meaning "conflicts with
+                            // any OTHER package still providing the old
+                            // name", not "conflicts with myself". Skipping
+                            // self-conflicts here prevents every such
+                            // package from generating an immediate,
+                            // self-contradictory unit-false clause the
+                            // moment it's pulled in as a dependency.
+                            if provider == *name { continue; }
+                            // Respect the version constraint on the
+                            // Conflicts: entry, if any — e.g. "Conflicts:
+                            // gcc (<< 4:13.2.0-3)" means "conflicts with
+                            // OLD gcc, not with any gcc ever again" (an
+                            // extremely common transition-period pattern
+                            // in real Debian packages). Treating every
+                            // Conflicts: as unconditional/all-versions
+                            // turned routine version-gated conflicts into
+                            // permanent hard conflicts against the
+                            // package's current, actually-compatible
+                            // version.
+                            if let Some(constraint) = &alt.constraint {
+                                let provider_version = self.solver.cache.get(&provider)
+                                    .map(|p| p.version.as_str());
+                                let conflict_applies = provider_version
+                                    .map(|v| crate::package::version_satisfies(v, constraint.op.as_str(), &constraint.version))
+                                    .unwrap_or(true); // unknown version: be conservative, keep the conflict
+                                if !conflict_applies { continue; }
+                            }
+                            let qv = sat.intern(&provider);
+                            if let Err(e) = sat.add_clause(vec![Lit::neg(pv), Lit::neg(qv)]) {
+                                bail!(
+                                    "Dependency conflict detected (CDCL): {}\n  \
+                                     Run 'hammer why-not <package>' for details.",
+                                    e
+                                );
+                            }
                         }
                     }
                 }
