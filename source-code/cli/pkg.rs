@@ -4,13 +4,11 @@ use owo_colors::OwoColorize;
 use crate::cache::{detect_arch, PackageCache};
 use crate::cli_types::{GlobalFlags, has_flag};
 use crate::db::InstalledDb;
-use crate::grub;
 use crate::hk_tools;
 use crate::lock;
-use crate::profile::GenerationsDb;
 use crate::selfupdate;
 use crate::solver::Solver;
-use crate::transaction::{execute_transaction, TransactionContext};
+use crate::transaction::TransactionContext;
 use crate::ui;
 use crate::userenv::{self, UserEnv};
 
@@ -61,9 +59,7 @@ pub async fn cmd_install(args: &[String], flags: &GlobalFlags) -> Result<()> {
 
     let note    = format!("install {}", names.join(" "));
     let ctx     = TransactionContext::system(&plan, &db, &names, false);
-    let gen_num = execute_transaction(ctx, &note).await?;
-    if let Ok(gdb) = GenerationsDb::load() { let _ = grub::update_grub(&gdb); }
-    ui::print_pending_notice(gen_num);
+    crate::transaction::run_transaction(ctx, &note).await?;
     Ok(())
 }
 
@@ -89,9 +85,7 @@ pub async fn cmd_reinstall(args: &[String]) -> Result<()> {
 
     let note    = format!("reinstall {}", names.join(" "));
     let ctx     = TransactionContext::system(&plan, &db, &names, false);
-    let gen_num = execute_transaction(ctx, &note).await?;
-    if let Ok(gdb) = GenerationsDb::load() { let _ = grub::update_grub(&gdb); }
-    ui::print_pending_notice(gen_num);
+    crate::transaction::run_transaction(ctx, &note).await?;
     Ok(())
 }
 
@@ -118,9 +112,7 @@ pub async fn cmd_remove(args: &[String], flags: &GlobalFlags) -> Result<()> {
 
     let note    = format!("remove {}", names.join(" "));
     let ctx     = TransactionContext::system(&plan, &db, &names, false);
-    let gen_num = execute_transaction(ctx, &note).await?;
-    if let Ok(gdb) = GenerationsDb::load() { let _ = grub::update_grub(&gdb); }
-    ui::print_pending_notice(gen_num);
+    crate::transaction::run_transaction(ctx, &note).await?;
     Ok(())
 }
 
@@ -158,9 +150,7 @@ pub async fn cmd_upgrade(args: &[String], flags: &GlobalFlags) -> Result<()> {
             if !yes && !ui::confirm("Proceed with upgrade?")? { println!("  Aborted."); return Ok(()); }
             let explicit: Vec<String> = plan.to_upgrade.iter().map(|p| p.name.clone()).collect();
             let ctx     = TransactionContext::system(&plan, &db, &explicit, true);
-            let gen_num = execute_transaction(ctx, "upgrade").await?;
-            if let Ok(gdb) = GenerationsDb::load() { let _ = grub::update_grub(&gdb); }
-            ui::print_pending_notice(gen_num);
+            crate::transaction::run_transaction(ctx, "upgrade").await?;
         } else {
             println!("  {} All Debian packages up to date.", "✔".bright_green());
         }
@@ -204,9 +194,7 @@ pub async fn cmd_dist_upgrade(args: &[String], _flags: &GlobalFlags) -> Result<(
     ui::print_transaction_summary(&plan);
     if !yes && !ui::confirm("Proceed with dist-upgrade?")? { println!("  Aborted."); return Ok(()); }
     let ctx     = TransactionContext::system(&plan, &db, &[], true);
-    let gen_num = execute_transaction(ctx, "dist-upgrade").await?;
-    if let Ok(gdb) = GenerationsDb::load() { let _ = grub::update_grub(&gdb); }
-    ui::print_pending_notice(gen_num);
+    crate::transaction::run_transaction(ctx, "dist-upgrade").await?;
     Ok(())
 }
 
@@ -226,9 +214,7 @@ pub async fn cmd_autoremove(args: &[String]) -> Result<()> {
     if !yes && !ui::confirm("Remove unused dependencies?")? { println!("  Aborted."); return Ok(()); }
     let removals: Vec<String> = plan.to_autoremove.clone();
     let ctx     = TransactionContext::system(&plan, &db, &removals, false);
-    let gen_num = execute_transaction(ctx, "autoremove").await?;
-    if let Ok(gdb) = GenerationsDb::load() { let _ = grub::update_grub(&gdb); }
-    ui::print_pending_notice(gen_num);
+    crate::transaction::run_transaction(ctx, "autoremove").await?;
     Ok(())
 }
 
@@ -246,9 +232,7 @@ pub async fn cmd_fix_broken(args: &[String]) -> Result<()> {
     ui::print_transaction_summary(&plan);
     if !yes && !ui::confirm("Fix broken dependencies?")? { println!("  Aborted."); return Ok(()); }
     let ctx     = TransactionContext::system(&plan, &db, &[], false);
-    let gen_num = execute_transaction(ctx, "fix-broken").await?;
-    if let Ok(gdb) = GenerationsDb::load() { let _ = grub::update_grub(&gdb); }
-    ui::print_pending_notice(gen_num);
+    crate::transaction::run_transaction(ctx, "fix-broken").await?;
     Ok(())
 }
 
