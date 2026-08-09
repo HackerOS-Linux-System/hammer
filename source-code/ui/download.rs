@@ -338,6 +338,7 @@ fn file_sha256_matches(path: &Path, expected: &str) -> bool {
     computed.eq_ignore_ascii_case(expected)
 }
 
+#[async_recursion::async_recursion]
 async fn download_one(
     client:  &HttpClient,
     url:     &str,
@@ -366,7 +367,7 @@ async fn download_one(
         if status == StatusCode::RANGE_NOT_SATISFIABLE {
             // Server says range invalid — start fresh
             let _ = tokio::fs::remove_file(&tmp).await;
-            return Box::pin(download_one(client, url, dest, pb, overall)).await;
+            return download_one(client, url, dest, pb, overall).await;
         }
         if status == StatusCode::NOT_FOUND { bail!("404 Not Found: {}", url); }
 
