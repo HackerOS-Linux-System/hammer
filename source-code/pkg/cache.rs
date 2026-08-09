@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use owo_colors::OwoColorize;
 use std::collections::HashMap;
-use std::io::Read;
+use std::io::{IsTerminal, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -62,6 +62,14 @@ impl PackageCache {
     /// Load cache filtered/including a specific arch.
     pub fn load_for_arch(_arch: &str) -> Result<Self> { Self::load() }
 
+    /// Insert a single package into the cache, same de-duplication rule as
+    /// `load()`'s ingest path (keeps the highest version seen per name).
+    /// Public wrapper — mainly used by tests and callers building a cache
+    /// from an in-memory package list rather than parsed index files.
+    pub fn insert(&mut self, pkg: Package) {
+        self.ingest(pkg);
+    }
+
     fn ingest(&mut self, pkg: Package) {
         let key = format!("{}:{}:{}", pkg.name, pkg.architecture, pkg.version);
         self.all.insert(key, pkg.clone());
@@ -105,7 +113,23 @@ impl PackageCache {
 
         std::fs::create_dir_all(LISTS_DIR).context("Cannot create lists directory")?;
 
-        let mp  = MultiProgress::new();
+        // Indicatif's `MultiProgress` normally redraws in place using ANSI
+        // cursor movement, which requires a real terminal. When stderr
+        // isn't one (piped output, log capture, CI, or — very commonly —
+        // a `docker exec` session started without `-t`), indicatif can't
+        // move the cursor and instead periodically reprints the whole
+        // block of lines from scratch, which looks like the header and
+        // every source's spinner repeating over and over. Detecting this
+        // up front and switching to a hidden draw target + plain,
+        // one-line-per-event output sidesteps the whole class of redraw
+        // artifacts instead of fighting indicatif's TTY heuristics.
+        let interactive = std::io::stderr().is_terminal();
+
+        let mp = if interactive {
+            MultiProgress::new()
+        } else {
+            MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden())
+        };
         let sty = spinner_style();
 
         let header = mp.add(ProgressBar::new_spinner());
@@ -114,15 +138,19 @@ impl PackageCache {
             .unwrap().tick_strings(&["·","·"]),
         );
         header.set_prefix("hammer sync");
-        header.set_message(format!(
+        let header_msg = format!(
             "Refreshing {} source{} for {} arch{} (native: {})…",
                                    urls.len(),
                                    if urls.len() == 1 { "" } else { "s" },
                                        all_arches.len(),
                                    if all_arches.len() == 1 { "" } else { "s" },
                                        native,
-        ));
+        );
+        header.set_message(header_msg.clone());
         header.tick();
+        if !interactive {
+            println!("  {}  {}", "hammer sync".bold().cyan(), header_msg);
+        }
 
         let mut handles = Vec::new();
 
@@ -131,15 +159,17 @@ impl PackageCache {
                                 url_info.suite, url_info.component, url_info.arch);
             let pb = mp.add(ProgressBar::new_spinner());
             pb.set_style(sty.clone());
-            pb.set_prefix(label);
+            pb.set_prefix(label.clone());
             pb.set_message("connecting…".dimmed().to_string());
-            pb.enable_steady_tick(Duration::from_millis(80));
+            if interactive {
+                pb.enable_steady_tick(Duration::from_millis(80));
+            }
 
             let client_c  = client.clone();
             let base_uri  = url_info.base_uri.clone();
             let handle    = tokio::spawn(async move {
                 let result = fetch_and_verify_index(&client_c, &url_info).await;
-                (url_info, base_uri, pb, result)
+                (url_info, base_uri, pb, result, label)
             });
             handles.push(handle);
         }
@@ -150,7 +180,7 @@ impl PackageCache {
         let mut gpg_failed = 0usize;
 
         for handle in handles {
-            let (url_info, base_uri, pb, result) = handle.await?;
+            let (url_info, base_uri, pb, result, label) = handle.await?;
             match result {
                 Ok(FetchResult { content, gpg_ok, sha256_ok }) => {
                     let sig_icon = if gpg_ok { "🔒".to_string() }
@@ -165,7 +195,7 @@ impl PackageCache {
                     total_pkgs += count;
 
                     let sha_note = if sha256_ok { "" } else { " ⚠sha256" };
-                    pb.finish_with_message(format!(
+                    let done_msg = format!(
                         "{}  {} packages{}  {}",
                         sig_icon,
                         count.to_string().cyan(),
@@ -173,21 +203,27 @@ impl PackageCache {
                                                    if !gpg_ok {
                                                        "(no signature)".yellow().to_string()
                                                    } else { String::new() }
-                    ));
+                    );
+                    pb.finish_with_message(done_msg.clone());
+                    if !interactive {
+                        println!("  {:<42}  {}", label.bold(), done_msg);
+                    }
 
                     if !gpg_ok { gpg_failed += 1; }
                     ok_count += 1;
                 }
                 Err(e) => {
-                    pb.finish_with_message(format!(
-                        "{}  {}", "✗".red().bold(), e.to_string().dimmed()
-                    ));
+                    let done_msg = format!("{}  {}", "✗".red().bold(), e.to_string().dimmed());
+                    pb.finish_with_message(done_msg.clone());
+                    if !interactive {
+                        println!("  {:<42}  {}", label.bold(), done_msg);
+                    }
                     err_count += 1;
                 }
             }
         }
 
-        header.finish_with_message(format!(
+        let summary = format!(
             "Synced {} {}{} — {} packages indexed.",
             format!("{} source{}", ok_count, if ok_count == 1 { "" } else { "s" })
                 .green().bold(),
@@ -198,14 +234,35 @@ impl PackageCache {
                                                    format!(", {} unverified", gpg_failed).yellow().to_string()
                                                } else { String::new() },
                                                    total_pkgs.to_string().cyan().bold()
-        ));
+        );
+        header.finish_with_message(summary.clone());
         mp.clear().ok();
+        if !interactive {
+            println!("  {}  {}", "hammer sync".bold().cyan(), summary);
+        }
 
         if gpg_failed > 0 {
             println!();
             println!("  {} {} source(s) could not be verified by GPG.",
                      "!".yellow().bold(), gpg_failed.to_string().yellow().bold());
             println!("  Add trusted keys with: {}", "hammer key add <url>".cyan());
+        }
+
+        // Individual .deb files in a standard Debian repo are never
+        // themselves GPG-signed (`.deb.sig`/`.deb.asc` — only the
+        // InRelease/Release index is) — `verify_package_signature()`
+        // correctly falls back to trusting the repo as a whole via this
+        // marker file once the index itself was GPG-verified here. Only
+        // write it when *every* configured source was actually verified
+        // this sync — if any source failed, remove a stale marker rather
+        // than leave a false "trusted" signal in place from a previous,
+        // fully-verified sync.
+        let trust_marker = std::path::Path::new(crate::download::DL_DIR).join(".gpg-verified");
+        if gpg_failed == 0 && ok_count > 0 {
+            let _ = std::fs::create_dir_all(crate::download::DL_DIR);
+            let _ = std::fs::write(&trust_marker, chrono::Utc::now().to_rfc3339());
+        } else {
+            let _ = std::fs::remove_file(&trust_marker);
         }
 
         Ok(())
