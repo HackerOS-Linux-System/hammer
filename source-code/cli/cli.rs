@@ -22,15 +22,24 @@ pub async fn run(mut args: Vec<String>) -> Result<()> {
         "_import"    => return setup::cmd_import().await,
         "version" | "--version" | "-V" => { print_version(); return Ok(()); }
         "features"   => { build_mode::Features::current().print(); return Ok(()); }
+        "oci"        => return run_oci(&rest).await,
         "help" | "--help" | "-h" | "" => { print_help(); return Ok(()); }
         _ => {}
     }
 
     // ── Live system guard ──────────────────────────────────────
-    let live_safe = matches!(cmd,
-        "immutable" | "doctor" | "version" | "features" | "log" | "logs"
-    );
-    if !live_safe { livecheck::assert_not_live(); }
+    // Only the atomic build actually requires a real installed root
+    // (generations, immutable /usr, GRUB entries, etc — none of which
+    // exist or make sense on a live ISO / container overlay root).
+    // --features normal-mode is explicitly designed to work anywhere,
+    // including containers and live-booted systems (see the "Live-boot
+    // note" in internal/build_mode.rs) — it must never hit this guard.
+    if !build_mode::NORMAL_MODE {
+        let live_safe = matches!(cmd,
+            "immutable" | "doctor" | "version" | "features" | "log" | "logs"
+        );
+        if !live_safe { livecheck::assert_not_live(); }
+    }
 
     if flags.user_mode {
         return pkg::run_user(cmd, &rest, &flags).await;
@@ -105,13 +114,16 @@ pub async fn run(mut args: Vec<String>) -> Result<()> {
             sys::cmd_rollback(&rest)
         }
         "diff"    => sys::cmd_diff(&rest),
-        "pending" => sys::cmd_pending(&rest),
+        "pending" => {
+            build_mode::require_atomic("hammer pending")?;
+            sys::cmd_pending(&rest)
+        }
 
         // ── Query v0.5 ────────────────────────────────────────
         "what"     => crate::file_index::cmd_what(&rest),
         "what-rebuild" => crate::file_index::cmd_what_rebuild(),
         "size"     => crate::size::cmd_size(&rest),
-        "undo"     => crate::undo::cmd_undo(&rest),
+        "undo"     => { build_mode::require_atomic("hammer undo")?; crate::undo::cmd_undo(&rest) }
         "show-deps" => crate::query::cmd_show_deps(&rest),
         "owns"     => crate::query::cmd_owns(&rest),
         "stats"    => crate::query::cmd_stats(),
@@ -184,6 +196,25 @@ pub async fn run(mut args: Vec<String>) -> Result<()> {
             process::exit(1);
         }
     }
+}
+
+// ─────────────────────────────────────────────────────────────
+//  OCI mode (--features oci-mode only; graceful message otherwise)
+// ─────────────────────────────────────────────────────────────
+
+#[cfg(feature = "oci-mode")]
+async fn run_oci(rest: &[String]) -> Result<()> {
+    crate::oci::cmd::run(rest).await
+}
+
+#[cfg(not(feature = "oci-mode"))]
+async fn run_oci(_rest: &[String]) -> Result<()> {
+    eprintln!();
+    eprintln!("  {} 'hammer oci' is only available in builds compiled with", "!".yellow().bold());
+    eprintln!("    {}.", "--features oci-mode".cyan());
+    eprintln!("    This binary was built without it (run 'hammer features' to check).");
+    eprintln!();
+    process::exit(1);
 }
 
 // ─────────────────────────────────────────────────────────────
