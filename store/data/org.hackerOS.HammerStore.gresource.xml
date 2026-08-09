@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="UTF-8"?>
-<gresources>
-  <gresource prefix="/org/hackerOS/HammerStore">
-    <file>ui/main_window.ui</file>
-    <file>icons/hammer-store.svg</file>
-  </gresource>
-</gresources>
