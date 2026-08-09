@@ -15,6 +15,18 @@ pub fn assert_not_live() {
         eprintln!();
         eprintln!("  HackerOS must be \x1b[1minstalled to disk\x1b[0m before using hammer.");
         eprintln!("  To install HackerOS, use the installer from the live environment.");
+        if let Some(reason) = container_reason() {
+            eprintln!();
+            eprintln!("  Detected: {reason}.");
+            eprintln!("  This binary was built for the \x1b[1matomic\x1b[0m mode (generations +");
+            eprintln!("  immutable store), which needs a real installed root and doesn't apply");
+            eprintln!("  inside a container. For classic apt-style package management that works");
+            eprintln!("  anywhere — including containers — rebuild with:");
+            eprintln!();
+            eprintln!("      cargo build --release --features normal-mode");
+            eprintln!();
+            eprintln!("  Run 'hammer features' on a binary to check which mode it was built with.");
+        }
         eprintln!();
         std::process::exit(2);
     }
