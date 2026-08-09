@@ -435,8 +435,7 @@ pub async fn cmd_build_dep(args: &[String]) -> Result<()> {
     let solver = crate::solver::Solver::new(&cache, &db);
     let plan   = solver.resolve_install(&to_install, false)?;
     let ctx    = crate::transaction::TransactionContext::system(&plan, &db, &to_install, false);
-    let gen    = crate::transaction::execute_transaction(ctx, &format!("build-dep {}", name)).await?;
-    crate::ui::print_pending_notice(gen);
+    crate::transaction::run_transaction(ctx, &format!("build-dep {}", name)).await?;
     Ok(())
 }
 
