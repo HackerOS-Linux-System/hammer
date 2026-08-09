@@ -53,10 +53,26 @@ pub fn print_mode_banner() {
 /// Called before any operation that requires the atomic store.
 /// In normal-mode this is a no-op; in atomic mode it verifies the
 /// store is properly initialised.
+/// Guard for commands that only make sense with the atomic (generations +
+/// immutable store) backend — `hammer gen`, `hammer rollback`, `hammer
+/// pending`, `hammer undo`. Call this **before** touching any
+/// generations/store state.
+///
+/// Previously this only checked `/hammer/store` existed in atomic mode and
+/// silently returned `Ok(())` in normal-mode — meaning normal-mode builds
+/// would fall through into `GenerationsDb::load()` and similar atomic-only
+/// code, and fail later with a confusing low-level error (e.g. "no
+/// generations found") instead of a clear message explaining *why*. Now it
+/// actively blocks with a helpful error in normal-mode.
 pub fn require_atomic(op: &str) -> anyhow::Result<()> {
     if NORMAL_MODE {
-        // Normal mode: silently skip atomic-only prerequisites
-        return Ok(());
+        anyhow::bail!(
+            "{op} is only available in the atomic build of hammer (generations \
+             + immutable store).\n  This binary was built with --features normal-mode, \
+             which has no generation history to roll back to or pending state to track.\n  \
+             For classic apt-style installs, use 'hammer history' to see what changed \
+             and reinstall the previous version manually if needed."
+        );
     }
     // Atomic mode: ensure /hammer/store exists and is a directory
     let store_path = std::path::Path::new("/hammer/store");
@@ -113,6 +129,7 @@ pub struct Features {
     pub services:     bool,   // always true
     pub sandbox:      bool,   // always true
     pub doctor:       bool,   // always true
+    pub oci_mode:     bool,   // compile-time: --features oci-mode
 }
 
 impl Features {
@@ -130,6 +147,7 @@ impl Features {
             services:     true,
             sandbox:      true,
             doctor:       true,
+            oci_mode:     cfg!(feature = "oci-mode"),
         }
     }
 
@@ -137,6 +155,17 @@ impl Features {
         let yes  = "✔".bright_green().to_string();
         let no   = "✘".dimmed().to_string();
         let mark = |b: bool| if b { yes.clone() } else { no.clone() };
+
+        let mode_name = if NORMAL_MODE { "normal-mode" } else { "atomic (default)" };
+        println!("  {} {}", "Build mode:".bold(), mode_name.bright_cyan().bold());
+        if NORMAL_MODE {
+            println!("    Classic apt-style installs — works on any system, including containers.");
+        } else {
+            println!("    Generations + immutable store — requires HackerOS installed to disk;");
+            println!("    will refuse to run in a live/container environment. For containers, use");
+            println!("    a binary built with 'cargo build --release --features normal-mode'.");
+        }
+        println!();
 
         println!("  {}", "Feature flags:".bold());
         println!("    {} Atomicity & generation rollback", mark(self.atomicity));
@@ -150,6 +179,7 @@ impl Features {
         println!("    {} Service management (systemd)", mark(self.services));
         println!("    {} Namespace sandbox (seccomp + namespaces)", mark(self.sandbox));
         println!("    {} System doctor & self-repair", mark(self.doctor));
+        println!("    {} 'hammer oci' — OSTree+OCI image-based deployments", mark(self.oci_mode));
     }
 }
 
