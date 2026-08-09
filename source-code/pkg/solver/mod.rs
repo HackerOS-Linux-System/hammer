@@ -1,5 +1,8 @@
 pub(crate) mod conflicts;
-pub(crate) mod dpll;
+// `dpll` (a second, independent, unused DPLL-based solver implementation)
+// was removed — nothing in the codebase referenced it, and it had its own
+// unfixed correctness bugs (see ROADMAP.md). `sat` (CdclSolver) is the
+// single, tested, actually-used SAT engine.
 pub(crate) mod error;
 pub(crate) mod provides;
 pub(crate) mod resolve;
@@ -18,6 +21,7 @@ use crate::package::{parse_dep_field, Package};
 use crate::pins::PinDb;
 use crate::multi_arch::MultiArchDb;
 use provides::build as build_provides;
+use provides::ProvidesMap;
 
 // ──────────────────────────────────────────────────────────────────────────────
 //  TransactionPlan
@@ -208,7 +212,7 @@ impl<'a> Solver<'a> {
                 }
 
                 // Check reverse conflicts
-                let rev = conflicts::check_reverse_breaks(pkg, self.db);
+                let rev = conflicts::check_reverse_breaks(pkg, self.db, self.cache);
                 for c in &rev {
                     lines.push(format!("  {} {}", "✗".red().bold(), c.message));
                 }
@@ -250,10 +254,109 @@ impl<'a> Solver<'a> {
                         else { providers.join(", ").cyan().to_string() }
                     ));
                 }
+
+                // If none of the direct (depth-1) checks above found
+                // anything, the problem is very likely several levels
+                // deep in the dependency tree — e.g. a package `vim`
+                // depends on transitively conflicts with something else
+                // already resolvable, which a depth-1 check can never
+                // see. Walk the full transitive closure (same BFS as
+                // `dependency_closure`, but with a parent pointer per
+                // node so we can report the actual chain) and check
+                // every package in it for the same conflict/reverse-
+                // conflict problems checked above for the top-level
+                // package.
+                if lines.len() == 1 {
+                    if let Some((path, problem)) = self.find_transitive_problem(name, &pmap) {
+                        lines.push(format!(
+                            "  {} Transitive problem found {} levels deep:",
+                            "✗".red().bold(), path.len().saturating_sub(1)
+                        ));
+                        lines.push(format!("    {}", path.join(" → ").dimmed()));
+                        lines.push(format!("  {} {}", "✗".red().bold(), problem));
+                    } else {
+                        lines.push(format!(
+                            "  {} No single unmet dependency or direct conflict found, but the \
+                             full dependency set is still unsatisfiable — this usually means two \
+                             transitively-required packages conflict with each other rather than \
+                             either one being individually broken.",
+                            "ℹ".cyan()
+                        ));
+                    }
+                }
             }
         }
 
         lines.join("\n")
+    }
+
+    /// BFS over the full transitive dependency closure of `root`,
+    /// tracking a parent pointer per visited package so we can report the
+    /// path from `root` down to whichever package first turns out to have
+    /// a direct conflict, reverse-conflict, or unmet dependency of its
+    /// own. Returns `None` if every package in the closure looks
+    /// individually fine (meaning the real problem, if any, is a
+    /// multi-package interaction the CDCL solver can see but this
+    /// depth-first-style check cannot).
+    fn find_transitive_problem(&self, root: &str, pmap: &ProvidesMap) -> Option<(Vec<String>, String)> {
+        let mut visited: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        let mut queue: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+        queue.push_back(root.to_string());
+        visited.insert(root.to_string(), String::new()); // root has no parent
+
+        fn reconstruct(visited: &std::collections::HashMap<String, String>, mut node: String) -> Vec<String> {
+            let mut path = vec![node.clone()];
+            while let Some(parent) = visited.get(&node) {
+                if parent.is_empty() { break; }
+                path.push(parent.clone());
+                node = parent.clone();
+            }
+            path.reverse();
+            path
+        }
+
+        while let Some(name) = queue.pop_front() {
+            let Some(pkg) = self.cache.get(&name) else { continue };
+
+            if name != root {
+                let confs = conflicts::check_install(pkg, self.db);
+                if let Some(c) = confs.iter().find(|c| c.hard) {
+                    return Some((reconstruct(&visited, name), c.message.clone()));
+                }
+                let rev = conflicts::check_reverse_breaks(pkg, self.db, self.cache);
+                if let Some(c) = rev.first() {
+                    return Some((reconstruct(&visited, name), c.message.clone()));
+                }
+            }
+
+            let dep_strs = [pkg.pre_depends.as_deref(), pkg.depends.as_deref()];
+            for dep_str in dep_strs.iter().flatten() {
+                for group in parse_dep_field(dep_str) {
+                    let mut any_provider_exists = false;
+                    for alt in &group.alternatives {
+                        let providers = pmap.providers_of(&alt.name);
+                        if providers.is_empty() { continue; }
+                        any_provider_exists = true;
+                        for p in providers {
+                            if self.db.is_installed(&p) { continue; }
+                            if !visited.contains_key(&p) {
+                                visited.insert(p.clone(), name.clone());
+                                queue.push_back(p);
+                            }
+                        }
+                    }
+                    if !any_provider_exists {
+                        let alts: Vec<&str> = group.alternatives.iter()
+                            .map(|a| a.name.as_str()).collect();
+                        return Some((
+                            reconstruct(&visited, name.clone()),
+                            format!("Unmet dependency: {} (no provider available)", alts.join(" | ")),
+                        ));
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Full dependency closure for a set of names.
@@ -325,7 +428,7 @@ impl<'a> Solver<'a> {
         let mut issues = Vec::new();
         for name in names {
             if let Some(avail) = self.cache.get(name) {
-                let rev_breaks = conflicts::check_reverse_breaks(avail, self.db);
+                let rev_breaks = conflicts::check_reverse_breaks(avail, self.db, self.cache);
                 for c in rev_breaks {
                     if c.hard {
                         issues.push(format!(
