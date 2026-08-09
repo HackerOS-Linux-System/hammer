@@ -10,6 +10,7 @@ authors     = ["HackerOS Team <hackeros068@gmail.com>"]
 description = "Atomic Debian package manager — HackerOS"
 license     = "Apache-2.0"
 repository  = "https://github.com/HackerOS-Linux-System/hammer"
+build       = "build.rs"
 
 # ── Build modes ───────────────────────────────────────────────
 #
@@ -23,6 +24,17 @@ repository  = "https://github.com/HackerOS-Linux-System/hammer"
 #    → /usr/bin/hammer  — all package management without atomicity or
 #      immutable FS (like a classic apt/dnf, but with hammer's SAT solver,
 #      multi-arch, pinning, services, doctor, etc.)
+#
+#  OCI (image-based, replaces the standalone `deb-ostree` tool):
+#    cargo build --release --features oci-mode
+#    → /usr/bin/hammer  — everything from the default (atomic) build, PLUS
+#      a native `hammer oci <subcommand>` command tree: OSTree-backed,
+#      OCI-image-based deployments with rpm-ostree-style package layering.
+#      This is the same functionality as the old standalone `deb-ostree`
+#      C++ project, now implemented natively in Rust inside hammer.
+#      `cargo build --release` and `--features normal-mode` are completely
+#      unaffected — every file under source-code/oci/ is behind
+#      #[cfg(feature = "oci-mode")].
 
 [[bin]]
 name = "hammer"
@@ -32,9 +44,21 @@ path = "source-code/main.rs"
 default     = []
 # Disables: immutable FS, atomic store, generation rollback
 normal-mode = []
+# Adds: `hammer oci <subcommand>` — OSTree+OCI image-based deployments
+# with deb package layering (native replacement for standalone deb-ostree).
+# `hammer oci` links libostree (+ glib/gobject/gio) directly via FFI bindings
+# generated at build time by `build.rs` (needs `libostree-dev`, `libglib2.0-dev`,
+# and `libclang`/`clang` on the build machine — NOT needed for default or
+# normal-mode builds, which never invoke build.rs's oci-mode branch).
+oci-mode    = ["dep:bindgen", "dep:pkg-config"]
+
+[build-dependencies]
+bindgen    = { version = "0.69", optional = true }
+pkg-config = { version = "0.3", optional = true }
 
 [dependencies]
 anyhow          = "1"
+async-recursion = "1"
 tokio           = { version = "1", features = ["full"] }
 reqwest         = { version = "0.11", default-features = false, features = [
                     "json", "gzip", "deflate", "stream", "rustls-tls"] }
@@ -58,8 +82,8 @@ sha2            = "0.10"
 sha1            = "0.10"
 hex             = "0.4"
 walkdir         = "2"
-nix             = { version = "0.27", features = ["user"] }
-hk-parser       = "0.3.0"
+nix             = { version = "0.27", features = ["user", "mount"] }
+hk-parser       = "0.3.1"
 indexmap        = { version = "2", features = ["serde"] }
 resolvo         = "0.4"
 fslock          = "0.2"
