@@ -1,9 +1,9 @@
 [package]
 name        = "libhammer"
-version     = "0.5.0"
+version     = "0.0.1"
 edition     = "2021"
 authors     = ["HackerOS Team <hackeros068@gmail.com>"]
-description = "Library crate for Hammer — Debian package management primitives"
+description = "Debian package-management primitives: version comparison, dependency parsing, a CDCL SAT solver, .deb archive parsing, and control-file/Release parsing"
 license     = "Apache-2.0"
 repository  = "https://github.com/HackerOS-Linux-System/hammer"
 homepage    = "https://github.com/HackerOS-Linux-System/hammer"
@@ -44,9 +44,7 @@ indexmap     = { version = "2", features = ["serde"] }
 # optional — only pulled in with `db` or `fetch` feature
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 chrono   = { version = "0.4",  features = ["serde"],  optional = true }
-reqwest  = { version = "0.11", default-features = false,
-             features = ["json", "gzip", "stream", "rustls-tls"],
-             optional = true }
+reqwest  = { version = "0.11", default-features = false, features = ["json", "gzip", "stream", "rustls-tls"], optional = true }
 tokio    = { version = "1",    features = ["full"],    optional = true }
 
 [dev-dependencies]
