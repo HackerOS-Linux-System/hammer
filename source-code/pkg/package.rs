@@ -100,6 +100,11 @@ pub struct Package {
     pub sha256:            Option<String>,
 
     pub provides_list:     Vec<String>,
+
+    /// `Multi-Arch:` field (`same`, `foreign`, `allowed`, or absent — meaning
+    /// `no`). Parsed but not enforced anywhere before this field existed;
+    /// see `pkg::multi_arch::MultiArchDb::get_mode`.
+    pub multi_arch:        Option<String>,
 }
 
 // ── Default ─────────────────────────────────────────────────
@@ -133,6 +138,7 @@ impl Default for Package {
             filename:          None,
             sha256:            None,
             provides_list:     Vec::new(),
+            multi_arch:        None,
         }
     }
 }
@@ -194,6 +200,7 @@ impl Package {
             "homepage"       => self.homepage            = Some(v),
             "filename"       => self.filename            = Some(v),
             "sha256"         => self.sha256              = Some(v),
+            "multi-arch"     => self.multi_arch           = Some(v),
             "installed-size" => self.installed_size_kb   = v.parse().ok(),
             "size"           => self.download_size        = v.parse().ok(),
             "description"    => {
