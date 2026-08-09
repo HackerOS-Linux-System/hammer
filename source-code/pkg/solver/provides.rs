@@ -204,9 +204,17 @@ fn repo_priority_for(uri: Option<&str>) -> i32 {
 /// Strip `:arch` suffix from a package name.
 fn strip_arch_suffix(name: &str) -> &str {
     if let Some(idx) = name.rfind(':') {
-        // Only strip if what follows looks like an arch (alpha only, short)
+        // Only strip if what follows looks like an arch qualifier. Real
+        // Debian architecture names are alphanumeric and virtually all of
+        // them contain digits (amd64, i386, arm64, mips64el, ppc64el,
+        // riscv64, ...) — checking `is_alphabetic()` alone rejected every
+        // one of those and made this function a no-op for the
+        // overwhelming majority of real packages.
         let suffix = &name[idx+1..];
-        if suffix.len() <= 8 && suffix.chars().all(|c| c.is_alphabetic() || c == '_') {
+        if !suffix.is_empty()
+            && suffix.len() <= 12
+            && suffix.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
             return &name[..idx];
         }
     }
