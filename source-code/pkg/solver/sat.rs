@@ -217,6 +217,18 @@ pub struct CdclSolver {
     // watches[lit.inner] = list of clause indices watching that literal's negation
     watches:          Vec<Vec<usize>>,
     assigned:         Vec<Option<bool>>,
+    /// Decision level at which each variable was assigned — O(1) lookup
+    /// for `var_level()`, which used to do a linear scan of `trail` on
+    /// every call (called once per learnt-clause literal per conflict;
+    /// on larger real dependency graphs this made conflict analysis
+    /// effectively quadratic and could turn a sub-second resolve into a
+    /// multi-minute hang).
+    var_level_arr:    Vec<u32>,
+    /// Whether each variable's current assignment came from unit
+    /// propagation (`true`) or was a decision (`false`) — O(1) lookup for
+    /// `minimize_clause`'s dominator check, same rationale as
+    /// `var_level_arr` above (was a linear trail scan per literal).
+    var_has_reason:   Vec<bool>,
     /// Phase saving: last known polarity per variable
     saved_phase:      Vec<bool>,
     /// Domain hint: prefer true (installed) for certain variables
@@ -246,6 +258,8 @@ impl CdclSolver {
             clauses:          Vec::new(),
             watches:          Vec::new(),
             assigned:         Vec::new(),
+            var_level_arr:    Vec::new(),
+            var_has_reason:   Vec::new(),
             saved_phase:      Vec::new(),
             prefer_true:      HashSet::new(),
             trail:            Vec::new(),
@@ -280,6 +294,8 @@ impl CdclSolver {
     fn grow_to(&mut self, v: Var) {
         let n = (v + 1) as usize;
         while self.assigned.len()    < n { self.assigned.push(None); }
+        while self.var_level_arr.len() < n { self.var_level_arr.push(0); }
+        while self.var_has_reason.len() < n { self.var_has_reason.push(false); }
         while self.saved_phase.len() < n { self.saved_phase.push(false); }
         // watches indexed by Lit::inner → size = 2*(n_vars+1)+2
         while self.watches.len()     < n * 2 + 4 { self.watches.push(Vec::new()); }
@@ -288,7 +304,56 @@ impl CdclSolver {
 
     fn watch_idx(lit: Lit) -> usize { lit.inner as usize }
 
+    /// Builds a human-readable explanation for a clause that became empty
+    /// at add-time — i.e. every one of its literals was already forced to
+    /// the opposite value by an earlier clause. `original_lits` is the
+    /// clause as given, before the already-false literals were filtered
+    /// out (which is what made it empty in the first place). Names each
+    /// literal's package (falling back to the raw variable id if this
+    /// solver instance wasn't built with named variables — e.g. the unit
+    /// tests) and whether it was required to be true or false, so the
+    /// error a user actually sees names the real conflicting packages
+    /// instead of generic wording like "empty clause after simplification".
+    fn describe_root_conflict(&self, original_lits: &[Lit]) -> String {
+        if original_lits.is_empty() {
+            return "conflicting requirements leave no valid choice (empty clause)".to_string();
+        }
+        let parts: Vec<String> = original_lits.iter().map(|l| {
+            let name = self.vars.pkg_of(l.var())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("var#{}", l.var()));
+            if l.is_neg() { format!("NOT {name}") } else { name }
+        }).collect();
+        format!(
+            "conflicting requirements: every alternative already excluded — {}",
+            parts.join(" / ")
+        )
+    }
+
     // ── Clause addition ────────────────────────────────────────
+
+    /// Interns `name` as a solver variable AND grows this solver's
+    /// per-variable state (`assigned`/`var_level_arr`/`var_has_reason`/
+    /// `saved_phase`/watch lists/VSIDS heap) to cover it — unlike calling
+    /// `self.vars.var_of(name)` directly, which only allocates the ID in
+    /// the name↔Var map and leaves the solver's own per-variable arrays
+    /// untouched until the variable happens to appear in an `add_clause`
+    /// call.
+    ///
+    /// Callers that intern a name and are **not** guaranteed to
+    /// immediately pass it into `add_clause` (e.g. pre-interning names for
+    /// stable ordering, or building up a clause's literals where some
+    /// branches `continue` before reaching `add_clause`) must use this
+    /// instead of `self.vars.var_of()` directly — otherwise the variable
+    /// exists in `self.vars` (so `self.vars.n_vars()`/`next` count it) but
+    /// not in `self.assigned` etc, and any code that sizes an array from
+    /// `self.vars.next` (like `preprocess()`'s pure-literal pass) will
+    /// index past the end of those un-grown arrays.
+    pub fn intern(&mut self, name: &str) -> Var {
+        let v = self.vars.var_of(name);
+        self.grow_to(v);
+        v
+    }
 
     pub fn add_clause(&mut self, mut lits: Vec<Lit>) -> Result<(), SolverError> {
         // Apply equivalences
@@ -301,6 +366,11 @@ impl CdclSolver {
                 return Ok(()); // tautology
             }
         }
+        // Keep the pre-filter literals so a root-level contradiction can
+        // name the actual packages involved instead of just saying
+        // "empty clause" — that generic message is what a user actually
+        // saw and had to separately run `hammer why-not` to decode.
+        let original_lits = lits.clone();
         // Filter out assigned-true literals and already-false ones
         lits.retain(|l| self.lit_val(*l) != LitVal::False);
         if lits.iter().any(|l| self.lit_val(*l) == LitVal::True) {
@@ -311,7 +381,9 @@ impl CdclSolver {
 
         let idx = self.clauses.len();
         match lits.len() {
-            0 => return Err(SolverError::Unsatisfiable("empty clause after simplification".into())),
+            0 => return Err(SolverError::Unsatisfiable(
+                self.describe_root_conflict(&original_lits)
+            )),
             1 => {
                 let lit = lits[0];
                 self.clauses.push(Clause::new(lits, false));
@@ -447,6 +519,8 @@ impl CdclSolver {
             Some(_)                        => Err(()), // conflict
             None => {
                 self.assigned[v] = Some(!lit.is_neg());
+                self.var_level_arr[v] = self.level;
+                self.var_has_reason[v] = reason.is_some();
                 self.trail.push(Trail { lit, level: self.level, reason });
                 self.prop_queue.push_back(lit);
                 Ok(())
@@ -466,8 +540,22 @@ impl CdclSolver {
     fn propagate(&mut self) -> Option<usize> {
         while let Some(p) = self.prop_queue.pop_front() {
             self.propagations += 1;
+            // `false_lit` is the watched literal that just became false as a
+            // result of enqueuing `p` (p = ¬false_lit).
             let false_lit = p.negate();
-            let wl_idx    = Self::watch_idx(false_lit);
+            // The watch list to consult is keyed by `p` itself, NOT by
+            // `false_lit`. Registration (see add_clause / the "find new
+            // watch" branch below) always does
+            // `watches[watched_lit.negate()].push(clause)` — i.e. the list
+            // at index X holds clauses whose watched literal is `¬X`, and
+            // that list is exactly the one that must fire when `X` (here,
+            // `p`) is assigned true. Consulting `watches[p.negate()]`
+            // instead silently checked a disjoint, unrelated set of
+            // clauses on every propagation, which meant most binary (and
+            // longer) clauses were never re-examined when they should
+            // have been — e.g. `(a∨b) ∧ (¬a∨b)` failed to force `b=true`
+            // regardless of which value `a` was decided to.
+            let wl_idx = Self::watch_idx(p);
 
             let mut i = 0;
             while i < self.watches[wl_idx].len() {
@@ -539,12 +627,14 @@ impl CdclSolver {
             }
 
             // Walk trail backwards to next seen var at cur_lvl
+            let mut found_next = false;
             loop {
                 if trail_pos == 0 { break; }
                 trail_pos -= 1;
                 let t = &self.trail[trail_pos];
                 if t.level == cur_lvl && seen.contains(&t.lit.var()) {
                     counter -= 1;
+                    found_next = true;
                     if counter == 0 {
                         uip          = t.lit;
                         reason_lits  = vec![];
@@ -557,6 +647,19 @@ impl CdclSolver {
                 }
             }
             if counter <= 0 { break; }
+            if !found_next {
+                // Ran off the start of the trail without resolving the
+                // UIP counter to 0. In a correct CDCL run this should be
+                // unreachable (there is always exactly one literal at the
+                // current level that dominates the conflict), but looping
+                // here with unchanged `reason_lits`/`trail_pos` would spin
+                // forever doing no work (every literal in `reason_lits` is
+                // already in `seen`, so the outer `for` loop above becomes
+                // a no-op, and the inner walk immediately re-hits
+                // `trail_pos == 0` every time) — bail out with whatever
+                // partial UIP we have rather than hang.
+                break;
+            }
         }
 
         learnt[0] = uip.negate();
@@ -585,20 +688,13 @@ impl CdclSolver {
             // Always keep the UIP
             if l.var() == uip_var { return true; }
             // Keep decision literals (no reason clause) — cannot remove those
-            let has_reason = self.trail.iter().rev()
-                .find(|t| t.lit.var() == l.var())
-                .and_then(|t| t.reason.as_ref())
-                .is_some();
-            has_reason // only minimise implied (non-decision) literals
+            self.var_has_reason.get(l.var() as usize).copied().unwrap_or(false)
         });
         clause
     }
 
     fn var_level(&self, v: Var) -> u32 {
-        self.trail.iter().rev()
-            .find(|t| t.lit.var() == v)
-            .map(|t| t.level)
-            .unwrap_or(0)
+        self.var_level_arr.get(v as usize).copied().unwrap_or(0)
     }
 
     // ── Backtracking ───────────────────────────────────────────
