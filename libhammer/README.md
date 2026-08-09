@@ -19,6 +19,8 @@ reimplementing the hard parts.
 | `solver` | Full CDCL SAT solver (VSIDS, 2WL, 1UIP, LBD, restarts, preprocessing) |
 | `deb` | `.deb` archive parser (ar + tar, xz/gz/bz2/zst) |
 | `digest` | SHA-256 checksum helpers |
+| `control` | Generic RFC822 control-file reader/writer (folded fields, multi-block files) |
+| `release` | `Release`/`InRelease` repository-metadata parser (suite, components, index checksums) |
 | `db` *(feature)* | SQLite installed-packages database |
 | `fetch` *(feature)* | Async HTTP index downloader |
 
@@ -28,10 +30,10 @@ reimplementing the hard parts.
 
 ```toml
 [dependencies]
-libhammer = "0.1"                        # types + version + dep parser + SAT
-libhammer = { version = "0.1", features = ["db"] }     # + SQLite DB
-libhammer = { version = "0.1", features = ["fetch"] }  # + async HTTP fetch
-libhammer = { version = "0.1", features = ["full"] }   # everything
+libhammer = "0.0.1"                        # types + version + dep parser + SAT
+libhammer = { version = "0.0.1", features = ["db"] }     # + SQLite DB
+libhammer = { version = "0.0.1", features = ["fetch"] }  # + async HTTP fetch
+libhammer = { version = "0.0.1", features = ["full"] }   # everything
 ```
 
 ---
