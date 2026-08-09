@@ -362,6 +362,36 @@ fn save_postinst_script(pkg_name: &str, script: &str) -> Result<PathBuf> {
 }
 
 // ─────────────────────────────────────────────────────────────
+//  Mode-aware dispatcher
+// ─────────────────────────────────────────────────────────────
+//
+// `cli/pkg.rs` previously called `execute_transaction` (the atomic/
+// generations backend) directly and unconditionally at every call site,
+// regardless of build mode — `execute_transaction_normal` existed,
+// compiled, and was fully implemented, but nothing ever called it, so
+// `--features normal-mode` builds silently ran the atomic backend anyway
+// (generations, `/hammer/store`, "Composing gen-N…", GRUB updates, the
+// "reboot to activate" notice — none of which apply to, or even make
+// sense for, a normal-mode install). This function is the single place
+// that decides which backend runs, and prints only the follow-up UI that
+// backend actually supports.
+pub async fn run_transaction(ctx: TransactionContext<'_>, note: &str) -> Result<()> {
+    #[cfg(feature = "normal-mode")]
+    {
+        execute_transaction_normal(ctx, note).await
+    }
+    #[cfg(not(feature = "normal-mode"))]
+    {
+        let gen_num = execute_transaction(ctx, note).await?;
+        if let Ok(gdb) = crate::profile::GenerationsDb::load() {
+            let _ = crate::grub::update_grub(&gdb);
+        }
+        crate::ui::print_pending_notice(gen_num);
+        Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
 //  Normal-mode transaction (no atomic store, no generations)
 //  cargo build --release --features normal-mode
 // ─────────────────────────────────────────────────────────────
