@@ -78,6 +78,14 @@ pub struct HistoryEntry {
 
 pub struct InstalledDb {
     conn: Connection,
+    /// Whether queries should also consult `/var/lib/dpkg/status` for
+    /// packages hammer doesn't know about itself. `true` only for the
+    /// real, on-disk database (`open()`/`open_at()`) — `open_in_memory()`
+    /// is explicitly for isolated use (tests, and `hammer oci`'s
+    /// per-rootfs CDCL resolver bridge, which seeds its own synthetic
+    /// "installed" state and must not have the *host's* dpkg status
+    /// silently mixed in on top of that).
+    use_dpkg_fallback: bool,
 }
 
 impl InstalledDb {
@@ -91,7 +99,7 @@ impl InstalledDb {
         let conn = Connection::open(path)
         .with_context(|| format!("Cannot open database {}", path.display()))?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let db = InstalledDb { conn };
+        let db = InstalledDb { conn, use_dpkg_fallback: true };
         db.migrate()?;
         Ok(db)
     }
@@ -101,7 +109,7 @@ impl InstalledDb {
         if let Some(parent) = p.parent() { std::fs::create_dir_all(parent)?; }
         let conn = rusqlite::Connection::open(p)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")?;
-        let db = InstalledDb { conn };
+        let db = InstalledDb { conn, use_dpkg_fallback: true };
         db.migrate()?;
         Ok(db)
     }
@@ -112,28 +120,39 @@ impl InstalledDb {
     /// parallel test runs sharing a single on-disk DB path.
     pub fn open_in_memory() -> Result<Self> {
         let conn = rusqlite::Connection::open_in_memory()?;
-        let db = InstalledDb { conn };
+        let db = InstalledDb { conn, use_dpkg_fallback: false };
         db.migrate()?;
         Ok(db)
     }
 
 
     // ── Queries ───────────────────────────────────────────────
+    //
+    // Every query here checks hammer's own sqlite `installed` table
+    // first, then falls back to (or, for `list_all`, merges with) the
+    // real system's `/var/lib/dpkg/status` via `dpkg_status` — see that
+    // module's docs for why. Hammer's own record always wins when a
+    // package is known to both, since it's the more authoritative source
+    // for anything hammer itself is tracking (accurate `store_hash`,
+    // `reason`, etc); dpkg only fills in packages hammer has never
+    // touched itself.
 
     pub fn is_installed(&self, name: &str) -> bool {
-        self.conn.query_row(
+        let in_own_db = self.conn.query_row(
             "SELECT 1 FROM installed WHERE name = ?1",
             params![name], |_| Ok(true),
-        ).unwrap_or(false)
+        ).unwrap_or(false);
+        in_own_db || (self.use_dpkg_fallback && crate::dpkg_status::is_installed(name))
     }
 
     pub fn get(&self, name: &str) -> Option<InstalledPackage> {
-        self.conn.query_row(
+        let own: Option<InstalledPackage> = self.conn.query_row(
             "SELECT name,version,architecture,installed_size_kb,section,maintainer,
             description_short,installed_at,reason,store_hash,depends,recommends,multi_arch
             FROM installed WHERE name = ?1",
             params![name], row_to_installed,
-        ).ok()
+        ).ok();
+        own.or_else(|| if self.use_dpkg_fallback { crate::dpkg_status::get(name) } else { None })
     }
 
     pub fn list_all(&self) -> Result<Vec<InstalledPackage>> {
@@ -143,7 +162,18 @@ impl InstalledDb {
             FROM installed ORDER BY name"
         )?;
         let rows = stmt.query_map([], row_to_installed)?;
-        Ok(rows.filter_map(|r| r.ok()).collect())
+        let mut own: Vec<InstalledPackage> = rows.filter_map(|r| r.ok()).collect();
+
+        if self.use_dpkg_fallback {
+            let known: std::collections::HashSet<String> = own.iter().map(|p| p.name.clone()).collect();
+            own.extend(
+                crate::dpkg_status::read_all()
+                    .into_iter()
+                    .filter(|p| !known.contains(&p.name))
+            );
+            own.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+        Ok(own)
     }
 
     pub fn list_user_installed(&self) -> Result<Vec<InstalledPackage>> {
