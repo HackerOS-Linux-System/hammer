@@ -76,26 +76,44 @@ impl PostinstSandbox {
 
     fn run_bwrap(&self, script: &Path, pkg_name: &str) -> Result<PostinstResult> {
         // bwrap sandbox:
-        //   - Read-only bind of / (system root)
-        //   - Read-write tmpfs on /tmp, /run, /var/tmp
-        //   - Read-write bind of /etc (conffiles need to be writable)
+        //   - Read-write bind of / (system root) — see below for why this
+        //     isn't read-only despite "sandbox" in the name
+        //   - Isolated /tmp, /run (tmpfs)
+        //   - Dev/proc access (some scripts need /dev/null, /proc/self, etc.)
+        //   - PID/IPC namespace isolation (can't see/signal other host
+        //     processes, can't snoop other processes' IPC)
         //   - Network: allow (some postinsts fetch data)
-        //   - User namespace: map current user → root inside
-        //   - No new privileges
+        //
+        // NOT read-only: a read-only `/` broke extremely common,
+        // completely legitimate postinst behavior — most visibly
+        // `update-alternatives --install /usr/bin/<name> ...`, which
+        // every package using the alternatives system needs (editors,
+        // compilers, `vi`/`vim`/`ex`/`view` and dozens of others), since
+        // it must create a symlink under /usr/bin. `/usr` was outside the
+        // narrow writable set (previously just `/etc` + `/var`), so
+        // every such call silently failed — the package still reported
+        // as "installed" (extraction succeeded), but its actual command
+        // was never registered on $PATH. Real dpkg runs maintainer
+        // scripts with full filesystem access by design — they're part
+        // of the same trust boundary as the package payload itself
+        // (already SHA256/GPG-verified before we ever get here), so a
+        // read-only root here was trading away a security property that
+        // doesn't hold up in practice for broken core functionality.
+        // PID/IPC isolation below still provides real containment for
+        // what postinst scripts actually need isolating from.
         let mut cmd = Command::new("bwrap");
         cmd.args([
-            // Map / read-only
-            "--ro-bind", "/", "/",
-            // Overlay writable /tmp
+            // Read-write bind of the whole root
+            "--bind", "/", "/",
+            // Overlay isolated /tmp, /run (postinst scratch space stays
+            // ephemeral rather than leaking into the real /tmp)
             "--tmpfs", "/tmp",
             "--tmpfs", "/run",
-            // Allow writes to /etc and /var
-            "--bind", "/etc", "/etc",
-            "--bind-try", "/var", "/var",
             // Dev access (some scripts need /dev/null etc.)
             "--dev", "/dev",
             "--proc", "/proc",
-            // No new privs
+            // Process/IPC isolation (real security value, doesn't affect
+            // filesystem operations)
             "--unshare-pid",
             "--unshare-ipc",
             // Keep network for postinsts that fetch keys etc.
