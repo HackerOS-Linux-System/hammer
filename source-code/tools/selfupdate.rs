@@ -57,6 +57,121 @@ pub async fn self_update(client: &HttpClient) -> Result<()> {
 
     let tag = format!("v{}", new_version);
 
+    #[cfg(feature = "normal-mode")]
+    { return self_update_normal_mode(client, &tag, &new_version).await; }
+    #[cfg(not(feature = "normal-mode"))]
+    { self_update_atomic(client, &tag, &new_version).await }
+}
+
+/// Normal-mode self-update: the release asset for this build is a
+/// tar.gz archive (`hammer-normal-mode.tar.gz`) containing just the
+/// `hammer` binary — no `anvil`/`hammer-store` companions (those are
+/// atomic-mode-only tools that don't apply to a normal-mode install), and
+/// no generations/GRUB integration to worry about, matching normal-mode's
+/// "works like a classic package manager" design everywhere else. The
+/// archive itself is what gets signature-checked (before extraction —
+/// never unpack unverified content), not the binary inside it.
+#[cfg(feature = "normal-mode")]
+async fn self_update_normal_mode(client: &HttpClient, tag: &str, new_version: &str) -> Result<()> {
+    let archive_url = format!("{}/{}/hammer-normal-mode.tar.gz", RELEASE_BASE, tag);
+    println!("  {} Downloading hammer-normal-mode.tar.gz…", "·".dimmed());
+    let archive_bytes = client.get_bytes(&archive_url).await
+        .with_context(|| format!("Downloading {archive_url}"))?;
+    println!("  {} Downloaded ({} bytes)", "✔".green(), archive_bytes.len());
+
+    let tmp_archive = PathBuf::from("/tmp/hammer-update-normal-mode.tar.gz.tmp");
+    std::fs::write(&tmp_archive, &archive_bytes)
+        .context("Writing temp archive")?;
+
+    // Signature verification — of the archive itself, before extraction.
+    let sig_url = format!("{}.sig", archive_url);
+    match client.get_bytes(&sig_url).await {
+        Ok(sig_bytes) => {
+            let sig_path = tmp_archive.with_extension("sig");
+            std::fs::write(&sig_path, &sig_bytes)?;
+            match crate::audit::verify_package_signature(&tmp_archive) {
+                Ok(()) => println!("  {} Ed25519 OK: hammer-normal-mode.tar.gz", "✔".bright_green()),
+                Err(e) => {
+                    std::fs::remove_file(&tmp_archive).ok();
+                    std::fs::remove_file(&sig_path).ok();
+                    bail!("Signature verification FAILED for hammer-normal-mode.tar.gz: {e}\n  \
+                           Self-update aborted — hammer was NOT updated.");
+                }
+            }
+            std::fs::remove_file(&sig_path).ok();
+        }
+        Err(_) => {
+            println!("  {} No .sig for hammer-normal-mode.tar.gz — skipping signature check (legacy release?)",
+                     "⚠".yellow());
+        }
+    }
+
+    // Extract just the `hammer` binary from the archive into a temp file
+    // (never extract directly onto the live binary path — the atomic
+    // rename below is what makes this safe against a crash mid-update).
+    let extracted = extract_hammer_binary(&tmp_archive)
+        .context("Extracting hammer binary from hammer-normal-mode.tar.gz")?;
+    std::fs::remove_file(&tmp_archive).ok();
+
+    let mut perms = std::fs::metadata(&extracted)?.permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&extracted, perms)?;
+
+    if let Some(parent) = Path::new(HAMMER_BIN).parent() { std::fs::create_dir_all(parent)?; }
+    std::fs::rename(&extracted, HAMMER_BIN)
+        .with_context(|| format!("Replacing {HAMMER_BIN} (atomic rename)"))?;
+    log::info(&format!("self-update: replaced {HAMMER_BIN}"));
+    println!("  {} {} updated.", "✔".bright_green(), HAMMER_BIN);
+
+    write_version_file(new_version)?;
+
+    println!();
+    println!("  {}  hammer updated to {}.", "⬡".bright_cyan().bold(), new_version.bright_cyan().bold());
+    println!("  {}  Restart hammer for the new version to take effect.", "·".dimmed());
+    Ok(())
+}
+
+/// Finds and extracts the `hammer` binary from a tar.gz archive, writing
+/// it to a temp file and returning that path. Looks for an entry named
+/// exactly `hammer` at any depth in the archive (tolerates being packed
+/// either at the archive root or inside a subdirectory).
+#[cfg(feature = "normal-mode")]
+fn extract_hammer_binary(archive_path: &Path) -> Result<PathBuf> {
+    let file = std::fs::File::open(archive_path)?;
+    let decoder = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(decoder);
+
+    let out_path = PathBuf::from("/tmp/hammer-update-hammer.tmp");
+    let mut found = false;
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.to_path_buf();
+        if path.file_name().map(|n| n == "hammer").unwrap_or(false) {
+            let mut out = std::fs::File::create(&out_path)?;
+            std::io::copy(&mut entry, &mut out)?;
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        bail!("hammer-normal-mode.tar.gz did not contain a 'hammer' binary");
+    }
+    Ok(out_path)
+}
+
+#[cfg(feature = "normal-mode")]
+fn write_version_file(new_version: &str) -> Result<()> {
+    std::fs::create_dir_all(Path::new(VERSION_FILE).parent().unwrap_or(Path::new("/")))?;
+    let version_content = format!("[\n {}\n]\n", new_version);
+    let tmp = format!("{}.tmp", VERSION_FILE);
+    std::fs::write(&tmp, &version_content)?;
+    std::fs::rename(&tmp, VERSION_FILE)?;
+    Ok(())
+}
+
+#[cfg(not(feature = "normal-mode"))]
+async fn self_update_atomic(client: &HttpClient, tag: &str, new_version: &str) -> Result<()> {
+
     struct Target<'a> { name: &'a str, url: String, dest: &'a str, required: bool }
 
     let targets = [
