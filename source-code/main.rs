@@ -1,6 +1,7 @@
 // ── pkg/ ──────────────────────────────────────────────────────
 #[path = "pkg/cache.rs"]           mod cache;
 #[path = "pkg/db.rs"]              mod db;
+#[path = "pkg/dpkg_status.rs"]     mod dpkg_status;
 #[path = "pkg/deb.rs"]             mod deb;
 #[path = "pkg/package.rs"]         mod package;
 #[path = "pkg/solver/mod.rs"]      mod solver;
