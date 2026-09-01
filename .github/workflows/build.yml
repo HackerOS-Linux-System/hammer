@@ -1,1 +1,113 @@
+name: Build hammer
 
+# Builds the `hammer` binary from source.
+#
+# Modes (see [features] in Cargo.toml):
+#   default      -> cargo build --release
+#   oci          -> cargo build --release --features oci-mode
+#   normal       -> cargo build --release --features normal-mode
+#
+# Manual runs (workflow_dispatch) let you pick exactly one mode to build.
+# Automatic runs (push / pull_request) build all three, so a change can't
+# silently break a mode nobody happened to pick manually.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Build mode"
+        required: true
+        default: default
+        type: choice
+        options:
+          - default
+          - oci
+          - normal
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Manual run: build just the chosen mode ──────────────────────────────
+  build-selected:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OCI-mode system dependencies
+        if: inputs.mode == 'oci'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libostree-dev pkg-config clang libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ inputs.mode }}
+
+      - name: Build (default)
+        if: inputs.mode == 'default'
+        run: cargo build --release --locked
+
+      - name: Build (oci)
+        if: inputs.mode == 'oci'
+        run: cargo build --release --locked --features oci-mode
+
+      - name: Build (normal)
+        if: inputs.mode == 'normal'
+        run: cargo build --release --locked --features normal-mode
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hammer-${{ inputs.mode }}-${{ github.sha }}
+          path: target/release/hammer
+          if-no-files-found: error
+
+  # ── Push / PR: build all three modes so regressions can't hide ─────────
+  build-matrix:
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [default, oci, normal]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install OCI-mode system dependencies
+        if: matrix.mode == 'oci'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libostree-dev pkg-config clang libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.mode }}
+
+      - name: Build (default)
+        if: matrix.mode == 'default'
+        run: cargo build --release --locked
+
+      - name: Build (oci)
+        if: matrix.mode == 'oci'
+        run: cargo build --release --locked --features oci-mode
+
+      - name: Build (normal)
+        if: matrix.mode == 'normal'
+        run: cargo build --release --locked --features normal-mode
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: hammer-${{ matrix.mode }}-${{ github.sha }}
+          path: target/release/hammer
+          if-no-files-found: error
