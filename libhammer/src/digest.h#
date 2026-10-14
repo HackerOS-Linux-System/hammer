@@ -1,0 +1,31 @@
+use "std -> fs" from "fs"
+
+mod lhsys
+
+;; libhammer -> digest
+;;
+;; Port libhammer/src/digest.rs. SHA-256 liczy `sha256sum` (przez `lhsys`),
+;; bo `crypto::sha256*` nie dziala w backendzie LLVM (patrz lhsys.h#).
+
+;; SHA-256 zawartosci pliku (hex, male litery); `nil` gdy plik nieczytelny.
+pub fn sha256_file(path: string) -> string? is
+    if !fs::exists(path) || !fs::is_file(path) is return nil end
+    let h: string = lhsys::file_sha256(path)
+    if h == "" is return nil end
+    return h
+end
+
+;; SHA-256 napisu w pamieci (hex).
+pub fn sha256_str(data: string) -> string is
+    return lhsys::str_sha256(data)
+end
+
+;; Weryfikuje plik wzgledem oczekiwanego skrotu hex. Porownanie bez
+;; rozrozniania wielkosci liter; `false` przy kazdym bledzie I/O.
+pub fn verify_sha256(path: string, expected_hex: string) -> bool is
+    let actual: string? = sha256_file(path)
+    match actual is
+        nil => is return false end
+        a   => is return string_lower(a) == string_lower(expected_hex) end
+    end
+end
