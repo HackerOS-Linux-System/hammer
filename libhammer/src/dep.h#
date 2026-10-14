@@ -1,0 +1,80 @@
+mod lhpackage
+
+;; libhammer -> dep
+;;
+;; 1:1 port of libhammer/src/dep.rs. Parses a raw Debian `Depends:`-style
+;; field into `[DepGroup]` (comma-separated groups of `|`-separated
+;; alternatives). Pure string logic — no FFI, no `hk-parser` involved:
+;; this grammar (commas/pipes/parens/brackets) has nothing to do with
+;; the `.hk` config format hk-parser handles; that one's used by
+;; hammer's own `repo.h#` for `sources-list.hk`, not here.
+
+;; Parses a full dependency field, e.g. `"libssl3, libz1g | zlib1g"`.
+;; A group with zero valid alternatives (e.g. an empty comma segment)
+;; is dropped rather than kept as an empty `DepGroup`.
+pub fn parse_dep_field(s: string) -> [lhpackage::DepGroup] is
+    let mut out: [lhpackage::DepGroup] = []
+    for group_str in string_split(s, ",") is
+        let mut alts: [lhpackage::DepAlternative] = []
+        for alt in string_split(group_str, "|") is
+            let parsed: lhpackage::DepAlternative? = parse_alternative(string_trim(alt))
+            match parsed is
+                nil => is end
+                a   => is alts.push(a) end
+            end
+        end
+        if alts.len() > 0 is
+            out.push(lhpackage::DepGroup { alternatives: alts })
+        end
+    end
+    return out
+end
+
+;; Parses one alternative, e.g. `libssl3 (>= 3.0) [amd64]`.
+pub fn parse_alternative(raw: string) -> lhpackage::DepAlternative? is
+    let s0: string = string_trim(raw)
+    if s0 == "" is return nil end
+
+    ;; Architecture qualifier: `[amd64]` at the end.
+    let bstart: int = string_find(s0, "[")
+    let bend:    int = string_find(s0, "]")
+    let bend2:   int = if bend >= 0 then bend else string_len(s0)
+    let s1:      string  = if bstart >= 0 then string_trim(string_slice(s0, 0, bstart)) else s0
+    let bracket_arch: string? = if bstart >= 0 then string_trim(string_slice(s0, bstart + 1, bend2)) else nil
+
+    ;; Version constraint: `(>= 3.0)` at the end.
+    let pstart: int = string_find(s1, "(")
+    let pend:   int = string_find(s1, ")")
+    let pend2:  int = if pend >= 0 then pend else string_len(s1)
+    let name_part: string = if pstart >= 0 then string_trim(string_slice(s1, 0, pstart)) else string_trim(s1)
+    let constraint: lhpackage::VersionConstraint? = if pstart >= 0 then
+        parse_constraint(string_trim(string_slice(s1, pstart + 1, pend2)))
+    else nil
+
+    ;; Architecture suffix: `name:arch` (only used when no `[...]` was given).
+    let colon: int = string_find(name_part, ":")
+    let name:    string  = if colon >= 0 then string_slice(name_part, 0, colon) else name_part
+    let pkg_arch: string? = if colon >= 0 then string_slice(name_part, colon + 1, string_len(name_part)) else nil
+
+    let final_name: string = string_trim(name)
+    if final_name == "" is return nil end
+
+    let arch: string? = if bracket_arch != nil then bracket_arch else pkg_arch
+
+    return lhpackage::DepAlternative { name: final_name, constraint: constraint, arch: arch }
+end
+
+;; Formats: ">= 3.0"  "= 1.0"  ">> 2"  "<< 4"  "<= 5" — order matters:
+;; `>=`/`<=` must be tried before the bare `=` they both contain.
+fn parse_constraint(s: string) -> lhpackage::VersionConstraint? is
+    let ops: [string] = [">=", "<=", ">>", "<<", "="]
+    for op in ops is
+        if string_starts_with(s, op) is
+            let version: string = string_trim(string_slice(s, string_len(op), string_len(s)))
+            if version != "" is
+                return lhpackage::VersionConstraint { op: op, version: version }
+            end
+        end
+    end
+    return nil
+end
