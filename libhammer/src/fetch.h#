@@ -1,0 +1,108 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "bit -> progress-bar" from "pb"
+
+mod lhpackage
+mod lhdeb
+mod lhsys
+
+;; libhammer -> fetch
+;;
+;; Port libhammer/src/fetch.rs — PRZEPISANY pod backend LLVM: `std -> http`
+;; (`__builtin_http_request`) jest tylko w interpreterze, wiec pobieranie robi
+;; `curl` (przez `lhsys`), a dekompresja idzie plikami (`lhdeb::decompress_file`)
+;; zamiast `bytes`/`[int]`. Zmiany API wzgledem poprzedniej wersji:
+;; `try_fetch_bytes`/`fetch_bytes` (zwracaly `bytes`) -> `fetch_to_file`
+;; (sciezka pliku tymczasowego). User-agent: domyslny `curl` (oryginal Rusta
+;; ustawial `libhammer/<version>`).
+
+;; Fetches package indexes from a Debian-format repository.
+pub struct RepoFetcher is
+    pub base_url: string
+end
+
+impl RepoFetcher is
+    ;; `base_url`, np. "https://deb.debian.org/debian"; koncowy `/` jest ucinany.
+    pub fn new(base_url: string) -> RepoFetcher is
+        return RepoFetcher { base_url: trim_trailing_slash(base_url) }
+    end
+
+    ;; Pobiera i parsuje indeks `Packages` dla (suite, component, arch):
+    ;; probuje `.xz`, potem `.gz`, potem bez kompresji. Kazdy zwrocony
+    ;; `Package.repo_base_uri` = `base_url` tego fetchera.
+    pub fn fetch_packages(self, suite: string, component: string, arch: string) -> [lhpackage::Package] is
+        let base: string = self.base_url + "/dists/" + suite + "/" + component + "/binary-" + arch
+
+        let suffixes: [string] = ["Packages.xz", "Packages.gz", "Packages"]
+        let mut i: int = 0
+        while i < array_len(suffixes) is
+            let suffix: string = suffixes[i]
+            let url: string = base + "/" + suffix
+            let raw: string = self.fetch_to_file(url)
+            if raw != "" is
+                let plain: string = lhdeb::decompress_file(raw, suffix)
+                let text: string = fs::read(plain)
+                fs::remove(raw)
+                fs::remove(plain)
+                let pkgs: [lhpackage::Package] = lhpackage::Package::parse_index(text)
+                let mut annotated: [lhpackage::Package] = []
+                let mut j: int = 0
+                while j < pkgs.len() is
+                    annotated.push(pkgs[j].with_repo_base_uri(self.base_url))
+                    j += 1
+                end
+                return annotated
+            end
+            i += 1
+        end
+
+        panic("hammer: nie udalo sie pobrac indeksu Packages z " + base +
+              " (probowano .xz, .gz, bez kompresji)")
+        let none: [lhpackage::Package] = []
+        return none
+    end
+
+    ;; Pobiera plik `Release` dla `suite` jako tekst (bez dekompresji).
+    pub fn fetch_release(self, suite: string) -> string is
+        let url: string = self.base_url + "/dists/" + suite + "/Release"
+        let resp: lhsys::HttpText = lhsys::http_get_text(url)
+        if resp.status < 200 || resp.status >= 300 is
+            panic("hammer: HTTP " + to_string(resp.status) + " przy pobieraniu " + url)
+        end
+        return resp.body
+    end
+
+    ;; Pobiera `url` do pliku tymczasowego; zwraca jego sciezke albo "" przy
+    ;; kodzie != 2xx (wolajacy sprzata plik).
+    pub fn fetch_to_file(self, url: string) -> string is
+        let tmp: string = fs::temp_file("libhammer-fetch")
+        let status: int = lhsys::http_download(url, tmp)
+        if status < 200 || status >= 300 is
+            fs::remove(tmp)
+            return ""
+        end
+        return tmp
+    end
+end
+
+fn trim_trailing_slash(s: string) -> string is
+    let mut e: int = string_len(s)
+    while e > 0 && string_slice(s, e - 1, e) == "/" is
+        e -= 1
+    end
+    return string_slice(s, 0, e)
+end
+
+;; Pobiera `url` do `dest_path` ze spinnerem `progress-bar` (nie bylo w Rust).
+;; Spinner pokazuje, ze hammer pracuje; postep bajtowy wymagalby strumieniowego
+;; API HTTP.
+pub fn download_with_progress(url: string, dest_path: string, label: string) is
+    let sp: pb::spinner::Spinner = pb::quick_spinner(label + ": pobieranie...")
+    sp.draw()
+    let status: int = lhsys::http_download(url, dest_path)
+    if status < 200 || status >= 300 is
+        sp.fail(label + ": HTTP " + to_string(status))
+        panic("hammer: HTTP " + to_string(status) + " przy pobieraniu " + url)
+    end
+    sp.finish(label + ": pobrano")
+end
