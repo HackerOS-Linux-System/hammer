@@ -1,0 +1,198 @@
+use "std -> conv" from "conv"
+
+mod control
+
+;; libhammer -> release
+;;
+;; 1:1 port of libhammer/src/release.rs. `sha256_files` is a plain array
+;; here rather than a hashmap: `std -> collections`'s `HashMap` only
+;; stores `string` values (see collections.h#'s `map_get_str`), and a
+;; `Release` file's checksum listing is at most a few hundred lines —
+;; well under where a linear scan in `file()` would actually matter.
+
+;; One entry in a `Release` file's checksum listing (`MD5Sum:`, `SHA1:`,
+;; or `SHA256:` field) — one line per published index file, e.g.
+;; `main/binary-amd64/Packages`, `main/binary-amd64/Packages.gz`, etc.
+pub struct ReleaseFileEntry is
+    ;; Hex-encoded checksum, as published (lowercase, no `0x` prefix).
+    pub checksum: string
+    ;; Size in bytes, as published.
+    pub size: int
+    ;; Path relative to the repository suite root, e.g.
+    ;; `main/binary-amd64/Packages.xz`.
+    pub path: string
+end
+
+;; Parsed `Release`/`InRelease` metadata.
+pub struct Release is
+    pub origin:         string?    ;; `Origin:` — repository publisher (e.g. `Debian`)
+    pub label:          string?    ;; `Label:`
+    pub suite:          string?    ;; `Suite:` — e.g. `stable`, `testing`
+    pub codename:       string?    ;; `Codename:` — e.g. `bookworm`, `trixie`
+    pub version:        string?    ;; `Version:` — e.g. `12.5`
+    ;; `Date:` — publication timestamp, kept as the raw RFC 2822 string;
+    ;; parsing into a concrete date is left to the caller (mirrors the
+    ;; Rust original avoiding a hard dependency on a date-parsing crate).
+    pub date:           string?
+    pub architectures:  [string]   ;; `Architectures:`, space-separated in the source
+    pub components:     [string]   ;; `Components:`, space-separated in the source
+    pub description:    string?
+    ;; Every file listed under `SHA256:` (falling back to `SHA1:`/
+    ;; `MD5Sum:`, in that order, only if `SHA256:` is entirely absent —
+    ;; real-world Debian/Ubuntu repos always publish `SHA256:`).
+    pub checksum_files: [ReleaseFileEntry]
+end
+
+impl Release is
+    ;; Parses a `Release` or `InRelease` file's content. Strips PGP armor
+    ;; if present (does **not** verify the signature — see module docs
+    ;; in the original Rust crate; signature verification belongs to
+    ;; hammer's own GPG layer, not this parser).
+    pub fn parse(content: string) -> Release is
+        let body:   string = strip_pgp_armor(content)
+        let fields: control::Fields = control::parse_block(body)
+
+        let sha256_block: string? = fields.get("SHA256")
+        let sha1_block:   string? = fields.get("SHA1")
+        let md5_block:    string? = fields.get("MD5Sum")
+        let checksum_files: [ReleaseFileEntry] = pick_checksum_block(sha256_block, sha1_block, md5_block)
+
+        return Release {
+            origin:         fields.get("Origin"),
+            label:          fields.get("Label"),
+            suite:          fields.get("Suite"),
+            codename:       fields.get("Codename"),
+            version:        fields.get("Version"),
+            date:           fields.get("Date"),
+            architectures:  split_list(fields, "Architectures"),
+            components:     split_list(fields, "Components"),
+            description:    fields.get("Description"),
+            checksum_files: checksum_files,
+        }
+    end
+
+    ;; Looks up the expected checksum entry for a path relative to the
+    ;; suite root, e.g. `"main/binary-amd64/Packages.xz"`.
+    pub fn file(self, path: string) -> ReleaseFileEntry? is
+        let mut i: int = 0
+        while i < self.checksum_files.len() is
+            if self.checksum_files[i].path == path is return self.checksum_files[i] end
+            i += 1
+        end
+        return nil
+    end
+
+    ;; `true` if `arch` (e.g. `"amd64"`) is listed in `Architectures:`.
+    pub fn supports_arch(self, arch: string) -> bool is
+        let mut i: int = 0
+        while i < self.architectures.len() is
+            if self.architectures[i] == arch is return true end
+            i += 1
+        end
+        return false
+    end
+end
+
+fn pick_checksum_block(sha256_block: string?, sha1_block: string?, md5_block: string?) -> [ReleaseFileEntry] is
+    if sha256_block != nil is
+        let b: string = sha256_block
+        return parse_checksum_list(b)
+    end
+    if sha1_block != nil is
+        let b: string = sha1_block
+        return parse_checksum_list(b)
+    end
+    if md5_block != nil is
+        let b: string = md5_block
+        return parse_checksum_list(b)
+    end
+    let none: [ReleaseFileEntry] = []
+    return none
+end
+
+fn split_list(fields: control::Fields, key: string) -> [string] is
+    let v: string? = fields.get(key)
+    match v is
+        nil => is return [] end
+        s   => is return split_whitespace(s) end
+    end
+end
+
+fn split_whitespace(s: string) -> [string] is
+    let mut out: [string] = []
+    for part in string_split(s, " ") is
+        let p: string = string_trim(part)
+        if p != "" is out.push(p) end
+    end
+    return out
+end
+
+;; The `SHA256:`/`SHA1:`/`MD5Sum:` field body is itself a list, one
+;; entry per line (already un-folded by `control::parse_block` into one
+;; `\n`-joined string):
+;;   <checksum> <size> <path>
+fn parse_checksum_list(block: string) -> [ReleaseFileEntry] is
+    let mut out: [ReleaseFileEntry] = []
+    for raw_line in string_split(block, "\n") is
+        let line: string = string_trim(raw_line)
+        if line == "" is continue end
+        let parts: [string] = split_whitespace(line)
+        if array_len(parts) < 3 is continue end
+        let checksum: string = parts[0]
+        let size_s:   string = parts[1]
+        let path:     string = parts[2]
+        if !is_all_digits(size_s) is continue end
+        out.push(ReleaseFileEntry { checksum: checksum, size: conv::str_to_int(size_s), path: path })
+    end
+    return out
+end
+
+fn is_all_digits(s: string) -> bool is
+    if s == "" is return false end
+    let mut i: int = 0
+    while i < string_len(s) is
+        let c: string = string_at(s, i)
+        if !(c >= "0" && c <= "9") is return false end
+        i += 1
+    end
+    return true
+end
+
+;; `string_trim_right` (std) only trims whitespace as a fixed builtin
+;; notion — this needs a specific *set* of trailing chars (newline,
+;; space, tab) stripped after slicing off the PGP signature block.
+fn trim_right_set(s: string, cutset: string) -> string is
+    let mut e: int = string_len(s)
+    while e > 0 && string_find(cutset, string_slice(s, e - 1, e)) >= 0 is
+        e -= 1
+    end
+    return string_slice(s, 0, e)
+end
+
+;; Strips `-----BEGIN PGP SIGNED MESSAGE-----`/`Hash: ...`/
+;; `-----BEGIN PGP SIGNATURE-----...-----END PGP SIGNATURE-----` armor
+;; from an `InRelease` file, returning just the control-file body.
+;; Content without any armor (a plain `Release` file) is returned
+;; unchanged.
+fn strip_pgp_armor(content: string) -> string is
+    let begin_marker: string = "-----BEGIN PGP SIGNED MESSAGE-----"
+    let sig_marker:   string = "-----BEGIN PGP SIGNATURE-----"
+
+    let begin_idx: int = string_find(content, begin_marker)
+    ;; Computed unconditionally (cheap, and safe even when `begin_idx <
+    ;; 0` since `string_slice`/`string_find` on the whole string just
+    ;; won't matter — `body_start` below only uses them when armor
+    ;; actually starts).
+    let after: int    = begin_idx + string_len(begin_marker)
+    let rest:  string = if begin_idx >= 0 then string_slice(content, after, string_len(content)) else ""
+    let blank: int    = string_find(rest, "\n\n")
+    let skip_to_blank: int = if blank >= 0 then after + blank + 2 else after
+    let body_start: int = if begin_idx < 0 then 0 else skip_to_blank
+
+    let body: string = string_slice(content, body_start, string_len(content))
+    let sig_idx: int = string_find(body, sig_marker)
+    if sig_idx >= 0 is
+        return trim_right_set(string_slice(body, 0, sig_idx), "\n \t")
+    end
+    return trim_right_set(body, "\n \t")
+end
