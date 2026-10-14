@@ -1,0 +1,48 @@
+pub struct SolverProblem is
+    pub message:  string
+    ;; Packages involved in the conflict, when the underlying solver can
+    ;; name them. `satsolv::solver::all_problems_as_strings` (see
+    ;; solver.h#) only gives us free-text problem descriptions, not a
+    ;; structured package list, so this is `[]` for every problem
+    ;; produced there today — kept as a field (rather than dropped) so
+    ;; a future, more structured problem source doesn't need an API
+    ;; change here.
+    pub packages: [string]
+end
+
+;; Error returned by `solver::resolve` (solver.h#).
+pub enum SolverError is
+    ;; The formula is unsatisfiable, with a top-level message.
+    Unsatisfiable(string)
+    ;; One or more conflicts were detected.
+    Problems([SolverProblem])
+end
+
+impl SolverError is
+    ;; Builds a `Problems` error from a single problem.
+    pub fn single(p: SolverProblem) -> SolverError is
+        return SolverError::Problems([p])
+    end
+
+    pub fn unsat(msg: string) -> SolverError is
+        return SolverError::Unsatisfiable(msg)
+    end
+
+    ;; Human-readable rendering — the H# equivalent of the Rust
+    ;; original's `impl fmt::Display for SolverError`.
+    pub fn display(self) -> string is
+        match self is
+            SolverError::Unsatisfiable(msg) => is return "Unsatisfiable: " + msg end
+            SolverError::Problems(ps)       => is
+                if ps.len() == 1 is return ps[0].message end
+                let mut out: string = to_string(ps.len()) + " conflicts:"
+                let mut i: int = 0
+                while i < ps.len() is
+                    out = out + "\n  - " + ps[i].message
+                    i += 1
+                end
+                return out
+            end
+        end
+    end
+end
