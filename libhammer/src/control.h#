@@ -1,0 +1,144 @@
+pub struct Fields is
+    pub keys:   [string]
+    pub values: [string]
+end
+
+impl Fields is
+    pub fn new() -> Fields is
+        return Fields { keys: [], values: [] }
+    end
+
+    pub fn get(self, key: string) -> string? is
+        let mut i: int = 0
+        while i < self.keys.len() is
+            if self.keys[i] == key is return self.values[i] end
+            i += 1
+        end
+        return nil
+    end
+
+    pub fn get_or(self, key: string, default_val: string) -> string is
+        let v: string? = self.get(key)
+        match v is
+            nil => is return default_val end
+            s   => is return s end
+        end
+    end
+
+    pub fn has(self, key: string) -> bool is
+        return self.get(key) != nil
+    end
+
+    ;; Insert-or-overwrite, preserving the *first* position a key was
+    ;; seen at — exactly `IndexMap::insert`'s behaviour on an existing key.
+    pub fn set(self, key: string, val: string) is
+        let mut i: int = 0
+        while i < self.keys.len() is
+            if self.keys[i] == key is
+                self.values[i] = val
+                return
+            end
+            i += 1
+        end
+        self.keys.push(key)
+        self.values.push(val)
+    end
+
+    pub fn len(self) -> int is
+        return self.keys.len()
+    end
+end
+
+;; Parses a single control-file block (no blank lines inside it) into an
+;; ordered set of fields. Folded continuation lines (starting with a
+;; space or tab) are un-folded and appended to the previous field's
+;; value, joined with `\n` — matches how `dpkg`/`apt` treat multi-line
+;; `Description:`-style fields. A continuation line containing only a
+;; single `.` is an explicit blank line within the field (the standard
+;; convention for blank paragraph separators in long descriptions).
+pub fn parse_block(block: string) -> Fields is
+    let mut fields: Fields = Fields::new()
+    let mut current_key: string? = nil
+
+    for line in string_split(block, "\n") is
+        if line == "" is continue end
+
+        if string_starts_with(line, " ") || string_starts_with(line, "\t") is
+            match current_key is
+                nil => is continue end
+                key => is
+                    let trimmed: string = ltrim(line)
+                    let cont: string = if trimmed == "." then "" else trimmed
+                    let existing: string? = fields.get(key)
+                    match existing is
+                        nil => is end
+                        v   => is fields.set(key, v + "\n" + cont) end
+                    end
+                end
+            end
+            continue
+        end
+
+        let colon: int = string_find(line, ":")
+        if colon >= 0 is
+            let k: string = string_trim(string_slice(line, 0, colon))
+            let v: string = string_trim(string_slice(line, colon + 1, string_len(line)))
+            fields.set(k, v)
+            current_key = k
+        end
+    end
+
+    return fields
+end
+
+;; Parses a multi-block control file (blocks separated by one or more
+;; blank lines) — the format of `Packages`, `/var/lib/dpkg/status`, and
+;; `Sources` files. Empty blocks (extra blank lines) are skipped.
+pub fn parse_blocks(content: string) -> [Fields] is
+    let mut out: [Fields] = []
+    for block in string_split(content, "\n\n") is
+        let trimmed: string = string_trim(block)
+        if trimmed != "" is out.push(parse_block(trimmed)) end
+    end
+    return out
+end
+
+;; Serialises `fields` back into control-file format, preserving
+;; insertion order. Multi-line values (containing `\n`) are folded back
+;; with a leading space on continuation lines, and empty continuation
+;; lines are written as a single `.` — the inverse of `parse_block`'s
+;; folding.
+pub fn write_block(fields: Fields) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < fields.len() is
+        let k: string = fields.keys[i]
+        let v: string = fields.values[i]
+        let lines: [string] = string_split(v, "\n")
+        let mut li: int = 0
+        while li < array_len(lines) is
+            if li == 0 is
+                out = out + k + ": " + lines[li] + "\n"
+            else is
+                if lines[li] == "" is
+                    out = out + " .\n"
+                else is
+                    out = out + " " + lines[li] + "\n"
+                end
+            end
+            li += 1
+        end
+        i += 1
+    end
+    return out
+end
+
+;; `trim_start` (bare `string_trim_left` nie istnieje w backendzie LLVM).
+fn ltrim(s: string) -> string is
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n && (string_at(s, i) == " " || string_at(s, i) == "\t") is
+        i += 1
+    end
+    return string_slice(s, i, n)
+end
