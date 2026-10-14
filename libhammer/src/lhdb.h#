@@ -1,0 +1,253 @@
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+mod lhsys
+
+mod lhpackage
+
+;; libhammer -> db
+;;
+;; Port of libhammer/src/db.rs. ZMIANA wzgledem poprzedniej wersji tego
+;; pliku: `std -> sqlite` udostepnia `prepare/bind/step/column_*`, ale to
+;; atrapy, a kompilator nie ma dla nich implementacji ("codegen:
+;; undefined fn: prepare"). W H# v0.9 natywny backend (AOT) odrzuca tez
+;; kazde uzycie `sqlite_open/exec/close` i `std -> db/sqlite`. Jedyna
+;; przyjmowana sciezka to wbudowane `db_query_bind(plik, sql, bind)` (argv
+;; bez powloki -> CLI `sqlite3 -separator '\t'`; wiersze `\n`, kolumny
+;; `\t`, NULL = ""). "Uchwytem" jest sciezka pliku bazy. Wartosci trafiaja
+;; do SQL przez `q()` (podwajanie apostrofu, zawsze w cudzyslowiu SQL) —
+;; ta sama ochrona przed wstrzyknieciem SQL, co `?` w runtime, bez limitu
+;; 3 bindow; wywolanie 3-argumentowe z pustym bindem nie podstawia nic za
+;; `?`. `:memory:` nie dziala (kazde wywolanie to osobny proces) —
+;; `open_in_memory` uzywa pliku tymczasowego.
+
+;; Why a package was installed.
+pub enum InstallReason is
+    User
+    Dependency
+end
+
+impl InstallReason is
+    pub fn as_str(self) -> string is
+        match self is
+            InstallReason::User       => is return "user" end
+            InstallReason::Dependency => is return "dep"  end
+        end
+    end
+
+    pub fn from_str(s: string) -> InstallReason is
+        if s == "user" is return InstallReason::User end
+        return InstallReason::Dependency
+    end
+end
+
+;; A package as recorded in the installed DB.
+pub struct InstalledPackage is
+    pub name:              string
+    pub version:           string
+    pub architecture:      string
+    pub installed_size_kb: int
+    pub section:           string?
+    pub maintainer:        string?
+    pub description_short: string?
+    ;; ISO-8601-ish UTC timestamp string (`time::format`'s output) —
+    ;; kept as a string, exactly like the Rust original keeps an RFC
+    ;; 3339 string in the same column (parsed back into a real
+    ;; `DateTime<Utc>` there only at read time; callers here that need
+    ;; a unix timestamp back can `date::parse` it themselves).
+    pub installed_at:      string
+    pub reason:            InstallReason
+    pub store_hash:        string
+    pub depends:           string?
+    pub recommends:        string?
+end
+
+;; SQLite database of installed packages.
+pub struct InstalledDb is
+    pub handle: string   ;; opaque handle from `sqlite::open` (see std/sqlite.h#)
+end
+
+fn schema_v1() -> string is
+    return "CREATE TABLE IF NOT EXISTS installed (" +
+    "  name               TEXT    NOT NULL PRIMARY KEY," +
+    "  version            TEXT    NOT NULL," +
+    "  architecture       TEXT    NOT NULL DEFAULT 'amd64'," +
+    "  installed_size_kb  INTEGER NOT NULL DEFAULT 0," +
+    "  section            TEXT," +
+    "  maintainer         TEXT," +
+    "  description_short  TEXT," +
+    "  installed_at       TEXT    NOT NULL," +
+    "  reason             TEXT    NOT NULL DEFAULT 'dep'," +
+    "  store_hash         TEXT    NOT NULL DEFAULT ''," +
+    "  depends            TEXT," +
+    "  recommends         TEXT" +
+    "); CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);"
+end
+
+impl InstalledDb is
+    pub fn open(path: string) -> InstalledDb is
+        let h: string = path
+        sql_run(h, "PRAGMA journal_mode=WAL;")
+        return InstalledDb { handle: h }
+    end
+
+    pub fn open_in_memory() -> InstalledDb is
+        let tmp: string = "/tmp/libhammer-mem-" + to_string(lhsys::now_ms()) + ".sqlite"
+        return InstalledDb { handle: tmp }
+    end
+
+    pub fn migrate(self) is
+        sql_run(self.handle, schema_v1())
+    end
+
+    ;; ── Queries ──────────────────────────────────────────────────────────
+
+    pub fn is_installed(self, name: string) -> bool is
+        return run_rows(self, "SELECT 1 FROM installed WHERE name = " + q(name)).len() > 0
+    end
+
+    pub fn get(self, name: string) -> InstalledPackage? is
+        let rows: [string] = run_rows(self,
+            "SELECT " + pkg_columns() + " FROM installed WHERE name = " + q(name))
+        if rows.len() == 0 is return nil end
+        return row_to_pkg(rows[0])
+    end
+
+    pub fn list_all(self) -> [InstalledPackage] is
+        let rows: [string] = run_rows(self, "SELECT " + pkg_columns() + " FROM installed ORDER BY name")
+        let mut out: [InstalledPackage] = []
+        let mut i: int = 0
+        while i < rows.len() is
+            out.push(row_to_pkg(rows[i]))
+            i += 1
+        end
+        return out
+    end
+
+    pub fn count(self) -> int is
+        let rows: [string] = run_rows(self, "SELECT COUNT(*) FROM installed")
+        if rows.len() == 0 is return 0 end
+        if !str::is_numeric(rows[0]) is return 0 end
+        return conv::str_to_int(rows[0])
+    end
+
+    ;; ── Mutations ────────────────────────────────────────────────────────
+
+    ;; Also used for upgrades (`INSERT OR REPLACE`), like the Rust original.
+    pub fn record_install(self, pkg: lhpackage::Package, reason: InstallReason, store_hash: string) is
+        sql_run(self.handle,
+            "INSERT OR REPLACE INTO installed " +
+            "(name,version,architecture,installed_size_kb,section,maintainer," +
+            " description_short,installed_at,reason,store_hash,depends,recommends) VALUES (" +
+            q(pkg.name) + "," + q(pkg.version) + "," + q(pkg.architecture) + "," +
+            to_string(pkg.installed_size_kb) + "," + qo(pkg.section) + "," +
+            qo(pkg.maintainer) + "," + qo(pkg.description_short) + "," +
+            "strftime('%Y-%m-%dT%H:%M:%S','now')," + q(reason.as_str()) + "," +
+            q(store_hash) + "," + qo(pkg.depends) + "," + qo(pkg.recommends) + ");")
+    end
+
+    pub fn record_upgrade(self, pkg: lhpackage::Package, store_hash: string) is
+        self.record_install(pkg, InstallReason::User, store_hash)
+    end
+
+    pub fn record_remove(self, name: string) is
+        sql_run(self.handle, "DELETE FROM installed WHERE name = " + q(name) + ";")
+    end
+
+    pub fn set_reason(self, name: string, reason: InstallReason) is
+        sql_run(self.handle, "UPDATE installed SET reason = " + q(reason.as_str()) +
+            " WHERE name = " + q(name) + ";")
+    end
+
+    pub fn close(self) is
+        ;; brak polaczenia do zamkniecia — kazde zapytanie to osobny proces sqlite3
+    end
+end
+
+;; ── Helpers ──────────────────────────────────────────────────────────────
+
+fn q(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "''") + "'"
+end
+
+fn qo(v: string?) -> string is
+    if v == nil is return "NULL" end
+    let s: string = v
+    return q(s)
+end
+
+;; Jedyna sciezka do SQLite, ktora natywny backend AOT (LLVM) przyjmuje:
+;; `db_query_bind` (argv bez powloki -> CLI `sqlite3 -separator '\t' <plik> <sql>`).
+;; `sqlite_open/exec/close` i `std -> sqlite/db` SA ODRZUCANE przez AOT
+;; ("this program uses `db ->`, which the native AOT (LLVM) backend doesn't
+;; support yet"). "Uchwytem" jest po prostu sciezka pliku bazy.
+;; WAZNE: wywolanie 3-argumentowe z pustym bindem => runtime nie podstawia
+;; nic za `?` (wersja 5-argumentowa podstawialaby `\'\'` za kazde `?`, takze
+;; wewnatrz danych, np. opisu "Why?").
+fn sql_run(handle: string, sql: string) -> string is
+    return db_query_bind(handle, sql, "")
+end
+
+fn is_sql_error(out: string) -> bool is
+    if out.starts_with("Error:") is return true end
+    if out.starts_with("Parse error") is return true end
+    if out.starts_with("Runtime error") is return true end
+    if out.starts_with("db error") is return true end
+    if out.starts_with("sqlite3 not found") is return true end
+    return false
+end
+
+fn clean(col: string) -> string is
+    return "replace(replace(coalesce(" + col + ",''), char(9), ' '), char(10), ' ')"
+end
+
+fn pkg_columns() -> string is
+    return "name, version, architecture, installed_size_kb, " + clean("section") + ", " +
+        clean("maintainer") + ", " + clean("description_short") + ", installed_at, reason, " +
+        "store_hash, " + clean("depends") + ", " + clean("recommends")
+end
+
+fn run_rows(db: InstalledDb, sql: string) -> [string] is
+    let out: string = sql_run(db.handle, sql)
+    let mut rows: [string] = []
+    if is_sql_error(out) is return rows end
+    let lines: [string] = str::split(out, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i] != "" is rows.push(lines[i]) end
+        i += 1
+    end
+    return rows
+end
+
+fn field(cols: [string], i: int) -> string is
+    if i < cols.len() is return cols[i] end
+    return ""
+end
+
+;; NULL/"" -> absent (same round-trip as `qo`).
+fn empty_to_nil(s: string) -> string? is
+    if s == "" is return nil end
+    return s
+end
+
+fn row_to_pkg(line: string) -> InstalledPackage is
+    let c: [string] = str::split(line, "\t")
+    let size_raw: string = field(c, 3)
+    let mut size: int = 0
+    if str::is_numeric(size_raw) is size = conv::str_to_int(size_raw) end
+    return InstalledPackage {
+        name:              field(c, 0),
+        version:           field(c, 1),
+        architecture:      field(c, 2),
+        installed_size_kb: size,
+        section:           empty_to_nil(field(c, 4)),
+        maintainer:        empty_to_nil(field(c, 5)),
+        description_short: empty_to_nil(field(c, 6)),
+        installed_at:      field(c, 7),
+        reason:            InstallReason::from_str(field(c, 8)),
+        store_hash:        field(c, 9),
+        depends:           empty_to_nil(field(c, 10)),
+        recommends:        empty_to_nil(field(c, 11))
+    }
+end
