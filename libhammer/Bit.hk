@@ -16,5 +16,5 @@
 -> link => static
 
 [dependencies]
--> satsolv.version      => >=0.1.0
--> progress-bar.version => >=1.0.0
+-> satsolv.version      => newest
+-> progress-bar.version => newest
