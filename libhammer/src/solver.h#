@@ -74,43 +74,43 @@ pub fn resolve(installed: [lhpackage::Package], available: [lhpackage::Package],
                 install_names: [string], remove_names: [string],
                 arch: string, allow_downgrade: bool) -> SolveOutcome is
 
-    let p: int = pool::create()
+    let p: int = pool::new()
     pool::set_arch(p, arch)
 
-    let system: int = repo::create(p, "installed")
-    pool::set_installed(p, system)
+    let system: int = repo::new(p, "installed")
+    pool::set_installed_repo(p, system)
     if installed.len() > 0 is
         let sys_pkgs: [repo::Pkg] = to_satsolv_pkgs(installed)
         match repo::add_packages(p, system, sys_pkgs) is
             SatResult::Err(msg) => is
-                repo::free(system, false)
-                pool::free(p)
+                repo::destroy(system, false)
+                pool::destroy(p)
                 return SolveOutcome::Err(solver_error::SolverError::unsat(
                     "failed to load installed-package state: " + msg))
             end
             SatResult::Ok(rc) => is end
         end
     end
-    repo::internalize(system)
+    repo::finalize(system)
 
-    let avail: int = repo::create(p, "available")
+    let avail: int = repo::new(p, "available")
     repo::set_priority(avail, 0, 0)
     if available.len() > 0 is
         let avail_pkgs: [repo::Pkg] = to_satsolv_pkgs(available)
         match repo::add_packages(p, avail, avail_pkgs) is
             SatResult::Err(msg) => is
-                repo::free(avail, false)
-                repo::free(system, false)
-                pool::free(p)
+                repo::destroy(avail, false)
+                repo::destroy(system, false)
+                pool::destroy(p)
                 return SolveOutcome::Err(solver_error::SolverError::unsat(
                     "failed to load available-package index: " + msg))
             end
             SatResult::Ok(rc) => is end
         end
     end
-    repo::internalize(avail)
+    repo::finalize(avail)
 
-    pool::createwhatprovides(p)
+    pool::create_whatprovides(p)
 
     let jobs: int = queue::new()
     let mut i: int = 0
@@ -124,10 +124,10 @@ pub fn resolve(installed: [lhpackage::Package], available: [lhpackage::Package],
         i += 1
     end
 
-    let s: int = solver::create(p)
+    let s: int = solver::new(p)
     solver::allow_downgrade(s, allow_downgrade)
 
-    let problems: i32 = solver::solve(s, jobs)
+    let problems: i32 = solver::run(s, jobs)
 
     if problems > 0 is
         let msgs: [string] = solver::all_problems_as_strings(s)
@@ -137,11 +137,11 @@ pub fn resolve(installed: [lhpackage::Package], available: [lhpackage::Package],
             probs.push(solver_error::SolverProblem { message: msgs[pi], packages: [] })
             pi += 1
         end
-        queue::free(jobs)
-        solver::free(s)
-        repo::free(avail, false)
-        repo::free(system, false)
-        pool::free(p)
+        queue::destroy(jobs)
+        solver::destroy(s)
+        repo::destroy(avail, false)
+        repo::destroy(system, false)
+        pool::destroy(p)
         return SolveOutcome::Err(solver_error::SolverError::Problems(probs))
     end
 
@@ -154,13 +154,13 @@ pub fn resolve(installed: [lhpackage::Package], available: [lhpackage::Package],
         steps.push(parse_solvable_label(label))
         si += 1
     end
-    transaction::free(t)
+    transaction::destroy(t)
 
-    queue::free(jobs)
-    solver::free(s)
-    repo::free(avail, false)
-    repo::free(system, false)
-    pool::free(p)
+    queue::destroy(jobs)
+    solver::destroy(s)
+    repo::destroy(avail, false)
+    repo::destroy(system, false)
+    pool::destroy(p)
 
     return SolveOutcome::Ok(steps)
 end
