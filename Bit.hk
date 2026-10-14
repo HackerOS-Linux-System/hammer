@@ -1,1 +1,38 @@
+[package]
+-> name        => hammer
+-> version     => 0.7.0
+-> description => Menedzer pakietow HackerOS..
+-> authors     => ["HackerOS Team <hackeros068@gmail.com>"]
+-> license     => Apache-2.0
+-> lang        => h#
 
+[layout]
+-> src => source-code
+
+[build]
+-> link => static
+
+! goly `bit` w tym repo buduje binarke release
+[default-build]
+-> profile => release
+
+[dependencies]
+-> libhammer    => newest
+-> satsolv   => newest
+-> hk-parser => newest
+-> progress-bar => newest
+-> colors => newest
+
+[commands]
+-> check
+--> run => bit check
+--> description => Sprawdz skladnie/typy wszystkich modulow
+-> build-normal
+--> run => sed -i 's/return "atomic" end/return "normal" end/' source-code/internal/build_mode.h# && bit build
+--> description => Build w trybie normal-mode (bez atomowosci) — patrz internal/build_mode.h#
+-> build-oci
+--> run => sed -i 's/fn compiled_oci() -> bool is return false end/fn compiled_oci() -> bool is return true end/' source-code/internal/build_mode.h# && bit build
+--> description => Build z wlaczonym `hammer oci`
+
+[hooks]
+-> pre-build => echo "building hammer (static)"
