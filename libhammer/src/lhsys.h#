@@ -1,0 +1,73 @@
+use "std -> strings" from "str"
+use "std -> fs"      from "fs"
+use "std -> conv" from "conv"
+
+;; libhammer -> lhsys
+;;
+;; Zamienniki `std -> http`, `crypto`, `time`, ktorych backend LLVM v0.9
+;; (`h# compile`) NIE obsluguje (builtiny oznaczone w
+;; compiler/src/builtins_registry.rs jako `Backend::Interpreter`; typ `bytes`
+;; ma po stronie LLVM tylko `fs::read_bytes`/`write_bytes`). Zamiast buforow
+;; w pamieci wszystko idzie przez pliki i narzedzia systemowe (`curl`,
+;; `sha256sum`) — ta sama droga, ktora wybral `bit` (patrz `bit/src/util.h#`).
+
+pub fn sq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+;; Kod wyjscia polecenia (stdout/stderr polecenia sa tracone). `system()` w
+;; LLVM wymaga wlasnej deklaracji `extern` (jak w bit/src/util.h#), a
+;; libhammer ma byc samodzielna biblioteka, wiec idzie przez wbudowane `shell`.
+pub fn sh_rc(cmd: string) -> int is
+    let out: string = str::trim(shell("(" + cmd + ") >/dev/null 2>&1; echo $?"))
+    if str::is_numeric(out) is return conv::str_to_int(out) end
+    return 1
+end
+
+;; Patrz `internal/compat.h#::str_index_of` (hammer); libhammer jest osobna
+;; biblioteka, wiec ma wlasna kopie.
+pub fn index_of(s: string, sub: string) -> int is
+    if string_len(sub) == 0 is return -1 end
+    return string_find(s, sub)
+end
+
+pub fn now_ms() -> int is
+    return __builtin_time_now_ms()
+end
+
+;; SHA-256 pliku (hex); "" gdy nieczytelny.
+pub fn file_sha256(path: string) -> string is
+    let out: string = str::trim(shell("sha256sum -- " + sq(path) + " 2>/dev/null"))
+    if out == "" is return "" end
+    return str::slice(out, 0, index_of(out, " "))
+end
+
+;; SHA-256 napisu (hex); bez NUL w danych.
+pub fn str_sha256(data: string) -> string is
+    let out: string = str::trim(shell("printf %s " + sq(data) + " | sha256sum 2>/dev/null"))
+    if out == "" is return "" end
+    return str::slice(out, 0, index_of(out, " "))
+end
+
+pub struct HttpText is
+    pub status: int
+    pub body:   string
+end
+
+;; Pobiera `url` do pliku `dest`; zwraca kod HTTP (0 = blad sieci/curl).
+;; `--retry 2` jak w `bit` (chwilowe bledy DNS/polaczenia).
+pub fn http_download(url: string, dest: string) -> int is
+    let out: string = str::trim(shell("curl -sSL --retry 2 -w '%{{http_code}}' -o " + sq(dest) + " " + sq(url) + " 2>/dev/null"))
+    if str::is_numeric(out) is return conv::str_to_int(out) end
+    return 0
+end
+
+;; GET jako tekst (np. `Release`).
+pub fn http_get_text(url: string) -> HttpText is
+    let tmp: string = fs::temp_file("libhammer-http")
+    let status: int = http_download(url, tmp)
+    let mut body: string = ""
+    if status >= 200 && status < 300 && fs::exists(tmp) is body = fs::read(tmp) end
+    fs::remove(tmp)
+    return HttpText { status: status, body: body }
+end
