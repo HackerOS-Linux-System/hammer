@@ -97,7 +97,7 @@ end
 ;; Spinner pokazuje, ze hammer pracuje; postep bajtowy wymagalby strumieniowego
 ;; API HTTP.
 pub fn download_with_progress(url: string, dest_path: string, label: string) is
-    let sp: pb::spinner::Spinner = pb::quick_spinner(label + ": pobieranie...")
+    let sp: spinner::Spinner = pb::quick_spinner(label + ": pobieranie...")
     sp.draw()
     let status: int = lhsys::http_download(url, dest_path)
     if status < 200 || status >= 300 is
