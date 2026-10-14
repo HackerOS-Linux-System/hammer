@@ -1,0 +1,157 @@
+use "std -> conv" from "conv"
+
+;; libhammer -> version
+;;
+;; 1:1 port of libhammer/src/version.rs (Rust) to H#.
+;; Debian version comparison: epoch, upstream version, revision — same
+;; ordering rules as dpkg's own `Cmp-Version`. No FFI needed; pure
+;; string/char logic.
+
+;; ── Public API ───────────────────────────────────────────────────────────────
+
+;; Compares two Debian version strings.
+;; Returns -1 if a < b, 0 if a == b, 1 if a > b (mirrors Rust's
+;; `Ordering::Less|Equal|Greater` without needing a dedicated enum for
+;; every call site — `version_satisfies` below is the ergonomic wrapper
+;; most callers actually want).
+pub fn version_cmp(a: string, b: string) -> int is
+    let sa: (string, string, string) = split_version(a)
+    let sb: (string, string, string) = split_version(b)
+
+    let epoch_a: int = to_int_or(sa.0, 0)
+    let epoch_b: int = to_int_or(sb.0, 0)
+    if epoch_a != epoch_b is
+        return (if epoch_a < epoch_b then -1 else 1)
+    end
+
+    let up_cmp: int = compare_version_string(sa.1, sb.1)
+    if up_cmp != 0 is return up_cmp end
+
+    let rev_a: string = if sa.2 != "" then sa.2 else "0"
+    let rev_b: string = if sb.2 != "" then sb.2 else "0"
+    return compare_version_string(rev_a, rev_b)
+end
+
+;; Returns `true` if `installed` satisfies `op required` (`op` is one of
+;; the Debian relational operators, plus the `ge`/`le`/`eq`/`gt`/`lt`
+;; long spellings for convenience).
+pub fn version_satisfies(installed: string, op: string, required: string) -> bool is
+    let ord: int = version_cmp(installed, required)
+    match op is
+        ">=" | "ge" => is return ord != -1 end
+        "<=" | "le" => is return ord != 1 end
+        "="  | "eq" => is return ord == 0 end
+        ">>" | "gt" | ">" => is return ord == 1 end
+        "<<" | "lt" | "<" => is return ord == -1 end
+        _ => is return false end
+    end
+end
+
+;; ── Internals ────────────────────────────────────────────────────────────────
+
+fn to_int_or(s: string, default_val: int) -> int is
+    if s == "" is return default_val end
+    let n: int = conv::str_to_int(s)
+    ;; H#'s `to_int` on a non-numeric string yields 0 (see std/conv.h#);
+    ;; that's exactly the fallback Rust's `.parse().unwrap_or(0)` gives
+    ;; too, so no extra guard is needed here.
+    return n
+end
+
+;; Split into (epoch, upstream, revision). Epoch defaults to "0" when no
+;; leading `N:` is present; revision is "" (not "0") when there's no
+;; trailing `-N`, so callers can tell "absent" from "explicitly zero".
+fn split_version(v: string) -> (string, string, string) is
+    let colon: int = string_find(v, ":")
+    let epoch: string = if colon >= 0 then string_slice(v, 0, colon) else "0"
+    let rest:  string = if colon >= 0 then string_slice(v, colon + 1, string_len(v)) else v
+
+    let dash: int = string_rfind(rest, "-")
+    let upstream: string = if dash >= 0 then string_slice(rest, 0, dash) else rest
+    let revision: string = if dash >= 0 then string_slice(rest, dash + 1, string_len(rest)) else ""
+
+    return (epoch, upstream, revision)
+end
+
+;; Compares two version strings using Debian ordering rules: alternating
+;; non-digit / digit segments, non-digit segments compared under
+;; `char_order` (tilde sorts first, letters before other bytes), digit
+;; segments compared numerically.
+fn compare_version_string(a: string, b: string) -> int is
+    let mut ai: int = 0
+    let mut bi: int = 0
+    let la: int = string_len(a)
+    let lb: int = string_len(b)
+
+    while true is
+        let ra: (string, int) = take_nondigit(a, ai, la)
+        let rb: (string, int) = take_nondigit(b, bi, lb)
+        ai = ra.1
+        bi = rb.1
+        let nd_cmp: int = compare_nondigit_segs(ra.0, rb.0)
+        if nd_cmp != 0 is return nd_cmp end
+
+        let da: (string, int) = take_digit(a, ai, la)
+        let db: (string, int) = take_digit(b, bi, lb)
+        ai = da.1
+        bi = db.1
+        let na: int = to_int_or(da.0, 0)
+        let nb: int = to_int_or(db.0, 0)
+        if na != nb is return (if na < nb then -1 else 1) end
+
+        if ai >= la && bi >= lb is return 0 end
+    end
+    return 0
+end
+
+fn take_nondigit(s: string, start: int, len: int) -> (string, int) is
+    let mut i: int = start
+    let mut out: string = ""
+    while i < len is
+        let c: string = string_at(s, i)
+        if c >= "0" && c <= "9" is break end
+        out = out + c
+        i += 1
+    end
+    return (out, i)
+end
+
+fn take_digit(s: string, start: int, len: int) -> (string, int) is
+    let mut i: int = start
+    let mut out: string = ""
+    while i < len is
+        let c: string = string_at(s, i)
+        if !(c >= "0" && c <= "9") is break end
+        out = out + c
+        i += 1
+    end
+    return (out, i)
+end
+
+;; Debian ordering for a single non-digit "character" (given here as a
+;; length-1 string, or "" for "end of segment"):
+;;   ~  <  end-of-string  <  digits  <  letters (alphabetical)  <  everything else
+fn char_order(c: string) -> int is
+    if c == "" is return 0 end
+    if c == "~" is return -1 end
+    let is_alpha: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+    let code: int = conv::char_to_int(c)
+    if is_alpha is return code end
+    return code + 256
+end
+
+fn compare_nondigit_segs(a: string, b: string) -> int is
+    let la: int = string_len(a)
+    let lb: int = string_len(b)
+    let mut i: int = 0
+    while true is
+        let ca: string = if i < la then string_at(a, i) else ""
+        let cb: string = if i < lb then string_at(b, i) else ""
+        if ca == "" && cb == "" is return 0 end
+        let oa: int = char_order(ca)
+        let ob: int = char_order(cb)
+        if oa != ob is return (if oa < ob then -1 else 1) end
+        i += 1
+    end
+    return 0
+end
