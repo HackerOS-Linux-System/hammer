@@ -1,0 +1,287 @@
+use "std -> conv" from "conv"
+
+;; libhammer -> package
+;;
+;; 1:1 port of libhammer/src/package.rs. Holds the version-constraint and
+;; dependency-alternative types (also used by dep.h#) plus the `Package`
+;; struct and its `Packages`-index-stanza parser.
+
+;; ── Version constraint ───────────────────────────────────────────────────────
+
+;; Operator in a version constraint (`>=`, `<=`, `=`, `>>`, `<<`).
+pub enum VersionOp is
+    Gte
+    Lte
+    Eq
+    Gt
+    Lt
+end
+
+impl VersionOp is
+    ;; Parses the operator string; `nil` if it isn't one of the five
+    ;; Debian relational operators.
+    pub fn parse(s: string) -> VersionOp? is
+        match string_trim(s) is
+            ">=" => is return VersionOp::Gte end
+            "<=" => is return VersionOp::Lte end
+            "="  => is return VersionOp::Eq  end
+            ">>" => is return VersionOp::Gt  end
+            "<<" => is return VersionOp::Lt  end
+            _    => is return nil end
+        end
+    end
+
+    pub fn as_str(self) -> string is
+        match self is
+            VersionOp::Gte => is return ">=" end
+            VersionOp::Lte => is return "<=" end
+            VersionOp::Eq  => is return "="  end
+            VersionOp::Gt  => is return ">>" end
+            VersionOp::Lt  => is return "<<" end
+        end
+    end
+end
+
+;; A version constraint: operator + version string.
+pub struct VersionConstraint is
+    pub op:      string
+    pub version: string
+end
+
+;; ── Dependency types ─────────────────────────────────────────────────────────
+
+;; One alternative in an OR-group (e.g. `libssl3` or `libssl3 (>= 3.0)`).
+;; `constraint`/`arch` are `nil` when absent — the H# equivalent of Rust's
+;; `Option<T>` fields on `DepAlternative`.
+pub struct DepAlternative is
+    pub name:       string
+    pub constraint: VersionConstraint?
+    pub arch:       string?
+end
+
+;; A dependency group: satisfied when *any* alternative is satisfied.
+pub struct DepGroup is
+    pub alternatives: [DepAlternative]
+end
+
+;; ── Package ──────────────────────────────────────────────────────────────────
+
+;; All metadata fields for a Debian package, parsed from a `Packages`
+;; index or a `.deb` control file. Optional fields use `string?`/`int?`;
+;; absent means "field not present in this stanza" (same meaning as
+;; Rust's `None`), not "present but empty".
+pub struct Package is
+    pub name:              string
+    pub version:           string
+    pub architecture:      string
+    pub installed_size_kb: int
+    pub download_size:     int?
+    pub section:           string?
+    pub priority:          string?
+    pub maintainer:        string?
+    pub homepage:          string?
+    pub description_short: string?
+    pub description:       string?
+    pub depends:           string?
+    pub pre_depends:       string?
+    pub recommends:        string?
+    pub suggests:          string?
+    pub enhances:          string?
+    pub breaks:            string?
+    pub conflicts:         string?
+    pub provides:          string?
+    pub replaces:          string?
+    pub sha256:            string?
+    pub filename:          string?
+    pub repo_base_uri:     string?
+    pub essential:         bool
+    pub provides_list:     [string]
+end
+
+;; `str_to_int`/bare `to_int` return 0 on a non-numeric string (no
+;; `Option`/`Result` there), so these two small wrappers give
+;; `Package::parse_block` the "0 on missing/blank" vs. "nil when the
+;; field isn't a plain integer" distinction it actually needs for
+;; `Installed-Size:` vs. `Size:`.
+fn parse_int_or(s: string, default_val: int) -> int is
+    if s == "" is return default_val end
+    return conv::str_to_int(s)
+end
+
+fn parse_int_opt(s: string) -> int? is
+    if s == "" is return nil end
+    return conv::str_to_int(s)
+end
+
+;; `string_trim_right` (std) only trims whitespace — repeatedly strip a
+;; specific trailing character instead (used for the base-URI's `/`).
+fn trim_right_char(s: string, ch: string) -> string is
+    let mut e: int = string_len(s)
+    while e > 0 && string_slice(s, e - 1, e) == ch is
+        e -= 1
+    end
+    return string_slice(s, 0, e)
+end
+
+impl Package is
+    pub fn empty() -> Package is
+        return Package {
+            name: "", version: "", architecture: "",
+            installed_size_kb: 0, download_size: nil,
+            section: nil, priority: nil, maintainer: nil, homepage: nil,
+            description_short: nil, description: nil,
+            depends: nil, pre_depends: nil, recommends: nil, suggests: nil,
+            enhances: nil, breaks: nil, conflicts: nil, provides: nil,
+            replaces: nil, sha256: nil, filename: nil, repo_base_uri: nil,
+            essential: false, provides_list: [],
+        }
+    end
+
+    ;; Parses one stanza from a `Packages` index (blank-line delimited).
+    ;; Returns `nil` if the block is missing `Package:`/`Version:`.
+    pub fn parse_block(block: string) -> Package? is
+        let mut p: Package = Package::empty()
+        let mut desc_lines: [string] = []
+        let mut in_desc: bool = false
+
+        for line in string_split(block, "\n") is
+            if string_starts_with(line, " ") || string_starts_with(line, "\t") is
+                if in_desc is
+                    let stripped: string = string_trim(line)
+                    if stripped == "." is desc_lines.push("")
+                    else is desc_lines.push(stripped) end
+                end
+                continue
+            end
+            in_desc = false
+
+            let colon: int = string_find(line, ":")
+            if colon < 0 is continue end
+            let key: string = string_trim(string_slice(line, 0, colon))
+            let val: string = string_trim(string_slice(line, colon + 1, string_len(line)))
+
+            match key is
+                "Package"        => is p.name              = val end
+                "Version"        => is p.version           = val end
+                "Architecture"   => is p.architecture       = val end
+                "Installed-Size" => is p.installed_size_kb  = parse_int_or(val, 0) end
+                "Size"           => is p.download_size      = parse_int_opt(val) end
+                "Section"        => is p.section            = val end
+                "Priority"       => is p.priority           = val end
+                "Maintainer"     => is p.maintainer         = val end
+                "Homepage"       => is p.homepage           = val end
+                "SHA256"         => is p.sha256             = val end
+                "Filename"       => is p.filename           = val end
+                "Depends"        => is p.depends            = val end
+                "Pre-Depends"    => is p.pre_depends        = val end
+                "Recommends"     => is p.recommends         = val end
+                "Suggests"       => is p.suggests           = val end
+                "Enhances"       => is p.enhances           = val end
+                "Breaks"         => is p.breaks             = val end
+                "Conflicts"      => is p.conflicts          = val end
+                "Provides"       => is
+                    p.provides = val
+                    p.provides_list = parse_provides_list(val)
+                end
+                "Replaces"       => is p.replaces           = val end
+                "Essential"      => is p.essential          = string_lower(val) == "yes" end
+                "Description"    => is
+                    p.description_short = val
+                    in_desc = true
+                end
+                _ => is end
+            end
+        end
+
+        if p.name == "" || p.version == "" is return nil end
+        if desc_lines.len() > 0 is
+            p.description = join_lines(desc_lines)
+        end
+        return p
+    end
+
+    ;; Parses a full `Packages` index file, returning every valid stanza
+    ;; (blocks with no `Package:`/`Version:` are silently skipped, same
+    ;; as the Rust original).
+    pub fn parse_index(content: string) -> [Package] is
+        let mut out: [Package] = []
+        for block in string_split(content, "\n\n") is
+            let trimmed: string = string_trim(block)
+            if trimmed == "" is continue end
+            let parsed: Package? = Package::parse_block(trimmed)
+            match parsed is
+                nil => is end
+                p   => is out.push(p) end
+            end
+        end
+        return out
+    end
+
+    pub fn short_description(self) -> string is
+        match self.description_short is
+            nil => is return "" end
+            s   => is return s end
+        end
+    end
+
+    ;; Rebuilds this `Package` with `repo_base_uri` set — used instead
+    ;; of mutating `Package.repo_base_uri` in place (e.g. inside a `for`
+    ;; loop over a freshly-parsed `[Package]`) since nothing elsewhere in
+    ;; this codebase demonstrates `array[i].field = value` actually
+    ;; writing back through an array index + field-assignment chain (as
+    ;; opposed to the confirmed-safe `arr.push(x)` / whole-`self`-method
+    ;; mutation patterns used elsewhere) — full reconstruction is
+    ;; verbose but unambiguous.
+    pub fn with_repo_base_uri(self, uri: string) -> Package is
+        return Package {
+            name: self.name, version: self.version, architecture: self.architecture,
+            installed_size_kb: self.installed_size_kb, download_size: self.download_size,
+            section: self.section, priority: self.priority, maintainer: self.maintainer,
+            homepage: self.homepage, description_short: self.description_short,
+            description: self.description, depends: self.depends, pre_depends: self.pre_depends,
+            recommends: self.recommends, suggests: self.suggests, enhances: self.enhances,
+            breaks: self.breaks, conflicts: self.conflicts, provides: self.provides,
+            replaces: self.replaces, sha256: self.sha256, filename: self.filename,
+            repo_base_uri: uri, essential: self.essential, provides_list: self.provides_list,
+        }
+    end
+
+    ;; Download URL given the repo's base URI, or `nil` if either the
+    ;; base URI or `Filename:` is missing (unset `repo_base_uri` until
+    ;; a fetcher annotates it — see fetch.h#'s `fetch_packages`).
+    pub fn download_url(self) -> string? is
+        let base: string? = self.repo_base_uri
+        let file: string? = self.filename
+        if base == nil is return nil end
+        if file == nil is return nil end
+        let base2: string = base
+        let file2: string = file
+        let root: string = trim_right_char(base2, "/")
+        return root + "/" + file2
+    end
+end
+
+;; `Provides: foo, bar (= 1.0)` → `["foo", "bar"]` — versioned provides
+;; (rare, but legal) drop their constraint here, matching the Rust
+;; original's `split('(').next()`.
+fn parse_provides_list(val: string) -> [string] is
+    let mut out: [string] = []
+    for part in string_split(val, ",") is
+        let paren: int = string_find(part, "(")
+        let name: string = string_trim(if paren >= 0 then string_slice(part, 0, paren) else part)
+        if name != "" is out.push(name) end
+    end
+    return out
+end
+
+;; Laczy linie znakiem nowej linii (bare `string_join` nie istnieje w LLVM).
+fn join_lines(lines: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < lines.len() is
+        if i > 0 is out = out + "\n" end
+        out = out + lines[i]
+        i += 1
+    end
+    return out
+end
