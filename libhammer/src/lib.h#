@@ -1,0 +1,12 @@
+mod lhversion
+mod lhpackage
+mod dep
+mod digest
+mod control
+mod release
+mod solver_error
+mod solver
+mod lhdeb
+mod lhdb
+mod lhsys
+mod fetch
