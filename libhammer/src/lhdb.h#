@@ -27,6 +27,17 @@ pub enum InstallReason is
     Dependency
 end
 
+;; Wolajacy nie uzywa `x.as_str()`: backend LLVM kompiluje wywolania metod tylko dla struktur
+;; (metoda z `impl` na enumie => "no LLVM codegen for method call"), wiec ta sama logika
+;; jest tez zwyklą funkcja.
+pub fn reason_to_str(r: InstallReason) -> string is
+    match r is
+        InstallReason::User       => is return "user" end
+        InstallReason::Dependency => is return "dep"  end
+    end
+    return "user"
+end
+
 impl InstallReason is
     pub fn as_str(self) -> string is
         match self is
@@ -142,7 +153,7 @@ impl InstalledDb is
             q(pkg.name) + "," + q(pkg.version) + "," + q(pkg.architecture) + "," +
             to_string(pkg.installed_size_kb) + "," + qo(pkg.section) + "," +
             qo(pkg.maintainer) + "," + qo(pkg.description_short) + "," +
-            "strftime('%Y-%m-%dT%H:%M:%S','now')," + q(reason.as_str()) + "," +
+            "strftime('%Y-%m-%dT%H:%M:%S','now')," + q(reason_to_str(reason)) + "," +
             q(store_hash) + "," + qo(pkg.depends) + "," + qo(pkg.recommends) + ");")
     end
 
@@ -155,7 +166,7 @@ impl InstalledDb is
     end
 
     pub fn set_reason(self, name: string, reason: InstallReason) is
-        sql_run(self.handle, "UPDATE installed SET reason = " + q(reason.as_str()) +
+        sql_run(self.handle, "UPDATE installed SET reason = " + q(reason_to_str(reason)) +
             " WHERE name = " + q(name) + ";")
     end
 
