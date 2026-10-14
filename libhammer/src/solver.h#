@@ -1,0 +1,320 @@
+use "bit -> satsolv" from "sv"
+
+mod lhpackage
+mod dep
+mod solver_error
+
+;; libhammer -> solver
+;;
+;; DELIBERATE DEVIATION FROM 1:1 PORTING. The Rust original
+;; (`libhammer/src/solver.rs`, 772 lines) hand-rolls its own CDCL SAT
+;; solver: VSIDS branching, two-watched-literal propagation, 1UIP
+;; conflict analysis, LBD-based clause deletion, Luby restarts — a
+;; serious, from-scratch implementation that would be pure liability to
+;; re-derive by hand in a brand-new language without the Rust version's
+;; years of fuzzing/property-test coverage behind it.
+;;
+;; Per instructions, hammer's H# port uses `satsolv` (H# bindings to the
+;; real, battle-tested `libsolv` — the same solver core behind
+;; `zypper`/`dnf`/`conda`) instead. This module is therefore a genuine
+;; *port of behaviour*, not of source text: it re-expresses "given
+;; installed + available packages and a set of install/remove requests,
+;; produce an install plan or a conflict report" on top of `satsolv`'s
+;; pool/repo/job/solver/transaction API rather than on top of a
+;; hand-written clause database. `solver_error.h#`'s `SolverError`/
+;; `SolverProblem` types are kept unchanged so every *caller* in the
+;; rest of libhammer/hammer still sees the exact same error shape the
+;; Rust original produced.
+;;
+;; KNOWN SIMPLIFICATIONS (documented rather than silently glossed over):
+;;   1. OR-alternatives inside one dependency group (`DepGroup.alternatives`,
+;;      e.g. Depends: "libcurl4 | libcurl3") collapse to their *first*
+;;      alternative. libsolv itself fully supports rich/boolean deps
+;;      (`SOLVABLE_PREREQMARKER`, `rel2id` with `REL_OR`), but wiring
+;;      that through `satsolv`'s testtags-based `Pkg.requires: [string]`
+;;      needs either a `satsolv` API addition or hand-built `rel2id`
+;;      calls bypassing testtags — a follow-up, not done here.
+;;   2. `resolve()` takes plain package *names* to install/remove
+;;      (`sv::job::install_name`/`erase_name`), not version-pinned
+;;      requests (`sv::job::install_name_version` exists in `satsolv`
+;;      for that and is the natural next step for `hammer install
+;;      pkg=1.2.3`).
+;;   3. `satsolv::solver::all_problems_as_strings` returns free-text
+;;      messages, not structured package lists — every `SolverProblem`
+;;      built here has `packages: []` (see solver_error.h#'s doc comment
+;;      on that field).
+
+;; One resolved step of an install plan: a concrete package (name,
+;; version, arch) the solver decided must end up installed.
+pub struct ResolvedStep is
+    pub name:    string
+    pub version: string
+    pub arch:    string
+end
+
+;; Outcome of `resolve()` — `Ok` carries the full install plan (existing
+;; + newly-pulled-in packages the transaction says must be installed);
+;; `Err` carries the same `SolverError` type every other libhammer
+;; caller already expects.
+pub enum SolveOutcome is
+    Ok([ResolvedStep])
+    Err(solver_error::SolverError)
+end
+
+;; Resolves an install/removal request against a package universe.
+;;   - `installed`      packages considered already present (`installed` repo)
+;;   - `available`      the full candidate pool from synced repo indices
+;;   - `install_names`  package names requested for installation
+;;   - `remove_names`   package names requested for removal
+;;   - `arch`           target architecture, e.g. "x86_64"/"amd64"
+;;   - `allow_downgrade` mirrors `satsolv::solver::allow_downgrade` — hammer
+;;                        defaults this to `false` at every call site,
+;;                        same as apt/dpkg's default policy.
+pub fn resolve(installed: [lhpackage::Package], available: [lhpackage::Package],
+                install_names: [string], remove_names: [string],
+                arch: string, allow_downgrade: bool) -> SolveOutcome is
+
+    let p: int = sv::pool::create()
+    sv::pool::set_arch(p, arch)
+
+    let system: int = sv::repo::create(p, "installed")
+    sv::pool::set_installed(p, system)
+    if installed.len() > 0 is
+        let sys_pkgs: [sv::repo::Pkg] = to_satsolv_pkgs(installed)
+        match sv::repo::add_packages(p, system, sys_pkgs) is
+            SatResult::Err(msg) => is
+                sv::repo::free(system, false)
+                sv::pool::free(p)
+                return SolveOutcome::Err(solver_error::SolverError::unsat(
+                    "failed to load installed-package state: " + msg))
+            end
+            SatResult::Ok(rc) => is end
+        end
+    end
+    sv::repo::internalize(system)
+
+    let avail: int = sv::repo::create(p, "available")
+    sv::repo::set_priority(avail, 0, 0)
+    if available.len() > 0 is
+        let avail_pkgs: [sv::repo::Pkg] = to_satsolv_pkgs(available)
+        match sv::repo::add_packages(p, avail, avail_pkgs) is
+            SatResult::Err(msg) => is
+                sv::repo::free(avail, false)
+                sv::repo::free(system, false)
+                sv::pool::free(p)
+                return SolveOutcome::Err(solver_error::SolverError::unsat(
+                    "failed to load available-package index: " + msg))
+            end
+            SatResult::Ok(rc) => is end
+        end
+    end
+    sv::repo::internalize(avail)
+
+    sv::pool::createwhatprovides(p)
+
+    let jobs: int = sv::queue::new()
+    let mut i: int = 0
+    while i < install_names.len() is
+        sv::job::install_name(jobs, p, install_names[i])
+        i += 1
+    end
+    i = 0
+    while i < remove_names.len() is
+        sv::job::erase_name(jobs, p, remove_names[i])
+        i += 1
+    end
+
+    let s: int = sv::solver::create(p)
+    sv::solver::allow_downgrade(s, allow_downgrade)
+
+    let problems: i32 = sv::solver::solve(s, jobs)
+
+    if problems > 0 is
+        let msgs: [string] = sv::solver::all_problems_as_strings(s)
+        let mut probs: [solver_error::SolverProblem] = []
+        let mut pi: int = 0
+        while pi < array_len(msgs) is
+            probs.push(solver_error::SolverProblem { message: msgs[pi], packages: [] })
+            pi += 1
+        end
+        sv::queue::free(jobs)
+        sv::solver::free(s)
+        sv::repo::free(avail, false)
+        sv::repo::free(system, false)
+        sv::pool::free(p)
+        return SolveOutcome::Err(solver_error::SolverError::Problems(probs))
+    end
+
+    let t: int = sv::transaction::create_from_solver(s)
+    let ids: [i32] = sv::transaction::installed_result(t)
+    let mut steps: [ResolvedStep] = []
+    let mut si: int = 0
+    while si < array_len(ids) is
+        let label: string = sv::pool::solvable_to_str(p, ids[si])
+        steps.push(parse_solvable_label(label))
+        si += 1
+    end
+    sv::transaction::free(t)
+
+    sv::queue::free(jobs)
+    sv::solver::free(s)
+    sv::repo::free(avail, false)
+    sv::repo::free(system, false)
+    sv::pool::free(p)
+
+    return SolveOutcome::Ok(steps)
+end
+
+;; `pool::solvable_to_str` prints libsolv's conventional
+;; `name-version.arch` label (e.g. `"nginx-1.24.0-2.x86_64"`). Splitting
+;; it back apart is inherently a little fragile (a package name itself
+;; could in principle contain a `-`, which is exactly why libsolv keeps
+;; name/version/release/arch as separate solvable fields internally
+;; rather than round-tripping through this string) — so this parser is
+;; deliberately permissive: on anything it can't confidently split, it
+;; keeps the whole label as `name` and leaves `version`/`arch` empty
+;; rather than guessing wrong or crashing. A future revision of
+;; `satsolv` exposing `solvable_lookup_str`-style structured accessors
+;; would let this go away entirely.
+fn parse_solvable_label(label: string) -> ResolvedStep is
+    let dot: int = string_rfind(label, ".")
+    let arch: string = if dot >= 0 then string_slice(label, dot + 1, string_len(label)) else ""
+    let head: string = if dot >= 0 then string_slice(label, 0, dot) else label
+
+    let dash: int = string_rfind(head, "-")
+    if dash < 0 is
+        return ResolvedStep { name: head, version: "", arch: arch }
+    end
+    let name:    string = string_slice(head, 0, dash)
+    let version: string = string_slice(head, dash + 1, string_len(head))
+    return ResolvedStep { name: name, version: version, arch: arch }
+end
+
+;; Converts hammer `Package`s into `satsolv::repo::Pkg`s for
+;; `repo::add_packages`. See the module doc comment's simplification #1
+;; for the OR-alternative collapsing.
+fn to_satsolv_pkgs(pkgs: [lhpackage::Package]) -> [sv::repo::Pkg] is
+    let mut out: [sv::repo::Pkg] = []
+    let mut i: int = 0
+    while i < pkgs.len() is
+        out.push(to_satsolv_pkg(pkgs[i]))
+        i += 1
+    end
+    return out
+end
+
+fn to_satsolv_pkg(pkg: lhpackage::Package) -> sv::repo::Pkg is
+    let release: string = extract_release(pkg.version)
+    let mut p: sv::repo::Pkg = sv::repo::new_pkg(pkg.name, pkg.version, release, pkg.architecture)
+
+    p.requires  = dep_field_to_tokens(pkg.depends) + dep_field_to_tokens(pkg.pre_depends)
+    p.provides  = pkg.provides_list
+    p.conflicts = dep_field_to_tokens(pkg.conflicts)
+    p.obsoletes = dep_field_to_tokens(pkg.replaces)
+    p.recommends = dep_field_to_tokens(pkg.recommends)
+    p.suggests   = dep_field_to_tokens(pkg.suggests)
+    return p
+end
+
+;; Debian versions are `[epoch:]upstream[-revision]`; libsolv's
+;; `Pkg.release` is its own separate field (unlike Debian, which folds
+;; the revision into the same version string). We don't actually need
+;; a *correct* Debian→RPM-style epoch/release split for solving purposes
+;; here — `satsolv`'s `new_pkg` just needs *some* non-empty release
+;; token, and the full Debian version string is already carried
+;; verbatim in `version` for comparisons — so this only peels off a
+;; trailing `-revision` when present, and falls back to `"0"` (never an
+;; empty string — `add_packages` rejects empty NVRA tokens, see
+;; satsolv's own input validation).
+fn extract_release(version: string) -> string is
+    let dash: int = string_rfind(version, "-")
+    if dash < 0 is return "0" end
+    let rev: string = string_slice(version, dash + 1, string_len(version))
+    if rev == "" is return "0" end
+    return rev
+end
+
+;; `Depends: "libssl3 (>= 3.0), libz1g | zlib1g"` → `["libssl3 >= 3.0", "libz1g"]`
+;; (see this module's doc comment, simplification #1, for the OR collapse).
+fn dep_field_to_tokens(field: string?) -> [string] is
+    if field == nil is return [] end
+    let f: string = field
+    let groups: [lhpackage::DepGroup] = dep::parse_dep_field(f)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < groups.len() is
+        let alts: [lhpackage::DepAlternative] = groups[i].alternatives
+        if alts.len() > 0 is
+            out.push(alt_to_token(alts[0]))
+        end
+        i += 1
+    end
+    return out
+end
+
+fn alt_to_token(alt: lhpackage::DepAlternative) -> string is
+    let c: lhpackage::VersionConstraint? = alt.constraint
+    if c == nil is return alt.name end
+    let c2: lhpackage::VersionConstraint = c
+    return alt.name + " " + c2.op + " " + c2.version
+end
+
+;; ── Wygodna struktura wyniku (dla innych pakietow) ───────────────────────
+;;
+;; `SolveOutcome` to enum zdefiniowany tutaj — rozpakowanie go w innym pakiecie
+;; wymaga sciezek typu `lh::solver::SolveOutcome::Ok(..)`. Ta struktura
+;; robi `match` TUTAJ i oddaje zwykle pola, zeby hammer (`pkg/solver/libsolv.h#`)
+;; mogl z niej korzystac bez dopasowywania wariantow miedzy pakietami.
+
+pub struct SolveSummary is
+    ;; true = libsolv rozwiazal zadanie
+    pub ok:          bool
+    ;; true = NIE udalo sie zaladowac danych do libsolv (to nie jest konflikt
+    ;; zaleznosci — wolajacy powinien zostac przy swoim solverze)
+    pub load_failed: bool
+    ;; zainstalowane wg transakcji (przy ok): nazwa / wersja / architektura
+    pub names:       [string]
+    pub versions:    [string]
+    pub arches:      [string]
+    ;; opisy problemow (przy !ok i !load_failed)
+    pub problems:    [string]
+end
+
+pub fn resolve_summary(installed: [lhpackage::Package], available: [lhpackage::Package],
+                       install_names: [string], remove_names: [string],
+                       arch: string, allow_downgrade: bool) -> SolveSummary is
+    let mut names: [string] = []
+    let mut versions: [string] = []
+    let mut arches: [string] = []
+    let mut problems: [string] = []
+    let out: SolveOutcome = resolve(installed, available, install_names, remove_names, arch, allow_downgrade)
+    match out is
+        SolveOutcome::Ok(steps) => is
+            let mut i: int = 0
+            while i < steps.len() is
+                names.push(steps[i].name)
+                versions.push(steps[i].version)
+                arches.push(steps[i].arch)
+                i += 1
+            end
+            return SolveSummary { ok: true, load_failed: false, names: names, versions: versions, arches: arches, problems: problems }
+        end
+        SolveOutcome::Err(e) => is
+            match e is
+                SolverError::Unsatisfiable(msg) => is
+                    let failed: bool = string_starts_with(msg, "failed to load")
+                    problems.push(msg)
+                    return SolveSummary { ok: false, load_failed: failed, names: names, versions: versions, arches: arches, problems: problems }
+                end
+                SolverError::Problems(list) => is
+                    let mut k: int = 0
+                    while k < list.len() is
+                        problems.push(list[k].message)
+                        k += 1
+                    end
+                    return SolveSummary { ok: false, load_failed: false, names: names, versions: versions, arches: arches, problems: problems }
+                end
+            end
+        end
+    end
+end
