@@ -1,0 +1,157 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+
+mod control
+mod lhsys
+
+;; libhammer -> deb
+;;
+;; Port libhammer/src/deb.rs — PRZEPISANY na narzedzia systemowe.
+;;
+;; Poprzednia wersja parsowala kontenery `ar`/`tar` z `[int]` zbudowanego z
+;; typu `bytes` (`__builtin_bytes_to_ints` / `bytes_from_ints`). Te builtiny
+;; sa tylko w interpreterze — backend LLVM v0.9 (`h# compile`) ich odrzuca
+;; (builtins_registry.rs, `Backend::Interpreter`), wiec libhammer nie mogl
+;; sie skompilowac. Teraz: `ar` (binutils), `tar`, `gzip`/`xz`/`bzip2`/`zstd`,
+;; przez pliki tymczasowe; w calym kodzie zero `bytes`.
+;; Wszystkie te narzedzia sa `Essential`/`required` w Debianie (jak `dpkg`).
+;;
+;; Zmiana API: `DebPackage.data_tar: [TarEntry]` (zawartosc w pamieci) ->
+;; `data_files: [string]` (lista sciezek z `tar -t`); dane pliku odczytuje
+;; `read_data_file(path_deb, name)`. Nikt w repo nie uzywal `TarEntry`.
+
+pub fn compression_kind(name: string) -> string is
+    if string_ends_with(name, ".gz")   is return "gz"   end
+    if string_ends_with(name, ".xz")   is return "xz"   end
+    if string_ends_with(name, ".bz2")  is return "bz2"  end
+    if string_ends_with(name, ".zst")  is return "zst"  end
+    if string_ends_with(name, ".lzma") is return "lzma" end
+    return "none"
+end
+
+;; Polecenie dekompresji do stdout (z pliku `in_path`).
+fn decompress_stdout_cmd(kind: string, in_path: string) -> string is
+    let q: string = lhsys::sq(in_path)
+    if kind == "gz"   is return "gzip -dc "  + q end
+    if kind == "xz"   is return "xz -dc "    + q end
+    if kind == "lzma" is return "xz -dc --format=lzma " + q end
+    if kind == "bz2"  is return "bzip2 -dc " + q end
+    if kind == "zst"  is return "zstd -dc "  + q end
+    return "cat " + q
+end
+
+;; Rozpakowuje `in_path` (rodzaj wg rozszerzenia `name`) do nowego pliku
+;; tymczasowego; zwraca jego sciezke. Panikuje przy bledzie (jak oryginal).
+pub fn decompress_file(in_path: string, name: string) -> string is
+    let kind: string = compression_kind(name)
+    let out_path: string = fs::temp_file("hammer-deb-out")
+    let cmd: string = decompress_stdout_cmd(kind, in_path) + " > " + lhsys::sq(out_path)
+    let rc: int = lhsys::sh_rc(cmd)
+    if rc != 0 || !fs::exists(out_path) is
+        fs::remove(out_path)
+        panic("hammer: nie udalo sie rozpakowac '" + name + "' (" + kind + ", polecenie: " + cmd + ")")
+    end
+    return out_path
+end
+
+;; ── ar ───────────────────────────────────────────────────────────────────
+
+;; Nazwy czlonkow archiwum `ar` (kolejnosc jak w pliku).
+pub fn ar_members(deb_path: string) -> [string] is
+    let out: string = shell("ar t " + lhsys::sq(deb_path) + " 2>/dev/null")
+    let mut names: [string] = []
+    let lines: [string] = str::split(out, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let n: string = str::trim(lines[i])
+        if n != "" is names.push(n) end
+        i += 1
+    end
+    return names
+end
+
+;; Pierwszy czlonek, ktorego nazwa zaczyna sie od `base_name` (np.
+;; "control.tar" -> "control.tar.xz"); "" gdy brak.
+pub fn find_member(members: [string], base_name: string) -> string is
+    let mut i: int = 0
+    while i < members.len() is
+        if string_starts_with(members[i], base_name) is return members[i] end
+        i += 1
+    end
+    return ""
+end
+
+;; Wypakowuje czlonek `.deb` do pliku tymczasowego; zwraca sciezke.
+pub fn ar_extract_member(deb_path: string, member: string) -> string is
+    let out_path: string = fs::temp_file("hammer-deb-member")
+    let rc: int = lhsys::sh_rc("ar p " + lhsys::sq(deb_path) + " " + lhsys::sq(member) + " > " + lhsys::sq(out_path) + " 2>/dev/null")
+    if rc != 0 is
+        fs::remove(out_path)
+        panic("hammer: nie udalo sie wypakowac czlonka '" + member + "' z " + deb_path)
+    end
+    return out_path
+end
+
+;; ── tar ──────────────────────────────────────────────────────────────────
+
+;; Lista wpisow archiwum tar (`tar -t`), bez katalogow.
+pub fn tar_list(tar_path: string) -> [string] is
+    let out: string = shell("tar -tf " + lhsys::sq(tar_path) + " 2>/dev/null")
+    let mut names: [string] = []
+    let lines: [string] = str::split(out, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let n: string = lines[i]
+        if n != "" && !string_ends_with(n, "/") is names.push(n) end
+        i += 1
+    end
+    return names
+end
+
+;; Zawartosc jednego wpisu (tekst) — `./control` albo `control`; "" gdy brak.
+pub fn tar_read_text(tar_path: string, name: string) -> string is
+    let a: string = shell("tar -xOf " + lhsys::sq(tar_path) + " " + lhsys::sq(name) + " 2>/dev/null")
+    if a != "" is return a end
+    return shell("tar -xOf " + lhsys::sq(tar_path) + " " + lhsys::sq("./" + name) + " 2>/dev/null")
+end
+
+;; ── high-level .deb ──────────────────────────────────────────────────────
+
+pub struct DebPackage is
+    pub control:    control::Fields
+    ;; surowa zawartosc `md5sums`, jesli jest ("" gdy brak)
+    pub md5sums:    string
+    ;; sciezki plikow z `data.tar*`
+    pub data_files: [string]
+end
+
+;; Czyta `.deb`: parsuje `control` i `md5sums` z `control.tar*`, a z
+;; `data.tar*` zwraca liste plikow. Panikuje, gdy czlonka brakuje.
+pub fn read_deb(path: string) -> DebPackage is
+    let members: [string] = ar_members(path)
+    let cm: string = find_member(members, "control.tar")
+    let dm: string = find_member(members, "data.tar")
+    if cm == "" is panic("hammer: '" + path + "' nie ma czlonka control.tar*") end
+    if dm == "" is panic("hammer: '" + path + "' nie ma czlonka data.tar*") end
+
+    let c_raw: string = ar_extract_member(path, cm)
+    let c_tar: string = decompress_file(c_raw, cm)
+    let control_text: string = tar_read_text(c_tar, "control")
+    if control_text == "" is
+        fs::remove(c_raw)
+        fs::remove(c_tar)
+        panic("hammer: '" + path + "' nie ma pliku control w control.tar")
+    end
+    let fields: control::Fields = control::parse_block(control_text)
+    let md5: string = tar_read_text(c_tar, "md5sums")
+    fs::remove(c_raw)
+    fs::remove(c_tar)
+
+    let d_raw: string = ar_extract_member(path, dm)
+    let d_tar: string = decompress_file(d_raw, dm)
+    let files: [string] = tar_list(d_tar)
+    fs::remove(d_raw)
+    fs::remove(d_tar)
+
+    return DebPackage { control: fields, md5sums: md5, data_files: files }
+end
