@@ -35,8 +35,8 @@ mod solver_error
 ;;      needs either a `satsolv` API addition or hand-built `rel2id`
 ;;      calls bypassing testtags — a follow-up, not done here.
 ;;   2. `resolve()` takes plain package *names* to install/remove
-;;      (`sv::job::install_name`/`erase_name`), not version-pinned
-;;      requests (`sv::job::install_name_version` exists in `satsolv`
+;;      (`job::install_name`/`erase_name`), not version-pinned
+;;      requests (`job::install_name_version` exists in `satsolv`
 ;;      for that and is the natural next step for `hammer install
 ;;      pkg=1.2.3`).
 ;;   3. `satsolv::solver::all_problems_as_strings` returns free-text
@@ -74,93 +74,93 @@ pub fn resolve(installed: [lhpackage::Package], available: [lhpackage::Package],
                 install_names: [string], remove_names: [string],
                 arch: string, allow_downgrade: bool) -> SolveOutcome is
 
-    let p: int = sv::pool::create()
-    sv::pool::set_arch(p, arch)
+    let p: int = pool::create()
+    pool::set_arch(p, arch)
 
-    let system: int = sv::repo::create(p, "installed")
-    sv::pool::set_installed(p, system)
+    let system: int = repo::create(p, "installed")
+    pool::set_installed(p, system)
     if installed.len() > 0 is
-        let sys_pkgs: [sv::repo::Pkg] = to_satsolv_pkgs(installed)
-        match sv::repo::add_packages(p, system, sys_pkgs) is
+        let sys_pkgs: [repo::Pkg] = to_satsolv_pkgs(installed)
+        match repo::add_packages(p, system, sys_pkgs) is
             SatResult::Err(msg) => is
-                sv::repo::free(system, false)
-                sv::pool::free(p)
+                repo::free(system, false)
+                pool::free(p)
                 return SolveOutcome::Err(solver_error::SolverError::unsat(
                     "failed to load installed-package state: " + msg))
             end
             SatResult::Ok(rc) => is end
         end
     end
-    sv::repo::internalize(system)
+    repo::internalize(system)
 
-    let avail: int = sv::repo::create(p, "available")
-    sv::repo::set_priority(avail, 0, 0)
+    let avail: int = repo::create(p, "available")
+    repo::set_priority(avail, 0, 0)
     if available.len() > 0 is
-        let avail_pkgs: [sv::repo::Pkg] = to_satsolv_pkgs(available)
-        match sv::repo::add_packages(p, avail, avail_pkgs) is
+        let avail_pkgs: [repo::Pkg] = to_satsolv_pkgs(available)
+        match repo::add_packages(p, avail, avail_pkgs) is
             SatResult::Err(msg) => is
-                sv::repo::free(avail, false)
-                sv::repo::free(system, false)
-                sv::pool::free(p)
+                repo::free(avail, false)
+                repo::free(system, false)
+                pool::free(p)
                 return SolveOutcome::Err(solver_error::SolverError::unsat(
                     "failed to load available-package index: " + msg))
             end
             SatResult::Ok(rc) => is end
         end
     end
-    sv::repo::internalize(avail)
+    repo::internalize(avail)
 
-    sv::pool::createwhatprovides(p)
+    pool::createwhatprovides(p)
 
-    let jobs: int = sv::queue::new()
+    let jobs: int = queue::new()
     let mut i: int = 0
     while i < install_names.len() is
-        sv::job::install_name(jobs, p, install_names[i])
+        job::install_name(jobs, p, install_names[i])
         i += 1
     end
     i = 0
     while i < remove_names.len() is
-        sv::job::erase_name(jobs, p, remove_names[i])
+        job::erase_name(jobs, p, remove_names[i])
         i += 1
     end
 
-    let s: int = sv::solver::create(p)
-    sv::solver::allow_downgrade(s, allow_downgrade)
+    let s: int = solver::create(p)
+    solver::allow_downgrade(s, allow_downgrade)
 
-    let problems: i32 = sv::solver::solve(s, jobs)
+    let problems: i32 = solver::solve(s, jobs)
 
     if problems > 0 is
-        let msgs: [string] = sv::solver::all_problems_as_strings(s)
+        let msgs: [string] = solver::all_problems_as_strings(s)
         let mut probs: [solver_error::SolverProblem] = []
         let mut pi: int = 0
         while pi < array_len(msgs) is
             probs.push(solver_error::SolverProblem { message: msgs[pi], packages: [] })
             pi += 1
         end
-        sv::queue::free(jobs)
-        sv::solver::free(s)
-        sv::repo::free(avail, false)
-        sv::repo::free(system, false)
-        sv::pool::free(p)
+        queue::free(jobs)
+        solver::free(s)
+        repo::free(avail, false)
+        repo::free(system, false)
+        pool::free(p)
         return SolveOutcome::Err(solver_error::SolverError::Problems(probs))
     end
 
-    let t: int = sv::transaction::create_from_solver(s)
-    let ids: [i32] = sv::transaction::installed_result(t)
+    let t: int = transaction::create_from_solver(s)
+    let ids: [i32] = transaction::installed_result(t)
     let mut steps: [ResolvedStep] = []
     let mut si: int = 0
     while si < array_len(ids) is
-        let label: string = sv::pool::solvable_to_str(p, ids[si])
+        let label: string = pool::solvable_to_str(p, ids[si])
         steps.push(parse_solvable_label(label))
         si += 1
     end
-    sv::transaction::free(t)
+    transaction::free(t)
 
-    sv::queue::free(jobs)
-    sv::solver::free(s)
-    sv::repo::free(avail, false)
-    sv::repo::free(system, false)
-    sv::pool::free(p)
+    queue::free(jobs)
+    solver::free(s)
+    repo::free(avail, false)
+    repo::free(system, false)
+    pool::free(p)
 
     return SolveOutcome::Ok(steps)
 end
@@ -193,8 +193,8 @@ end
 ;; Converts hammer `Package`s into `satsolv::repo::Pkg`s for
 ;; `repo::add_packages`. See the module doc comment's simplification #1
 ;; for the OR-alternative collapsing.
-fn to_satsolv_pkgs(pkgs: [lhpackage::Package]) -> [sv::repo::Pkg] is
-    let mut out: [sv::repo::Pkg] = []
+fn to_satsolv_pkgs(pkgs: [lhpackage::Package]) -> [repo::Pkg] is
+    let mut out: [repo::Pkg] = []
     let mut i: int = 0
     while i < pkgs.len() is
         out.push(to_satsolv_pkg(pkgs[i]))
@@ -203,9 +203,9 @@ fn to_satsolv_pkgs(pkgs: [lhpackage::Package]) -> [sv::repo::Pkg] is
     return out
 end
 
-fn to_satsolv_pkg(pkg: lhpackage::Package) -> sv::repo::Pkg is
+fn to_satsolv_pkg(pkg: lhpackage::Package) -> repo::Pkg is
     let release: string = extract_release(pkg.version)
-    let mut p: sv::repo::Pkg = sv::repo::new_pkg(pkg.name, pkg.version, release, pkg.architecture)
+    let mut p: repo::Pkg = repo::new_pkg(pkg.name, pkg.version, release, pkg.architecture)
 
     p.requires  = dep_field_to_tokens(pkg.depends) + dep_field_to_tokens(pkg.pre_depends)
     p.provides  = pkg.provides_list
@@ -262,7 +262,7 @@ end
 ;; ── Wygodna struktura wyniku (dla innych pakietow) ───────────────────────
 ;;
 ;; `SolveOutcome` to enum zdefiniowany tutaj — rozpakowanie go w innym pakiecie
-;; wymaga sciezek typu `lh::solver::SolveOutcome::Ok(..)`. Ta struktura
+;; wymaga sciezek typu `solver::SolveOutcome::Ok(..)`. Ta struktura
 ;; robi `match` TUTAJ i oddaje zwykle pola, zeby hammer (`pkg/solver/libsolv.h#`)
 ;; mogl z niej korzystac bez dopasowywania wariantow miedzy pakietami.
 
