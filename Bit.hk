@@ -12,7 +12,6 @@
 [build]
 -> link => static
 
-! goly `bit` w tym repo buduje binarke release
 [default-build]
 -> profile => release
 
