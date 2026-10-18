@@ -1,0 +1,888 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+;; [mod db pominiete: source-code/pkg/db.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania db::fn dzialaja bez zmian]
+mod gpg
+mod ui
+
+;; hammer -> audit
+;;
+;; Port of source-code/system/audit.rs (Rust) to H#: lancuch audytu
+;; (/hammer/db/audit.jsonl) z haszowaniem i podpisami Ed25519, weryfikacja
+;; lancucha, generowanie kluczy, `hammer audit list|verify|export|keygen` i
+;; weryfikacja podpisu paczki.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. ED25519 PRZEZ `openssl`: H# nie ma Ed25519 w `std -> crypto`. Uzywam
+;;    `openssl pkeyutl -rawin` (OpenSSL >= 3.0): seed 32 B -> PKCS#8 DER
+;;    (`302e020100300506032b657004220420` + seed), klucz publiczny ->
+;;    SPKI DER (`302a300506032b6570032100` + pub). Ed25519 jest
+;;    deterministyczny (RFC 8032), wiec podpisy sa IDENTYCZNE bajt w bajt z
+;;    `ed25519-dalek` (sprawdzone na losowym kluczu) — dzienniki i klucze
+;;    z wersji Rust dzialaja bez zmian. WYMAGANE: `openssl` w PATH.
+;;    Bajty dla `openssl` tworze przez `printf '\\NNN…'` (osemkowo; bez `xxd`).
+;; 2. JSON: `serde_json` -> wlasna serializacja kompaktowa (kolejnosc pol jak
+;;    w `struct AuditEntry`, `null` dla `None`, ucieczki jak serde: `\\b \\f
+;;    \\n \\r \\t \\" \\\\` i `\\u00xx` dla reszty znakow < 0x20) — wymagane,
+;;    bo skrot lancucha i podpis liczone sa z TEJ postaci (przy `verify_chain`
+;;    wpis jest parsowany i serializowany ponownie). Odczyt: `jsonlite`.
+;;    `export`: ukladem `to_string_pretty`.
+;; 3. `timestamp`: sekundy zamiast nanosekund (`date -u +%FT%T+00:00`);
+;;    wpisy z Rust (z nanosekundami) odczytuja sie i weryfikuja bez zmian.
+;; 4. `libc::getuid()` -> `id -u`. `Result<()>` -> `string` ("" = Ok).
+;; 5. `println!` z kolorami -> `ui::`; kolumna "Action" dopelniana
+;;    WIDOCZNYM tekstem (Rust dopelnial juz pokolorowany `String` do 20
+;;    znakow razem z kodami ANSI, wiec kolumny sie rozjezdzaly).
+;;
+;; ── BLEDY / LUKI ORYGINALU, KTORE NAPRAWIAM ──────────────────────────────
+;; A. `verify_ed25519_sig` czytal AUDIT_PUB jako 32 SUROWE bajty i odrzucal
+;;    plik o innej dlugosci, a `keygen` zapisuje klucz jako 64 znaki HEX —
+;;    weryfikacja podpisu `.deb.sig` ZAWSZE konczyla sie bledem
+;;    "Invalid public key length". Teraz przyjmowane sa oba formaty.
+;; B. `keygen`: klucz prywatny zapisywany `fs::write` (umask 022 => 0644),
+;;    dopiero potem `chmod 0600` — przez chwile czytelny dla kazdego
+;;    uzytkownika. Teraz tworzony pod `umask 077`.
+;; C. LUKA INTEGRALNOSCI: `verify_entry_sig` uznawal wpis bez podpisu oraz
+;;    brak pliku klucza publicznego za "OK". Skrot lancucha (`prev_hash`)
+;;    nie zawiera sekretu, wiec kazdy z prawem zapisu do dziennika mogl
+;;    przepisac wpisy BEZ podpisow, przeliczyc lancuch i `hammer audit
+;;    verify` pokazywal "intact". Tryb `strict_signatures()` (domyslnie
+;;    wlaczony): (1) wpis niepodpisany PO pierwszym podpisanym = niewazny,
+;;    (2) wpis podpisany przy braku klucza publicznego = niewazny.
+;;    Pozostaje (nie do wykrycia bez zewnetrznej kotwicy): skasowanie
+;;    OGONA dziennika oraz dziennik, w ktorym NIC nie jest podpisane.
+;; D. Znane, NIE naprawiane: `seq` = liczba linii + 1 i `prev_hash` sa
+;;    liczone bez blokady — dwa rownolegle procesy hammera moga zapisac
+;;    zdublowany `seq` i rozwidlic lancuch (Rust tak samo).
+
+pub fn audit_log() -> string is return compat::path_join(build_mode::db_dir(), "audit.jsonl") end
+pub fn audit_pub() -> string is return "/etc/hammer/audit-key.pub" end
+pub fn audit_priv() -> string is return "/etc/hammer/audit-key.priv" end
+
+;; Patrz C.
+pub fn strict_signatures() -> bool is return true end
+
+pub struct AuditPackage is
+    pub name:        string
+    pub old_version: string?
+    pub new_version: string?
+end
+
+pub struct AuditEntry is
+    pub seq:        int
+    pub timestamp:  string
+    pub action:     string
+    pub packages:   [AuditPackage]
+    pub gen_before: int?
+    pub gen_after:  int?
+    pub gen_hash:   string?
+    pub uid:        int
+    pub prev_hash:  string
+    pub signature:  string
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sys_ok(cmd: string) -> bool is
+    return system(cmd) == 0
+end
+
+fn now_rfc3339() -> string is
+    return str::trim(proc::shell("date -u +%Y-%m-%dT%H:%M:%S+00:00"))
+end
+
+fn sha256_hex(s: string) -> string is
+    return compat::crypto_sha256(s)
+end
+
+fn genesis() -> string is return sha256_hex("genesis") end
+
+fn lines_nonempty(text: string) -> [string] is
+    let parts: [string] = str::split(text, "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < parts.len() is
+        let l: string = parts[i]
+        let ln: int = string_len(l)
+        let t: string = if ln > 0 && string_at(l, ln - 1) == "\r" then str::slice(l, 0, ln - 1) else l
+        if t != "" is out.push(t) end
+        i += 1
+    end
+    return out
+end
+
+;; ── JSON (kompatybilny z serde_json) ─────────────────────────────────────
+
+fn hex2(n: int) -> string is
+    let h: string = conv::int_to_hex(n)
+    if string_len(h) < 2 is return "0" + h end
+    return h
+end
+
+;; `"…"` z ucieczkami jak serde_json.
+fn jstr(s: string) -> string is
+    let mut out: string = "\""
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(s, i)
+        if c == "\"" is
+            out = out + "\\\""
+        elsif c == "\\" is
+            out = out + "\\\\"
+        elsif c < " " is
+            let code: int = conv::char_to_int(c)
+            if code == 8 is
+                out = out + "\\b"
+            elsif code == 9 is
+                out = out + "\\t"
+            elsif code == 10 is
+                out = out + "\\n"
+            elsif code == 12 is
+                out = out + "\\f"
+            elsif code == 13 is
+                out = out + "\\r"
+            else is
+                out = out + "\\u00" + hex2(code)
+            end
+        else is
+            out = out + c
+        end
+        i += 1
+    end
+    return out + "\""
+end
+
+fn jopt(v: string?) -> string is
+    if v == nil is return "null" end
+    let s: string = v
+    return jstr(s)
+end
+
+fn jopt_int(v: int?) -> string is
+    if v == nil is return "null" end
+    let n: int = v
+    return to_string(n)
+end
+
+fn pkg_json(p: AuditPackage) -> string is
+    return "{\"name\":" + jstr(p.name) + ",\"old_version\":" + jopt(p.old_version) +
+        ",\"new_version\":" + jopt(p.new_version) + "}"
+end
+
+;; `serde_json::to_string(&entry)`; `signature` podmieniane na `sig`.
+fn entry_json_with(e: AuditEntry, sig: string) -> string is
+    let mut pk: [string] = []
+    let mut i: int = 0
+    while i < e.packages.len() is
+        pk.push(pkg_json(e.packages[i]))
+        i += 1
+    end
+    return "{\"seq\":" + to_string(e.seq) + ",\"timestamp\":" + jstr(e.timestamp) +
+        ",\"action\":" + jstr(e.action) + ",\"packages\":[" + str::join(pk, ",") + "]" +
+        ",\"gen_before\":" + jopt_int(e.gen_before) + ",\"gen_after\":" + jopt_int(e.gen_after) +
+        ",\"gen_hash\":" + jopt(e.gen_hash) + ",\"uid\":" + to_string(e.uid) +
+        ",\"prev_hash\":" + jstr(e.prev_hash) + ",\"signature\":" + jstr(sig) + "}"
+end
+
+pub fn entry_json(e: AuditEntry) -> string is
+    return entry_json_with(e, e.signature)
+end
+
+;; `serde_json::to_string_pretty(&Vec<AuditEntry>)`
+pub fn entries_pretty(entries: [AuditEntry]) -> string is
+    if entries.len() == 0 is return "[]" end
+    let mut out: string = "[\n"
+    let mut i: int = 0
+    while i < entries.len() is
+        let e: AuditEntry = entries[i]
+        out = out + "  {\n" +
+            "    \"seq\": " + to_string(e.seq) + ",\n" +
+            "    \"timestamp\": " + jstr(e.timestamp) + ",\n" +
+            "    \"action\": " + jstr(e.action) + ",\n"
+        if e.packages.len() == 0 is
+            out = out + "    \"packages\": [],\n"
+        else is
+            out = out + "    \"packages\": [\n"
+            let mut k: int = 0
+            while k < e.packages.len() is
+                let p: AuditPackage = e.packages[k]
+                out = out + "      {\n" +
+                    "        \"name\": " + jstr(p.name) + ",\n" +
+                    "        \"old_version\": " + jopt(p.old_version) + ",\n" +
+                    "        \"new_version\": " + jopt(p.new_version) + "\n" +
+                    "      }"
+                if k + 1 < e.packages.len() is out = out + "," end
+                out = out + "\n"
+                k += 1
+            end
+            out = out + "    ],\n"
+        end
+        out = out + "    \"gen_before\": " + jopt_int(e.gen_before) + ",\n" +
+            "    \"gen_after\": " + jopt_int(e.gen_after) + ",\n" +
+            "    \"gen_hash\": " + jopt(e.gen_hash) + ",\n" +
+            "    \"uid\": " + to_string(e.uid) + ",\n" +
+            "    \"prev_hash\": " + jstr(e.prev_hash) + ",\n" +
+            "    \"signature\": " + jstr(e.signature) + "\n" +
+            "  }"
+        if i + 1 < entries.len() is out = out + "," end
+        out = out + "\n"
+        i += 1
+    end
+    return out + "]"
+end
+
+;; ── JSON: odczyt jednej linii ────────────────────────────────────────────
+
+struct AuditPkgParsed is
+    pub p:   AuditPackage
+    pub pos: int
+    pub ok:  bool
+end
+
+struct AuditEntryParsed is
+    pub e:  AuditEntry
+    pub ok: bool
+end
+
+fn tstr(toks: [string], pos: int) -> string? is
+    if pos < toks.len() && jsonlite::is_string_tok(toks[pos]) is return jsonlite::tok_text(toks[pos]) end
+    return nil
+end
+
+fn tint(toks: [string], pos: int) -> int? is
+    if pos < toks.len() && jsonlite::is_word_tok(toks[pos]) is
+        let t: string = jsonlite::tok_text(toks[pos])
+        if t != "" && str::is_numeric(t) is return conv::str_to_int(t) end
+    end
+    return nil
+end
+
+fn parse_pkg(toks: [string], start: int) -> AuditPkgParsed is
+    let mut p: AuditPackage = AuditPackage { name: "", old_version: nil, new_version: nil }
+    let mut pos: int = start
+    if pos >= toks.len() || toks[pos] != "{" is return AuditPkgParsed { p: p, pos: pos, ok: false } end
+    pos += 1
+    let mut have_name: bool = false
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is return AuditPkgParsed { p: p, pos: pos, ok: false } end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        if key == "name" && jsonlite::is_string_tok(toks[vpos]) is
+            p.name = jsonlite::tok_text(toks[vpos])
+            have_name = true
+        end
+        if key == "old_version" is p.old_version = tstr(toks, vpos) end
+        if key == "new_version" is p.new_version = tstr(toks, vpos) end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return AuditPkgParsed { p: p, pos: pos, ok: false } end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    if pos >= toks.len() || !have_name is return AuditPkgParsed { p: p, pos: pos, ok: false } end
+    return AuditPkgParsed { p: p, pos: pos + 1, ok: true }
+end
+
+;; Jak `serde_json::from_str::<AuditEntry>(l).ok()`: wymagane pola stringowe/liczbowe
+;; musza istniec; `Option` moga byc `null` albo pominiete.
+pub fn parse_entry(line: string) -> AuditEntry? is
+    let toks: [string] = jsonlite::tokenize(line)
+    let none_pk: [AuditPackage] = []
+    let mut e: AuditEntry = AuditEntry { seq: 0, timestamp: "", action: "", packages: none_pk, gen_before: nil,
+        gen_after: nil, gen_hash: nil, uid: 0, prev_hash: "", signature: "" }
+    if toks.len() == 0 || toks[0] != "{" is return nil end
+    let mut have_seq: bool = false
+    let mut have_ts: bool = false
+    let mut have_action: bool = false
+    let mut have_pk: bool = false
+    let mut have_uid: bool = false
+    let mut have_prev: bool = false
+    let mut have_sig: bool = false
+    let mut pos: int = 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is return nil end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        if key == "seq" is
+            let v: int? = tint(toks, vpos)
+            if v == nil is return nil end
+            e.seq = v
+            have_seq = true
+        elsif key == "timestamp" is
+            let v: string? = tstr(toks, vpos)
+            if v == nil is return nil end
+            e.timestamp = v
+            have_ts = true
+        elsif key == "action" is
+            let v: string? = tstr(toks, vpos)
+            if v == nil is return nil end
+            e.action = v
+            have_action = true
+        elsif key == "packages" is
+            if toks[vpos] != "[" is return nil end
+            let mut pk: [AuditPackage] = []
+            let mut ppos: int = vpos + 1
+            while ppos < toks.len() && toks[ppos] != "]" is
+                let pr: AuditPkgParsed = parse_pkg(toks, ppos)
+                if !pr.ok is return nil end
+                pk.push(pr.p)
+                ppos = pr.pos
+                if ppos < toks.len() && toks[ppos] == "," is ppos += 1 end
+            end
+            e.packages = pk
+            have_pk = true
+        elsif key == "gen_before" is
+            e.gen_before = tint(toks, vpos)
+        elsif key == "gen_after" is
+            e.gen_after = tint(toks, vpos)
+        elsif key == "gen_hash" is
+            e.gen_hash = tstr(toks, vpos)
+        elsif key == "uid" is
+            let v: int? = tint(toks, vpos)
+            if v == nil is return nil end
+            e.uid = v
+            have_uid = true
+        elsif key == "prev_hash" is
+            let v: string? = tstr(toks, vpos)
+            if v == nil is return nil end
+            e.prev_hash = v
+            have_prev = true
+        elsif key == "signature" is
+            let v: string? = tstr(toks, vpos)
+            if v == nil is return nil end
+            e.signature = v
+            have_sig = true
+        end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return nil end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    if pos >= toks.len() is return nil end
+    if !(have_seq && have_ts && have_action && have_pk && have_uid && have_prev && have_sig) is return nil end
+    return e
+end
+
+;; ── Ed25519 przez openssl (patrz odejscie 1) ─────────────────────────────
+
+fn is_hex(s: string) -> bool is
+    let n: int = string_len(s)
+    if n == 0 is return false end
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(s, i)
+        let ok: bool = (c >= "0" && c <= "9") || (c >= "a" && c <= "f") || (c >= "A" && c <= "F")
+        if !ok is return false end
+        i += 1
+    end
+    return true
+end
+
+;; "ab12" -> "\\253\\022" (osemkowe, dla `printf`).
+fn hex_to_printf(hex: string) -> string is
+    let mut out: string = ""
+    let n: int = string_len(hex)
+    let mut i: int = 0
+    while i + 1 < n is
+        let v: int = conv::hex_to_int(str::slice(hex, i, i + 2))
+        let o: string = conv::int_to_oct(v)
+        out = out + "\\" + str::repeat("0", 3 - string_len(o)) + o
+        i += 2
+    end
+    return out
+end
+
+;; Katalog roboczy 0700; "" przy bledzie.
+fn make_work() -> string is
+    return str::trim(proc::shell("umask 077; mktemp -d /tmp/hammer-ed.XXXXXX 2>/dev/null"))
+end
+
+fn cleanup(work: string) is
+    if work.starts_with("/tmp/hammer-ed.") is system("rm -rf -- " + shq(work)) end
+end
+
+;; sha256(payload) jako 32 surowe bajty w pliku `out`.
+fn digest_file(payload: string, work: string) -> string is
+    let pf: string = work + "/payload"
+    let df: string = work + "/digest"
+    fs::write(pf, payload)
+    if !sys_ok("openssl dgst -sha256 -binary -out " + shq(df) + " " + shq(pf) + " 2>/dev/null") is return "" end
+    return df
+end
+
+pub struct SigResult is
+    pub hex: string
+    pub err: string
+end
+
+;; Podpis 32-bajtowego skrotu kluczem o ziarnie `seed_hex` (64 znaki hex).
+fn ed25519_sign_payload(seed_hex: string, payload: string) -> SigResult is
+    if string_len(seed_hex) != 64 || !is_hex(seed_hex) is
+        return SigResult { hex: "", err: "Audit private key must be 32 bytes (Ed25519 seed), got " + to_string(string_len(seed_hex) / 2) }
+    end
+    let work: string = make_work()
+    if work == "" is return SigResult { hex: "", err: "Cannot create temp dir" } end
+    let df: string = digest_file(payload, work)
+    if df == "" is
+        cleanup(work)
+        return SigResult { hex: "", err: "openssl not available (needed for Ed25519)" }
+    end
+    let keyf: string = work + "/key.der"
+    let sigf: string = work + "/sig"
+    system("printf '" + hex_to_printf("302e020100300506032b657004220420" + str::to_lower(seed_hex)) + "' > " + shq(keyf))
+    if !sys_ok("openssl pkeyutl -sign -inkey " + shq(keyf) + " -keyform DER -rawin -in " + shq(df) + " -out " + shq(sigf) + " 2>/dev/null") is
+        cleanup(work)
+        return SigResult { hex: "", err: "Ed25519 signing failed" }
+    end
+    let hex: string = str::trim(proc::shell("od -An -v -tx1 " + shq(sigf) + " | tr -d ' \n'"))
+    cleanup(work)
+    if string_len(hex) != 128 is return SigResult { hex: "", err: "Ed25519 signing failed" } end
+    return SigResult { hex: hex, err: "" }
+end
+
+;; Weryfikacja: `pub_hex` (64 znaki), wiadomosc w pliku `msg_file`, podpis `sig_hex`/plik.
+fn ed25519_verify_file(pub_hex: string, msg_file: string, sig_file: string, work: string) -> bool is
+    let pubf: string = work + "/pub.der"
+    system("printf '" + hex_to_printf("302a300506032b6570032100" + str::to_lower(pub_hex)) + "' > " + shq(pubf))
+    return sys_ok("openssl pkeyutl -verify -pubin -inkey " + shq(pubf) + " -keyform DER -rawin -in " + shq(msg_file) +
+        " -sigfile " + shq(sig_file) + " >/dev/null 2>&1")
+end
+
+fn ed25519_verify_payload(pub_hex: string, payload: string, sig_hex: string) -> bool is
+    if string_len(sig_hex) != 128 || !is_hex(sig_hex) is return false end
+    if string_len(pub_hex) != 64 || !is_hex(pub_hex) is return false end
+    let work: string = make_work()
+    if work == "" is return false end
+    let df: string = digest_file(payload, work)
+    if df == "" is
+        cleanup(work)
+        return false
+    end
+    let sigf: string = work + "/sig"
+    system("printf '" + hex_to_printf(str::to_lower(sig_hex)) + "' > " + shq(sigf))
+    let ok: bool = ed25519_verify_file(pub_hex, df, sigf, work)
+    cleanup(work)
+    return ok
+end
+
+;; Klucz publiczny z ziarna (hex) — przez SPKI DER z openssl.
+fn derive_pub_hex(seed_hex: string) -> SigResult is
+    let work: string = make_work()
+    if work == "" is return SigResult { hex: "", err: "Cannot create temp dir" } end
+    let keyf: string = work + "/key.der"
+    let pubf: string = work + "/pub.der"
+    system("printf '" + hex_to_printf("302e020100300506032b657004220420" + str::to_lower(seed_hex)) + "' > " + shq(keyf))
+    if !sys_ok("openssl pkey -inform DER -in " + shq(keyf) + " -pubout -outform DER -out " + shq(pubf) + " 2>/dev/null") is
+        cleanup(work)
+        return SigResult { hex: "", err: "openssl not available (needed for Ed25519)" }
+    end
+    let all: string = str::trim(proc::shell("od -An -v -tx1 " + shq(pubf) + " | tr -d ' \n'"))
+    cleanup(work)
+    if string_len(all) != 88 is return SigResult { hex: "", err: "Unexpected public key encoding" } end
+    return SigResult { hex: str::slice(all, 24, 88), err: "" }
+end
+
+;; ── AuditLog ─────────────────────────────────────────────────────────────
+
+fn read_trim(file: string) -> string is
+    if !fs::exists(file) is return "" end
+    return str::trim(fs::read(file))
+end
+
+fn last_entry_hash() -> string is
+    if !fs::exists(audit_log()) is return genesis() end
+    let lines: [string] = lines_nonempty(fs::read(audit_log()))
+    if lines.len() == 0 is return genesis() end
+    return sha256_hex(lines[lines.len() - 1])
+end
+
+fn next_seq() -> int is
+    if !fs::exists(audit_log()) is return 1 end
+    return lines_nonempty(fs::read(audit_log())).len() + 1
+end
+
+;; "" = Ok.
+pub fn record(action: string, packages: [AuditPackage], gen_before: int?, gen_after: int?) -> string is
+    fs::mkdir(build_mode::db_dir())
+    if !fs::is_dir(build_mode::db_dir()) is return "Cannot create " + build_mode::db_dir() end
+
+    let prev_hash: string = last_entry_hash()
+    let mut gen_hash: string? = nil
+    if gen_after != nil is
+        let g: int = gen_after
+        let hr: gpg::HashResult = gpg::hash_generation(g)
+        if hr.err == "" is gen_hash = hr.hash end
+    end
+    let uid_raw: string = str::trim(proc::shell("id -u 2>/dev/null"))
+    let uid: int = if uid_raw != "" && str::is_numeric(uid_raw) then conv::str_to_int(uid_raw) else 0
+    let seq: int = next_seq()
+
+    let mut entry: AuditEntry = AuditEntry { seq: seq, timestamp: now_rfc3339(), action: action, packages: packages,
+        gen_before: gen_before, gen_after: gen_after, gen_hash: gen_hash, uid: uid, prev_hash: prev_hash, signature: "" }
+
+    if fs::exists(audit_priv()) is
+        let sr: SigResult = sign_entry(entry, prev_hash)
+        if sr.err == "" is
+            entry.signature = sr.hex
+        else is
+            log::warn("audit: signing failed: " + sr.err + " (entry recorded unsigned)")
+        end
+    end
+
+    fs::append(audit_log(), entry_json(entry) + "\n")
+    log::info("audit: seq=" + to_string(seq) + " action=" + action + " gen=" + (if gen_after != nil then to_string(gen_after) else "None"))
+    return ""
+end
+
+;; sha256(json_bez_podpisu + "|" + prev_hash) -> podpis (hex).
+fn sign_entry(e: AuditEntry, prev_hash: string) -> SigResult is
+    let seed: string = read_trim(audit_priv())
+    if seed == "" is return SigResult { hex: "", err: "Reading audit private key" } end
+    if !is_hex(seed) is return SigResult { hex: "", err: "Decoding private key hex" } end
+    return ed25519_sign_payload(seed, entry_json_with(e, "") + "|" + prev_hash)
+end
+
+pub fn load_all() -> [AuditEntry] is
+    let mut out: [AuditEntry] = []
+    if !fs::exists(audit_log()) is return out end
+    let lines: [string] = lines_nonempty(fs::read(audit_log()))
+    let mut i: int = 0
+    while i < lines.len() is
+        let e: AuditEntry? = parse_entry(lines[i])
+        if e != nil is
+            let en: AuditEntry = e
+            out.push(en)
+        end
+        i += 1
+    end
+    return out
+end
+
+pub struct ChainVerifyResult is
+    pub total:        int
+    pub valid:        int
+    pub invalid_sigs: [int]
+    pub broken_chain: [int]
+end
+
+pub fn chain_is_ok(r: ChainVerifyResult) -> bool is
+    return r.invalid_sigs.len() == 0 && r.broken_chain.len() == 0
+end
+
+;; Klucz publiczny w HEX albo "" (brak/nieczytelny). Akceptuje 64 znaki hex
+;; ORAZ 32 surowe bajty (patrz A).
+fn load_pub_hex() -> string is
+    let f: string = audit_pub()
+    if !fs::exists(f) is return "" end
+    let sz: int = fs::size(f)
+    if sz == 32 is
+        return str::trim(proc::shell("od -An -v -tx1 " + shq(f) + " | tr -d ' \n'"))
+    end
+    let t: string = read_trim(f)
+    if string_len(t) == 64 && is_hex(t) is return str::to_lower(t) end
+    return ""
+end
+
+;; Jak `verify_entry_sig`, z zaostrzeniem C. `first_signed`: indeks pierwszego
+;; wpisu z podpisem (-1 gdy brak); `idx`: indeks tego wpisu.
+fn verify_entry_sig(e: AuditEntry, idx: int, first_signed: int) -> bool is
+    if e.signature == "" is
+        ;; Rust: niepodpisany = pomijamy. Teraz: dozwolone tylko PRZED pierwszym podpisanym.
+        if strict_signatures() && first_signed >= 0 && idx > first_signed is return false end
+        return true
+    end
+    if !fs::exists(audit_pub()) is
+        ;; Rust: brak klucza = pomijamy. Teraz: nie da sie zweryfikowac => niewazny.
+        return !strict_signatures()
+    end
+    let pub_hex: string = load_pub_hex()
+    if pub_hex == "" is return false end
+    return ed25519_verify_payload(pub_hex, entry_json_with(e, "") + "|" + e.prev_hash, e.signature)
+end
+
+pub fn verify_chain() -> ChainVerifyResult is
+    let entries: [AuditEntry] = load_all()
+    let mut first_signed: int = -1
+    let mut s: int = 0
+    while s < entries.len() && first_signed < 0 is
+        if entries[s].signature != "" is first_signed = s end
+        s += 1
+    end
+
+    let mut valid: int = 0
+    let mut invalid_sigs: [int] = []
+    let mut broken: [int] = []
+    let mut prev_hash: string = genesis()
+    let mut i: int = 0
+    while i < entries.len() is
+        let e: AuditEntry = entries[i]
+        let computed_prev: string = if e.seq == 1 then genesis() else prev_hash
+        if e.prev_hash != computed_prev is broken.push(e.seq) end
+        if !verify_entry_sig(e, i, first_signed) is
+            invalid_sigs.push(e.seq)
+        else is
+            valid += 1
+        end
+        prev_hash = sha256_hex(entry_json(e))
+        i += 1
+    end
+    return ChainVerifyResult { total: entries.len(), valid: valid, invalid_sigs: invalid_sigs, broken_chain: broken }
+end
+
+;; ── keygen ───────────────────────────────────────────────────────────────
+
+pub fn keygen() -> string is
+    fs::mkdir("/etc/hammer")
+    if !fs::is_dir("/etc/hammer") is return "Cannot create /etc/hammer" end
+    if fs::exists(audit_priv()) is
+        return "Audit key already exists at " + audit_priv() + ".\n  Remove it manually first if you really want to regenerate " +
+            "(this invalidates verification of all prior signed entries)."
+    end
+
+    let seed: string = str::trim(proc::shell("head -c 32 /dev/urandom | od -An -v -tx1 | tr -d ' \n'"))
+    if string_len(seed) != 64 is return "Cannot read /dev/urandom" end
+    let pr: SigResult = derive_pub_hex(seed)
+    if pr.err != "" is return pr.err end
+
+    ;; B: umask 077 PRZED utworzeniem pliku z kluczem prywatnym
+    let priv_ok: bool = sys_ok("sh -c " + shq("umask 077; printf '%s' " + shq(seed) + " > " + shq(audit_priv())))
+    if !priv_ok is return "Writing " + audit_priv() end
+    system("chmod 600 " + shq(audit_priv()))
+    fs::write(audit_pub(), pr.hex)
+    system("chmod 644 " + shq(audit_pub()))
+
+    write("  " + ui::bright_green_bold("✔") + " Ed25519 audit key pair generated:")
+    write("    Private: " + ui::cyan(audit_priv()) + " (root-only)")
+    write("    Public:  " + ui::cyan(audit_pub()))
+    write("")
+    write("  " + ui::yellow_bold("!") + " Back up " + ui::cyan(audit_priv()) + " securely — it cannot be recovered if lost.")
+    log::info("audit: generated new Ed25519 key pair")
+    return ""
+end
+
+;; ── CLI ──────────────────────────────────────────────────────────────────
+
+fn ints_join(items: [int]) -> string is
+    let mut p: [string] = []
+    let mut i: int = 0
+    while i < items.len() is
+        p.push(to_string(items[i]))
+        i += 1
+    end
+    return str::join(p, ", ")
+end
+
+fn action_color(a: string) -> string is
+    let padded: string = ui::pad(a, 12)
+    if a == "install" is return ui::bright_green(padded) end
+    if a == "remove" is return ui::red(padded) end
+    if a == "upgrade" is return ui::yellow(padded) end
+    if a == "rollback" is return ui::bright_red(padded) end
+    return ui::cyan(padded)
+end
+
+fn cmd_audit_list(args: [string]) -> string is
+    let mut limit: int = 20
+    let mut i: int = 0
+    while i < args.len() is
+        let a: string = args[i]
+        i += 1
+        if a.starts_with("-n") is
+            let rest: string = str::trim(str::slice(a, 2, string_len(a)))
+            if rest != "" && str::is_numeric(rest) is limit = conv::str_to_int(rest) end
+            ;; Rust: `.find(starts_with("-n"))` — tylko PIERWSZY pasujacy argument
+            i = args.len()
+        end
+    end
+
+    let entries: [AuditEntry] = load_all()
+    let total: int = entries.len()
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Audit trail (" + to_string(total) + " entries total)")
+    write("  " + ui::rule(75))
+    write("  " + ui::bold(ui::pad("Seq", 6)) + " " + ui::bold(ui::pad("Timestamp", 22)) + " " + ui::bold(ui::pad("Action", 12)) +
+          " " + ui::bold(ui::pad("Packages", 36)) + " " + ui::bold("Gen"))
+    write("  " + ui::rule(75))
+
+    let mut shown: int = 0
+    let mut k: int = total - 1
+    while k >= 0 && shown < limit is
+        let e: AuditEntry = entries[k]
+        k -= 1
+        shown += 1
+        let ts: string = if string_len(e.timestamp) > 19 then str::slice(e.timestamp, 0, 19) else e.timestamp
+        let mut names: [string] = []
+        let mut p: int = 0
+        while p < e.packages.len() && p < 3 is
+            names.push(e.packages[p].name)
+            p += 1
+        end
+        let mut pkg_summary: string = str::join(names, ", ")
+        if e.packages.len() > 3 is pkg_summary = pkg_summary + " +" + to_string(e.packages.len() - 3) end
+
+        let mut gen_str: string = ""
+        if e.gen_after != nil is
+            let a: int = e.gen_after
+            if e.gen_before != nil && e.gen_before != e.gen_after is
+                let b: int = e.gen_before
+                gen_str = to_string(b) + " → " + to_string(a)
+            else is
+                gen_str = to_string(a)
+            end
+        end
+        let sig_ok: string = if e.signature == "" then "" else " " + ui::bright_green("✓")
+        write("  " + ui::dim(ui::pad(to_string(e.seq), 6)) + " " + ui::dim(ui::pad(ts, 22)) + " " + action_color(e.action) +
+              " " + ui::pad(pkg_summary, 36) + " " + ui::cyan(gen_str) + sig_ok)
+    end
+
+    if total > limit is
+        write("  … " + to_string(total - limit) + " more entries. Use -n " + to_string(total) + " to see more.")
+    end
+    write("")
+    return ""
+end
+
+fn cmd_audit_verify() -> string is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Verifying audit chain integrity (Ed25519)…")
+    let r: ChainVerifyResult = verify_chain()
+    write("  " + ui::bold(ui::pad("Total entries:", 28)) + " " + ui::cyan(to_string(r.total)))
+    write("  " + ui::bold(ui::pad("Valid:", 28)) + " " + ui::bright_green(to_string(r.valid)))
+
+    if chain_is_ok(r) is
+        write("")
+        write("  " + ui::bright_green_bold("✔") + " Audit chain is intact and all Ed25519 signatures are valid.")
+    else is
+        if r.invalid_sigs.len() > 0 is
+            write("  " + ui::red_bold("✗") + " Invalid signatures at entries: " + ui::red(ints_join(r.invalid_sigs)))
+        end
+        if r.broken_chain.len() > 0 is
+            write("  " + ui::red_bold("✗") + " Broken chain links at entries: " + ui::red(ints_join(r.broken_chain)))
+        end
+        write("")
+        write("  " + ui::red_bold("WARNING:") + " AUDIT CHAIN TAMPERED OR CORRUPTED")
+    end
+    write("")
+    return ""
+end
+
+fn cmd_audit_export(args: [string]) -> string is
+    let output: string = if args.len() > 1 then args[1] else "hammer-audit.json"
+    let entries: [AuditEntry] = load_all()
+    fs::write(output, entries_pretty(entries))
+    write("  " + ui::bright_green("✔") + " Exported " + to_string(entries.len()) + " entries to " + ui::bold(output))
+    return ""
+end
+
+pub fn cmd_audit(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "list"
+    if sub == "list" || sub == "ls" is return cmd_audit_list(args) end
+    if sub == "verify" is return cmd_audit_verify() end
+    if sub == "export" is return cmd_audit_export(args) end
+    if sub == "keygen" is return keygen() end
+    return "Unknown audit subcommand: '" + sub + "'. Try: list, verify, export, keygen"
+end
+
+;; ── Wygodne: zapis ze strony transaction ─────────────────────────────────
+
+pub fn record_install(packages: [package::Package], gen_before: int?, gen_after: int?) is
+    let mut pkgs: [AuditPackage] = []
+    let mut i: int = 0
+    while i < packages.len() is
+        pkgs.push(AuditPackage { name: packages[i].name, old_version: nil, new_version: packages[i].version })
+        i += 1
+    end
+    record("install", pkgs, gen_before, gen_after)
+end
+
+pub fn record_remove(names: [string], gen_before: int?, gen_after: int?, idb: db::InstalledDb) is
+    let mut pkgs: [AuditPackage] = []
+    let mut i: int = 0
+    while i < names.len() is
+        let cur: db::InstalledPackage? = idb.get(names[i])
+        let mut old: string? = nil
+        if cur != nil is
+            let c: db::InstalledPackage = cur
+            old = c.version
+        end
+        pkgs.push(AuditPackage { name: names[i], old_version: old, new_version: nil })
+        i += 1
+    end
+    record("remove", pkgs, gen_before, gen_after)
+end
+
+;; `upgrade_from`: rownolegle tablice (nazwa -> stara wersja) zamiast HashMap.
+pub fn record_upgrade(packages: [package::Package], from_names: [string], from_versions: [string], gen_before: int?, gen_after: int?) is
+    let mut pkgs: [AuditPackage] = []
+    let mut i: int = 0
+    while i < packages.len() is
+        let mut old: string? = nil
+        let mut k: int = 0
+        while k < from_names.len() is
+            if from_names[k] == packages[i].name is old = from_versions[k] end
+            k += 1
+        end
+        pkgs.push(AuditPackage { name: packages[i].name, old_version: old, new_version: packages[i].version })
+        i += 1
+    end
+    record("upgrade", pkgs, gen_before, gen_after)
+end
+
+pub fn record_gen_switch(gen_before: int, gen_after: int) is
+    let none: [AuditPackage] = []
+    record("gen-switch", none, gen_before, gen_after)
+end
+
+pub fn record_rollback(gen_before: int, gen_after: int) is
+    let none: [AuditPackage] = []
+    record("rollback", none, gen_before, gen_after)
+end
+
+pub fn record_mark(pkg: string, reason: string) is
+    log::info("mark: " + pkg + " set to " + reason)
+end
+
+;; ── Weryfikacja podpisu paczki ───────────────────────────────────────────
+
+fn sig_path_for(deb_path: string, ext: string) -> string is
+    ;; `Path::with_extension("deb.sig")`: zastepuje OSTATNIE rozszerzenie
+    if deb_path.ends_with(".deb") is return str::slice(deb_path, 0, string_len(deb_path) - 4) + "." + ext end
+    return deb_path + "." + ext
+end
+
+fn verify_ed25519_sig(data_path: string, sig_path: string) -> string is
+    let pub_hex: string = load_pub_hex()
+    if pub_hex == "" is return "Invalid public key in " + audit_pub() end
+    if !fs::exists(data_path) is return "Reading package data" end
+    if fs::size(sig_path) != 64 is return "Invalid signature length in " + sig_path end
+    let work: string = make_work()
+    if work == "" is return "Cannot create temp dir" end
+    let ok: bool = ed25519_verify_file(pub_hex, data_path, sig_path, work)
+    cleanup(work)
+    if !ok is return "Ed25519 signature verification failed" end
+    log::info("audit: Ed25519 signature OK for " + data_path)
+    return ""
+end
+
+;; "" = Ok, inaczej tresc bledu.
+pub fn verify_package_signature(deb_path: string) -> string is
+    let sig_path: string = sig_path_for(deb_path, "deb.sig")
+    if fs::exists(sig_path) is return verify_ed25519_sig(deb_path, sig_path) end
+
+    let asc_path: string = sig_path_for(deb_path, "deb.asc")
+    if fs::exists(asc_path) is return gpg::verify_file_detached(deb_path, asc_path) end
+
+    if gpg::is_repo_trusted(deb_path) is
+        log::info("audit: no signature file for " + deb_path + " (repo trusted via InRelease)")
+        return ""
+    end
+    return "No signature found for package '" + deb_path + "' and repo is not GPG-verified.\n  " +
+        "Import the repository key with: hammer key import <keyfile>"
+end
