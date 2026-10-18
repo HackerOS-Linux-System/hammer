@@ -1,0 +1,885 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "bit -> hk-parser" from "hkp"
+
+mod internal
+mod ui
+
+;; hammer -> tools::hk_tools
+;;
+;; Port of source-code/tools/hk_tools.rs (Rust) to H#: instalacja i
+;; aktualizacja narzedzi HackerOS opisanych plikami `.hk` w
+;; /etc/hammer/HackerOS (+ preprocessor wieloliniowych wartosci, `!include`
+;; i walidacja schematu: `hammer hk validate`).
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `.hk` czyta biblioteka `hk-parser` z bit.io przez `hkp::HkConfig`
+;;    (sciezki kropkowe `sekcja.klucz`), a NIE `IndexMap<String, HkValue>`
+;;    z crate'u Rusta. `HkToolSpec::load` szuka klucza plaskiego, a potem w
+;;    kazdej sekcji (`cfg.keys("")`) — jak w Rust (`flat`, potem `sectioned`).
+;;    Interpolacje (`resolve_interpolations`) robi `cfg.resolve()`.
+;; 2. `async`/`HttpClient` -> `curl -fsSL` do pliku. GitHub API:
+;;    naglowki `User-Agent: hammer/<wersja>` i `Accept` jak w Rust.
+;; 3. `anyhow::Result<T>` -> `string` ("" = OK) albo struktury z polem `err`;
+;;    `Ok(bool)` z `update_tool` -> `UpdateResult { updated, err }`.
+;; 4. `load_hk_file_full` (include + preprocess + parse) -> `load_hk_full(path)`
+;;    zwraca `HkLoad { cfg, err }`; plik tymczasowy usuwany zawsze.
+;; 5. Walidacja (`validate_tool_hk`): "pusty klucz" sprawdzany tylko dla
+;;    typu string (`cfg.type_of(key) == "string"`), jak `HkValue::String`.
+;; 6. ZACHOWANE BLEDY ORYGINALU:
+;;    a) `KNOWN_TOOL_KEYS` NIE zawiera kluczy, ktorych uzywa `HkToolSpec::load`
+;;       (`releases`, `binaries`, `dirs`, `desc`) — `hammer hk validate` na
+;;       prawdziwym pliku narzedzia zglosi je jako "Unknown key", a
+;;       `REQUIRED_TOOL_KEYS` wymaga `github_repo`, ktorego `load` nie czyta
+;;       (czyta `releases`). Schemat i loader sie rozjezdzaja.
+;;    b) `preprocess_hk_source`: licznik nawiasow nie rozroznia nawiasow w
+;;       napisach ("(" w opisie) — zlicza `[`/`(` i `]`/`)` w calej linii.
+;;    c) `update_tool` porownuje tagi po zdjeciu jednego poczatkowego `v`.
+;; 7. Testy z Rusta (`multiline_tests`) przeniesione do `self_test()`.
+
+pub fn hk_tools_dir() -> string is return "/etc/hammer/HackerOS" end
+fn hk_versions_dir() -> string is return "/hammer/db/hk_tools" end
+fn hk_store_dir() -> string is return "/hammer/hk_store" end
+fn hk_hidden_dir() -> string is return "/usr/lib/hammer" end
+fn hk_public_bin() -> string is return "/usr/bin" end
+fn desktop_dir() -> string is return "/usr/share/applications" end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+fn mkdir_p(p: string) -> bool is
+    proc::shell("mkdir -p " + shq(p))
+    return fs::is_dir(p)
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ── Typy ─────────────────────────────────────────────────────────────────
+
+pub struct HkBinary is
+    pub asset_name:   string
+    pub wrapper_name: string
+    ;; per-binarny katalog dowiazan ("" = brak)
+    pub custom_dir:   string
+end
+
+pub struct HkToolSpec is
+    pub name:         string
+    pub hk_path:      string
+    pub releases_url: string
+    pub github_repo:  string
+    pub binaries:     [HkBinary]
+    pub hidden:       bool
+    pub is_gui:       bool
+    pub desktop_file: string?
+    pub default_dirs: [string]
+    pub description:  string
+end
+
+pub struct SpecResult is
+    pub spec: HkToolSpec
+    pub err:  string
+end
+
+;; ── Preprocessor wieloliniowych wartosci ─────────────────────────────────
+
+fn count_char(s: string, c: string) -> int is
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < string_len(s) is
+        if string_at(s, i) == c is n += 1 end
+        i += 1
+    end
+    return n
+end
+
+fn rtrim(s: string) -> string is
+    let mut n: int = string_len(s)
+    while n > 0 && (string_at(s, n - 1) == " " || string_at(s, n - 1) == "\t" || string_at(s, n - 1) == "\r") is
+        n -= 1
+    end
+    return str::slice(s, 0, n)
+end
+
+fn ltrim(s: string) -> string is
+    let mut i: int = 0
+    while i < string_len(s) && (string_at(s, i) == " " || string_at(s, i) == "\t") is
+        i += 1
+    end
+    return str::slice(s, i, string_len(s))
+end
+
+;; `trim_end_matches('\\')`.
+fn strip_trailing_backslashes(s: string) -> string is
+    let mut n: int = string_len(s)
+    while n > 0 && string_at(s, n - 1) == "\\" is
+        n -= 1
+    end
+    return str::slice(s, 0, n)
+end
+
+fn ends_backslash(s: string) -> bool is
+    return string_len(s) > 0 && string_at(s, string_len(s) - 1) == "\\"
+end
+
+;; `source.lines()`: bez ostatniego pustego elementu po koncowym `\n`.
+fn source_lines(source: string) -> [string] is
+    let mut ls: [string] = str::split(source, "\n")
+    if ls.len() > 0 && ls[ls.len() - 1] == "" is
+        let mut out: [string] = []
+        let mut i: int = 0
+        while i < ls.len() - 1 is
+            out.push(ls[i])
+            i += 1
+        end
+        return out
+    end
+    return ls
+end
+
+;; Sklada wielowierszowe tablice i linie z koncowym `\` w jedna linie.
+pub fn preprocess_hk_source(source: string) -> string is
+    let mut out: string = ""
+    let mut buf: string = ""
+    let mut depth: int = 0
+    let mut in_continuation: bool = false
+    let lines: [string] = source_lines(source)
+
+    let mut li: int = 0
+    while li < lines.len() is
+        let line: string = rtrim(lines[li])
+        li += 1
+
+        if in_continuation is
+            buf = buf + " "
+            if ends_backslash(line) is
+                buf = buf + strip_trailing_backslashes(ltrim(line))
+            else is
+                buf = buf + ltrim(line)
+                in_continuation = false
+                depth = 0
+                out = out + buf + "\n"
+                buf = ""
+            end
+        else is
+            ;; zmiana glebokosci nawiasow w tej linii
+            let mut ci: int = 0
+            while ci < string_len(line) is
+                let ch: string = string_at(line, ci)
+                if ch == "[" || ch == "(" is
+                    depth += 1
+                elsif ch == "]" || ch == ")" is
+                    depth -= 1
+                    if depth < 0 is depth = 0 end
+                end
+                ci += 1
+            end
+
+            if depth == 0 && ends_backslash(line) is
+                buf = buf + strip_trailing_backslashes(line)
+                in_continuation = true
+            elsif depth > 0 is
+                buf = buf + ltrim(line) + " "
+            else is
+                if buf != "" is
+                    buf = buf + ltrim(line)
+                    out = out + buf + "\n"
+                    buf = ""
+                    depth = 0
+                else is
+                    out = out + line + "\n"
+                end
+            end
+        end
+    end
+
+    if buf != "" is out = out + buf + "\n" end
+    return out
+end
+
+;; ── !include ─────────────────────────────────────────────────────────────
+
+pub struct IncludeResult is
+    pub text: string
+    pub err:  string
+end
+
+fn realpath(p: string) -> string is
+    return str::trim(proc::shell("realpath -- " + shq(p) + " 2>/dev/null"))
+end
+
+fn resolve_includes_inner(path: string, visited: [string]) -> IncludeResult is
+    let canonical: string = realpath(path)
+    if canonical == "" is return IncludeResult { text: "", err: "Resolving path " + path } end
+    if contains_str(visited, canonical) is
+        return IncludeResult { text: "", err: "Circular !include detected: " + canonical }
+    end
+    let mut seen: [string] = visited
+    seen.push(canonical)
+
+    if !fs::exists(canonical) is return IncludeResult { text: "", err: "Reading " + canonical } end
+    let dir: string = compat::path_parent(canonical)
+    let lines: [string] = source_lines(fs::read(canonical))
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < lines.len() is
+        let trimmed: string = str::trim(lines[i])
+        if string_starts_with(trimmed, "!include ") is
+            let rest: string = str::trim(str::slice(trimmed, 9, string_len(trimmed)))
+            let sub: IncludeResult = resolve_includes_inner(compat::path_join(dir, rest), seen)
+            if sub.err != "" is return IncludeResult { text: "", err: "In !include from " + canonical + ": " + sub.err } end
+            out = out + sub.text + "\n"
+        else is
+            out = out + lines[i] + "\n"
+        end
+        i += 1
+    end
+    return IncludeResult { text: out, err: "" }
+end
+
+pub fn resolve_includes(path: string) -> IncludeResult is
+    let none: [string] = []
+    return resolve_includes_inner(path, none)
+end
+
+;; ── Ladowanie .hk (include + preprocess + hk-parser) ─────────────────────
+
+pub struct HkLoad is
+    pub cfg: hkp::HkConfig
+    pub err: string
+end
+
+;; `cfg` jest wazny tylko gdy `err == ""`. Plik tymczasowy zawsze usuwany.
+pub fn load_hk_full(path: string) -> HkLoad is
+    let inc: IncludeResult = resolve_includes(path)
+    let dummy: hkp::HkConfig = hkp::parse_file("/dev/null")
+    if inc.err != "" is return HkLoad { cfg: dummy, err: inc.err } end
+    let normalised: string = preprocess_hk_source(inc.text)
+    let tmp: string = fs::temp_file("hammer_hk_full")
+    if !fs::write(tmp, normalised) is return HkLoad { cfg: dummy, err: "Cannot write " + tmp } end
+    let cfg: hkp::HkConfig = hkp::parse_file(tmp)
+    fs::remove(tmp)
+    if !cfg.is_valid() is return HkLoad { cfg: dummy, err: "Parsing (full) " + path + ": " + hkp::last_error() } end
+    return HkLoad { cfg: cfg, err: "" }
+end
+
+;; ── Wyszukiwanie wartosci: plasko, potem w sekcjach ──────────────────────
+
+fn find_key(cfg: hkp::HkConfig, key: string) -> string is
+    if cfg.has(key) || cfg.array_len(key) >= 0 is return key end
+    let secs: [string] = cfg.keys("")
+    let mut i: int = 0
+    while i < secs.len() is
+        let full: string = secs[i] + "." + key
+        if cfg.has(full) || cfg.array_len(full) >= 0 is return full end
+        i += 1
+    end
+    return ""
+end
+
+fn get_str(cfg: hkp::HkConfig, key: string) -> string? is
+    let k: string = find_key(cfg, key)
+    if k == "" is return nil end
+    if cfg.array_len(k) >= 0 is return nil end
+    return cfg.get(k)
+end
+
+fn get_bool(cfg: hkp::HkConfig, key: string) -> bool is
+    let k: string = find_key(cfg, key)
+    if k == "" is return false end
+    return cfg.get_bool(k)
+end
+
+fn get_array(cfg: hkp::HkConfig, key: string) -> [string] is
+    let k: string = find_key(cfg, key)
+    let none: [string] = []
+    if k == "" is return none end
+    if cfg.array_len(k) >= 0 is return cfg.array(k) end
+    if cfg.has(k) is
+        let one: [string] = [cfg.get(k)]
+        return one
+    end
+    return none
+end
+
+;; ── Pomocnicze ───────────────────────────────────────────────────────────
+
+fn extract_github_repo(url0: string) -> string? is
+    let mut n: int = string_len(url0)
+    while n > 0 && string_at(url0, n - 1) == "/" is
+        n -= 1
+    end
+    let url: string = str::slice(url0, 0, n)
+    let prefix: string = "https://github.com/"
+    if !string_starts_with(url, prefix) is return nil end
+    let after: string = str::slice(url, string_len(prefix), string_len(url))
+    let parts: [string] = str::split(after, "/")
+    if parts.len() < 2 is return nil end
+    return parts[0] + "/" + parts[1]
+end
+
+pub fn github_blob_to_raw(url: string) -> string is
+    if compat::str_index_of(url, "raw.githubusercontent.com") >= 0 is return url end
+    return str::replace_all(str::replace_all(url, "https://github.com/", "https://raw.githubusercontent.com/"), "/blob/", "/")
+end
+
+;; `"klucz": "wartosc"` z surowego JSON-a (bez pelnego parsera); "" gdy brak.
+pub fn extract_json_string(json: string, key: string) -> string is
+    let needle: string = "\"" + key + "\""
+    let pos: int = compat::str_index_of(json, needle)
+    if pos < 0 is return "" end
+    let after0: string = ltrim(str::slice(json, pos + string_len(needle), string_len(json)))
+    if string_len(after0) == 0 || string_at(after0, 0) != ":" is return "" end
+    let after: string = ltrim(str::slice(after0, 1, string_len(after0)))
+    if string_len(after) == 0 || string_at(after, 0) != "\"" is return "" end
+    let rest: string = str::slice(after, 1, string_len(after))
+    let close: int = compat::str_index_of(rest, "\"")
+    if close < 0 is return "" end
+    return str::slice(rest, 0, close)
+end
+
+fn normalize_tag(tag: string) -> string is
+    if string_starts_with(tag, "v") is return str::slice(tag, 1, string_len(tag)) end
+    return tag
+end
+
+pub fn asset_url(github_repo: string, tag: string, asset_name: string) -> string is
+    return "https://github.com/" + github_repo + "/releases/download/" + tag + "/" + asset_name
+end
+
+;; ── Ladowanie specyfikacji ───────────────────────────────────────────────
+
+fn spec_blank() -> HkToolSpec is
+    let b: [HkBinary] = []
+    let d: [string] = []
+    return HkToolSpec { name: "", hk_path: "", releases_url: "", github_repo: "", binaries: b, hidden: false,
+        is_gui: false, desktop_file: nil, default_dirs: d, description: "" }
+end
+
+fn append_bin(a: [HkBinary], x: HkBinary) -> [HkBinary] is
+    let mut o: [HkBinary] = a
+    o.push(x)
+    return o
+end
+
+pub fn spec_load(path: string) -> SpecResult is
+    let hl: HkLoad = load_hk_full(path)
+    if hl.err != "" is return SpecResult { spec: spec_blank(), err: "Parsing " + path + ": " + hl.err } end
+    let cfg: hkp::HkConfig = hl.cfg
+    if !cfg.resolve() is
+        return SpecResult { spec: spec_blank(), err: "Resolving interpolations in " + path + ": " + hkp::last_error() }
+    end
+
+    let name: string = compat::path_stem(path)
+
+    let mut releases: string? = get_str(cfg, "releases")
+    if releases == nil is releases = get_str(cfg, "releases_url") end
+    if releases == nil is return SpecResult { spec: spec_blank(), err: path + ": missing 'releases' key" } end
+    let releases_url: string = releases
+    let gr: string? = extract_github_repo(releases_url)
+    if gr == nil is
+        return SpecResult { spec: spec_blank(), err: path + ": 'releases' must be a GitHub releases URL (got: " + releases_url + ")" }
+    end
+    let github_repo: string = gr
+
+    let hidden: bool = get_bool(cfg, "hidden")
+    let is_gui: bool = get_bool(cfg, "is_gui")
+    let desktop_file: string? = get_str(cfg, "desktop_file")
+    let mut description: string = ""
+    let d1: string? = get_str(cfg, "description")
+    if d1 != nil is
+        description = d1
+    else is
+        let d2: string? = get_str(cfg, "desc")
+        if d2 != nil is description = d2 end
+    end
+
+    ;; dirs: "katalog" (domyslny) albo "katalog:binarka" (nadpisanie)
+    let dirs_raw: [string] = get_array(cfg, "dirs")
+    let mut default_dirs: [string] = []
+    let mut ov_bins: [string] = []
+    let mut ov_dirs: [string] = []
+    let mut i: int = 0
+    while i < dirs_raw.len() is
+        let c: int = compat::str_index_of(dirs_raw[i], ":")
+        if c < 0 is
+            default_dirs.push(dirs_raw[i])
+        else is
+            ov_dirs.push(str::trim(str::slice(dirs_raw[i], 0, c)))
+            ov_bins.push(str::trim(str::slice(dirs_raw[i], c + 1, string_len(dirs_raw[i]))))
+        end
+        i += 1
+    end
+
+    let mut bin_specs: [string] = get_array(cfg, "binaries")
+    if bin_specs.len() == 0 is
+        let b1: string? = get_str(cfg, "binary")
+        if b1 != nil is
+            let one: [string] = [b1]
+            bin_specs = one
+        end
+    end
+
+    let mut binaries: [HkBinary] = []
+    let mut k: int = 0
+    while k < bin_specs.len() is
+        let sp: string = bin_specs[k]
+        let col: int = compat::str_index_of(sp, ":")
+        let asset: string = if col >= 0 then str::trim(str::slice(sp, 0, col)) else str::trim(sp)
+        let wrapper: string = if col >= 0 then str::trim(str::slice(sp, col + 1, string_len(sp))) else str::trim(sp)
+        let mut custom: string = ""
+        let mut m: int = 0
+        while m < ov_bins.len() && custom == "" is
+            if ov_bins[m] == wrapper is custom = ov_dirs[m] end
+            m += 1
+        end
+        let mut m2: int = 0
+        while m2 < ov_bins.len() && custom == "" is
+            if ov_bins[m2] == asset is custom = ov_dirs[m2] end
+            m2 += 1
+        end
+        binaries = append_bin(binaries, HkBinary { asset_name: asset, wrapper_name: wrapper, custom_dir: custom })
+        k += 1
+    end
+    if binaries.len() == 0 is
+        binaries = append_bin(binaries, HkBinary { asset_name: name, wrapper_name: name, custom_dir: "" })
+    end
+
+    return SpecResult { spec: HkToolSpec { name: name, hk_path: path, releases_url: releases_url, github_repo: github_repo,
+        binaries: binaries, hidden: hidden, is_gui: is_gui, desktop_file: desktop_file, default_dirs: default_dirs,
+        description: description }, err: "" }
+end
+
+pub fn spec_version_file(s: HkToolSpec) -> string is
+    return compat::path_join(hk_versions_dir(), s.name + ".version")
+end
+
+;; "" gdy brak/pusty.
+pub fn spec_installed_version(s: HkToolSpec) -> string is
+    let vf: string = spec_version_file(s)
+    if !fs::exists(vf) is return "" end
+    return str::trim(fs::read(vf))
+end
+
+pub fn spec_store_dir(s: HkToolSpec) -> string is
+    return compat::path_join(hk_store_dir(), s.name)
+end
+
+pub fn spec_bin_dir_for(s: HkToolSpec, b: HkBinary) -> string is
+    if b.custom_dir != "" is return b.custom_dir end
+    if s.default_dirs.len() > 0 is return s.default_dirs[0] end
+    if s.hidden is return hk_hidden_dir() end
+    return hk_public_bin()
+end
+
+pub fn load_all_specs() -> [HkToolSpec] is
+    let none: [HkToolSpec] = []
+    if !fs::is_dir(hk_tools_dir()) is return none end
+    let names: [string] = sorting::sorted(str::split(proc::shell("ls -1 " + shq(hk_tools_dir()) + " 2>/dev/null"), "\n"))
+    let mut out: [HkToolSpec] = []
+    let mut i: int = 0
+    while i < names.len() is
+        if string_ends_with(names[i], ".hk") is
+            let path: string = compat::path_join(hk_tools_dir(), names[i])
+            let r: SpecResult = spec_load(path)
+            if r.err != "" is
+                log::warn("hk-tools: cannot parse " + path + ": " + r.err)
+            else is
+                out = append_spec(out, r.spec)
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+fn append_spec(a: [HkToolSpec], x: HkToolSpec) -> [HkToolSpec] is
+    let mut o: [HkToolSpec] = a
+    o.push(x)
+    return o
+end
+
+;; ── GitHub ───────────────────────────────────────────────────────────────
+
+pub struct TagResult is
+    pub tag: string
+    pub err: string
+end
+
+pub fn fetch_latest_release(github_repo: string) -> TagResult is
+    let api_url: string = "https://api.github.com/repos/" + github_repo + "/releases/latest"
+    let body: string = proc::shell("curl -fsSL -H 'User-Agent: hammer/" + build_mode::hammer_version() + "' -H 'Accept: application/vnd.github+json' " + shq(api_url) + " 2>/dev/null")
+    if body == "" is return TagResult { tag: "", err: "GET " + api_url } end
+    let tag: string = extract_json_string(body, "tag_name")
+    if tag == "" is
+        return TagResult { tag: "", err: "Cannot find tag_name in GitHub API response for " + github_repo }
+    end
+    return TagResult { tag: tag, err: "" }
+end
+
+;; ── Instalacja ───────────────────────────────────────────────────────────
+
+fn create_wrapper(spec: HkToolSpec, wrapper_name: string, binary_path: string, wrapper_dir: string) -> string is
+    let wrapper_path: string = compat::path_join(wrapper_dir, wrapper_name)
+    let content: string = "#!/bin/sh\n# HackerOS hammer tool wrapper — auto-generated, do not edit\n# Tool: " + spec.name + "  Source: " + spec.releases_url + "\nexec \"" + binary_path + "\" \"$@\"\n"
+    let tmp: string = compat::path_with_extension(wrapper_path, "tmp")
+    if !fs::write(tmp, content) is return "Cannot write " + tmp end
+    sh_ok("chmod 755 " + shq(tmp))
+    if !sh_ok("mv -f " + shq(tmp) + " " + shq(wrapper_path)) is return "Renaming " + tmp + " → " + wrapper_path end
+    log::info("hk-tools: wrapper " + wrapper_path + " → " + binary_path)
+    return ""
+end
+
+;; Wszystko albo nic: najpierw pobiera do plikow tmp, potem podmienia.
+pub fn install_tool(spec: HkToolSpec) -> string is
+    if !mkdir_p(hk_versions_dir()) || !mkdir_p(spec_store_dir(spec)) || !mkdir_p(hk_hidden_dir()) || !mkdir_p(hk_public_bin()) is
+        return "Creating hk-tools directories"
+    end
+    let tr: TagResult = fetch_latest_release(spec.github_repo)
+    if tr.err != "" is return "Fetching latest release for " + spec.name + ": " + tr.err end
+    let tag: string = tr.tag
+
+    write("  " + ui::accent_bold("⬡") + "  Installing " + ui::bold(spec.name) + " " + ui::dim(tag) + "…")
+
+    ;; Faza 1: pobierz wszystko do tmp
+    let mut tmps: [string] = []
+    let mut dests: [string] = []
+    let mut i: int = 0
+    while i < spec.binaries.len() is
+        let b: HkBinary = spec.binaries[i]
+        let url: string = asset_url(spec.github_repo, tag, b.asset_name)
+        let dest: string = compat::path_join(spec_store_dir(spec), b.asset_name)
+        write("  " + ui::dim("·") + " Downloading " + b.asset_name + "…")
+        let tmp: string = compat::path_with_extension(dest, "tmp")
+        if !sh_ok("curl -fsSL --retry 2 -o " + shq(tmp) + " " + shq(url)) is
+            let mut k: int = 0
+            while k < tmps.len() is
+                fs::remove(tmps[k])
+                k += 1
+            end
+            return "Downloading " + url
+        end
+        sh_ok("chmod 755 " + shq(tmp))
+        tmps.push(tmp)
+        dests.push(dest)
+        i += 1
+    end
+
+    ;; plik .desktop (aplikacje GUI)
+    let mut desktop_tmp: string = ""
+    let mut desktop_dest: string = ""
+    if spec.is_gui && spec.desktop_file != nil is
+        let df_url: string = spec.desktop_file
+        let raw_url: string = github_blob_to_raw(df_url)
+        write("  " + ui::dim("·") + " Downloading desktop file…")
+        let fname: string = compat::path_filename(raw_url)
+        let dest2: string = compat::path_join(desktop_dir(), if fname == "" then "app.desktop" else fname)
+        let tmp2: string = compat::path_with_extension(dest2, "tmp")
+        if !mkdir_p(desktop_dir()) is return "Cannot create " + desktop_dir() end
+        if sh_ok("curl -fsSL -o " + shq(tmp2) + " " + shq(raw_url)) is
+            desktop_tmp = tmp2
+            desktop_dest = dest2
+        else is
+            log::warn("hk-tools: desktop file download failed for " + spec.name + ": " + raw_url)
+        end
+    end
+
+    ;; Faza 2: podmiana
+    let mut j: int = 0
+    while j < tmps.len() is
+        if !sh_ok("mv -f " + shq(tmps[j]) + " " + shq(dests[j])) is return "Renaming " + tmps[j] + " → " + dests[j] end
+        let b2: HkBinary = spec.binaries[j]
+        let bin_dir: string = spec_bin_dir_for(spec, b2)
+        if !mkdir_p(bin_dir) is return "Cannot create " + bin_dir end
+        let we: string = create_wrapper(spec, b2.wrapper_name, dests[j], bin_dir)
+        if we != "" is return we end
+        j += 1
+    end
+    if desktop_tmp != "" is
+        if !sh_ok("mv -f " + shq(desktop_tmp) + " " + shq(desktop_dest)) is return "Renaming " + desktop_tmp end
+        log::info("hk-tools: installed desktop file " + desktop_dest)
+    end
+
+    if !fs::write(spec_version_file(spec), tag + "\n") is return "Cannot write " + spec_version_file(spec) end
+    write("  " + ui::bright_green("✔") + " " + ui::bold(spec.name) + " " + ui::cyan(tag) + " installed.")
+    return ""
+end
+
+pub struct UpdateResult is
+    pub updated: bool
+    pub err:     string
+end
+
+pub fn update_tool(spec: HkToolSpec) -> UpdateResult is
+    let tr: TagResult = fetch_latest_release(spec.github_repo)
+    if tr.err != "" is return UpdateResult { updated: false, err: tr.err } end
+    let current: string = spec_installed_version(spec)
+    if normalize_tag(tr.tag) == normalize_tag(current) is return UpdateResult { updated: false, err: "" } end
+    write("  " + ui::yellow_bold("↑") + " Updating " + ui::bold(spec.name) + " " + ui::dim(current) + " → " + ui::cyan(tr.tag))
+    let e: string = install_tool(spec)
+    if e != "" is return UpdateResult { updated: false, err: e } end
+    return UpdateResult { updated: true, err: "" }
+end
+
+pub fn update_all_tools() -> string is
+    let specs: [HkToolSpec] = load_all_specs()
+    if specs.len() == 0 is return "" end
+    write("  " + ui::cyan_bold("⬡") + "  Checking " + to_string(specs.len()) + " HackerOS tool" + (if specs.len() == 1 then "" else "s") + "…")
+    let mut updated: int = 0
+    let mut failed: int = 0
+    let mut i: int = 0
+    while i < specs.len() is
+        let r: UpdateResult = update_tool(specs[i])
+        if r.err != "" is
+            log::warn("hk-tools: update " + specs[i].name + " failed: " + r.err)
+            failed += 1
+        elsif r.updated is
+            updated += 1
+        end
+        i += 1
+    end
+    if updated > 0 is
+        write("  " + ui::bright_green("✔") + " " + to_string(updated) + " tool" + (if updated == 1 then "" else "s") + " updated.")
+    end
+    if failed > 0 is
+        write("  " + ui::yellow_bold("!") + " " + to_string(failed) + " tool update" + (if failed == 1 then "" else "s") + " failed — check logs.")
+    end
+    return ""
+end
+
+;; (nazwa, wersja, opis) jako trzy rownolegle tablice.
+pub struct ToolList is
+    pub names:    [string]
+    pub versions: [string]
+    pub descs:    [string]
+end
+
+pub fn list_tools() -> ToolList is
+    let specs: [HkToolSpec] = load_all_specs()
+    let mut n: [string] = []
+    let mut v: [string] = []
+    let mut d: [string] = []
+    let mut i: int = 0
+    while i < specs.len() is
+        n.push(specs[i].name)
+        let ver: string = spec_installed_version(specs[i])
+        v.push(if ver == "" then "not installed" else ver)
+        d.push(specs[i].description)
+        i += 1
+    end
+    return ToolList { names: n, versions: v, descs: d }
+end
+
+;; ── Walidacja schematu ───────────────────────────────────────────────────
+
+fn known_tool_keys() -> [string] is
+    return ["name", "description", "github_repo", "releases_url", "binary", "binary_glob", "hidden", "is_gui",
+        "desktop_file", "default_install_dir", "verify_sha256", "post_install", "pre_install", "depends_on"]
+end
+
+fn known_sources_keys() -> [string] is
+    return ["name", "baseurl", "suite", "components", "arch", "enabled", "gpgkey", "type", "priority"]
+end
+
+fn required_tool_keys() -> [string] is return ["name", "github_repo"] end
+fn required_sources_keys() -> [string] is return ["name", "baseurl", "suite", "components"] end
+
+pub struct SchemaError is
+    pub file:     string
+    pub errors:   [string]
+    pub warnings: [string]
+    ;; blad ladowania (plik/parser); "" = OK
+    pub err:      string
+end
+
+pub fn validate_tool_hk(path: string) -> SchemaError is
+    let none: [string] = []
+    if !fs::exists(path) is return SchemaError { file: path, errors: none, warnings: none, err: "Reading " + path } end
+    let normalised: string = preprocess_hk_source(fs::read(path))
+    let tmp: string = fs::temp_file("hammer_hk_validate")
+    if !fs::write(tmp, normalised) is return SchemaError { file: path, errors: none, warnings: none, err: "Cannot write " + tmp } end
+    let cfg: hkp::HkConfig = hkp::parse_file(tmp)
+    fs::remove(tmp)
+    if !cfg.is_valid() is
+        return SchemaError { file: path, errors: none, warnings: none, err: "Parsing .hk: " + hkp::last_error() }
+    end
+
+    let mut errors: [string] = []
+    let mut warnings: [string] = []
+    let keys: [string] = cfg.keys("")
+    let req: [string] = required_tool_keys()
+    let mut i: int = 0
+    while i < req.len() is
+        let present: bool = contains_str(keys, req[i])
+        let mut missing: bool = !present
+        if present && cfg.type_of(req[i]) == "string" is
+            missing = str::trim(cfg.get(req[i])) == ""
+        end
+        if missing is errors.push("Missing required key: '" + req[i] + "'") end
+        i += 1
+    end
+    let known: [string] = known_tool_keys()
+    let mut k: int = 0
+    while k < keys.len() is
+        if !contains_str(known, keys[k]) is warnings.push("Unknown key '" + keys[k] + "' (will be ignored)") end
+        k += 1
+    end
+    return SchemaError { file: path, errors: errors, warnings: warnings, err: "" }
+end
+
+fn flush_section(section: string, keys: [string], errors: [string], warnings: [string]) -> [[string]] is
+    let mut e: [string] = errors
+    let mut w: [string] = warnings
+    let req: [string] = required_sources_keys()
+    let mut i: int = 0
+    while i < req.len() is
+        if !contains_str(keys, req[i]) is e.push("[" + section + "] missing required key '" + req[i] + "'") end
+        i += 1
+    end
+    let known: [string] = known_sources_keys()
+    let mut k: int = 0
+    while k < keys.len() is
+        if !contains_str(known, keys[k]) is w.push("[" + section + "] unknown key '" + keys[k] + "' (ignored)") end
+        k += 1
+    end
+    return [e, w]
+end
+
+pub fn validate_sources_hk(path: string) -> SchemaError is
+    let none: [string] = []
+    if !fs::exists(path) is return SchemaError { file: path, errors: none, warnings: none, err: "Reading " + path } end
+    let lines: [string] = source_lines(fs::read(path))
+    let mut errors: [string] = []
+    let mut warnings: [string] = []
+    let mut current: string = ""
+    let mut have_section: bool = false
+    let mut section_keys: [string] = []
+
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = str::trim(lines[i])
+        if string_starts_with(line, "!") || line == "" is
+            i += 1
+        elsif string_starts_with(line, "[") && string_ends_with(line, "]") is
+            if have_section is
+                let r: [[string]] = flush_section(current, section_keys, errors, warnings)
+                errors = r[0]
+                warnings = r[1]
+            end
+            current = str::slice(line, 1, string_len(line) - 1)
+            have_section = true
+            section_keys = []
+            i += 1
+        else is
+            if compat::str_index_of(line, "=>") >= 0 is
+                let left: string = str::trim(str::slice(line, 0, compat::str_index_of(line, "=>")))
+                let mut key: string = left
+                while string_starts_with(key, "->") is
+                    key = str::slice(key, 2, string_len(key))
+                end
+                let kk: string = str::trim(key)
+                if !contains_str(section_keys, kk) is section_keys.push(kk) end
+            end
+            i += 1
+        end
+    end
+    if have_section is
+        let r2: [[string]] = flush_section(current, section_keys, errors, warnings)
+        errors = r2[0]
+        warnings = r2[1]
+    end
+    return SchemaError { file: path, errors: errors, warnings: warnings, err: "" }
+end
+
+;; `hammer hk validate <file.hk>`
+pub fn cmd_validate_hk(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer hk validate <file.hk>" end
+    let path: string = args[0]
+    if !fs::exists(path) is return "No such file: " + path end
+
+    ;; typ pliku wg tresci: linia zaczynajaca sie od `->` => sources-list
+    let mut is_sources: bool = false
+    let lines: [string] = source_lines(fs::read(path))
+    let mut i: int = 0
+    while i < lines.len() is
+        if string_starts_with(str::trim(lines[i]), "->") is is_sources = true end
+        i += 1
+    end
+    let result: SchemaError = if is_sources then validate_sources_hk(path) else validate_tool_hk(path)
+    if result.err != "" is return result.err end
+
+    if result.errors.len() == 0 && result.warnings.len() == 0 is
+        write("  " + ui::bright_green_bold("✔") + "  " + path + " — valid")
+        return ""
+    end
+    let mut w: int = 0
+    while w < result.warnings.len() is
+        write("  " + ui::yellow("⚠") + "  " + ui::yellow(result.warnings[w]))
+        w += 1
+    end
+    let mut e: int = 0
+    while e < result.errors.len() is
+        write("  " + ui::red_bold("✗") + "  " + ui::red(result.errors[e]))
+        e += 1
+    end
+    if result.errors.len() > 0 is return "Schema validation failed for " + path end
+    return ""
+end
+
+;; ── Testy (z multiline_tests / include_tests) ────────────────────────────
+
+fn t_text(label: string, got: string, want: string) -> int is
+    if got == want is return 0 end
+    write("hk_tools::self_test FAIL: " + label + " got [" + got + "] want [" + want + "]")
+    return 1
+end
+
+fn t_int(label: string, got: int, want: int) -> int is
+    if got == want is return 0 end
+    write("hk_tools::self_test FAIL: " + label + " got " + to_string(got) + " want " + to_string(want))
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow (czyste funkcje; bez plikow i parsera).
+pub fn self_test() -> int is
+    let mut f: int = 0
+    let single: string = "components => [\"main\", \"contrib\"]\n"
+    f += t_text("single line unchanged", preprocess_hk_source(single), single)
+
+    let multi: string = preprocess_hk_source("components => [\"main\",\n               \"contrib\",\n               \"non-free\"]\n")
+    f += t_int("multiline array -> 1 line", source_lines(multi).len(), 1)
+    f += t_int("multiline keeps non-free", if compat::str_index_of(multi, "non-free") >= 0 then 1 else 0, 1)
+
+    let cont: string = preprocess_hk_source("description => very long \\\n              value here\n")
+    f += t_int("backslash continuation -> 1 line", source_lines(cont).len(), 1)
+    f += t_int("continuation has value here", if compat::str_index_of(cont, "value here") >= 0 then 1 else 0, 1)
+
+    let cm: string = preprocess_hk_source("! comment line\nname => hello\n")
+    f += t_int("comment preserved", if compat::str_index_of(cm, "! comment line") >= 0 then 1 else 0, 1)
+    f += t_int("name preserved", if compat::str_index_of(cm, "name => hello") >= 0 then 1 else 0, 1)
+
+    let nested: string = preprocess_hk_source("opts => {{\"a\": [1,\n2,\n3]}}\n")
+    f += t_int("nested brackets -> 1 line", source_lines(nested).len(), 1)
+
+    f += t_text("github repo", if extract_github_repo("https://github.com/Owner/Repo/releases/") == nil then "nil" else extract_github_repo("https://github.com/Owner/Repo/releases/"), "Owner/Repo")
+    f += t_int("github repo non-github", if extract_github_repo("https://example.com/a/b") == nil then 1 else 0, 1)
+    f += t_text("blob to raw", github_blob_to_raw("https://github.com/o/r/blob/main/x.desktop"), "https://raw.githubusercontent.com/o/r/main/x.desktop")
+    f += t_text("json string", extract_json_string("{{\"tag_name\": \"v1.2.3\", \"x\": 1}}", "tag_name"), "v1.2.3")
+    f += t_text("json missing", extract_json_string("{{\"a\": 1}}", "tag_name"), "")
+    f += t_text("normalize tag", normalize_tag("v2.0"), "2.0")
+    f += t_text("asset url", asset_url("o/r", "v1", "bin"), "https://github.com/o/r/releases/download/v1/bin")
+    return f
+end
