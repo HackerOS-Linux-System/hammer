@@ -1,0 +1,156 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+
+;; hammer -> hammerd::hd_config
+;;
+;; Port of source-code/hammerd/config.rs (Rust) to H#: konfiguracja demona
+;; (`/etc/hammer/hammerd.toml`).
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. Nazwa pliku `hd_config.h#` (nazwa modulu = nazwa pliku; `config`
+;;    kolidowalby z innymi). Katalog `hammerd/` jest modulem `hammerd`.
+;; 2. `serde` + `toml` -> prosty parser `klucz = wartosc` (liczby calkowite,
+;;    `true`/`false`, napisy w cudzyslowie, komentarze `#`, brak sekcji/tablic —
+;;    format pliku nie ma ich). Nieznane klucze sa ignorowane, brakujace
+;;    dostaja wartosc domyslna (jak `#[serde(default = ..)]`). Linia, ktorej
+;;    nie da sie zinterpretowac, uniewaznia CALY plik (jak `from_str(..).ok()`
+;;    => `unwrap_or_default()`): wracaja wartosci domyslne.
+;; 3. `u64` -> `int` (63 bity), `u32` -> `int`. Wartosc ujemna uniewaznia plik.
+;; 4. `save()` zapisuje te same klucze w kolejnosci deklaracji struktury, w
+;;    formacie `to_string_pretty` (napisy w cudzyslowach).
+
+pub fn config_file() -> string is return "/etc/hammer/hammerd.toml" end
+
+pub struct DaemonConfig is
+    ;; godziny miedzy auto-sync (0 = wylaczone)
+    pub sync_interval_hours:   int
+    ;; godziny miedzy sprawdzeniem aktualizacji + powiadomieniem
+    pub check_interval_hours:  int
+    ;; godziny miedzy skanem integralnosci magazynu
+    pub verify_interval_hours: int
+    pub notify:                bool
+    ;; "trace" | "debug" | "info" | "warn" | "error"
+    pub log_level:             string
+    ;; automatycznie stosuj aktualizacje bezpieczenstwa
+    pub auto_security_upgrade: bool
+    pub max_generations:       int
+end
+
+pub fn config_default() -> DaemonConfig is
+    return DaemonConfig { sync_interval_hours: 6, check_interval_hours: 6, verify_interval_hours: 24,
+        notify: true, log_level: "info", auto_security_upgrade: false, max_generations: 20 }
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+;; Parsuje tresc TOML (patrz odejscie 2). `ok == false` => plik uniewazniony.
+pub struct ParsedConfig is
+    pub ok:  bool
+    pub cfg: DaemonConfig
+end
+
+fn unquote(v: string) -> string is
+    let t: string = str::trim(v)
+    if string_len(t) >= 2 && string_at(t, 0) == "\"" && string_at(t, string_len(t) - 1) == "\"" is
+        return str::slice(t, 1, string_len(t) - 1)
+    end
+    return t
+end
+
+pub fn config_parse(text: string) -> ParsedConfig is
+    let mut cfg: DaemonConfig = config_default()
+    let lines: [string] = str::split(text, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = str::trim(lines[i])
+        i += 1
+        if line == "" || string_starts_with(line, "#") is
+            continue
+        end
+        let eq: int = compat::str_index_of(line, "=")
+        if eq <= 0 is return ParsedConfig { ok: false, cfg: config_default() } end
+        let key: string = str::trim(str::slice(line, 0, eq))
+        let val: string = str::trim(str::slice(line, eq + 1, string_len(line)))
+        if key == "sync_interval_hours" || key == "check_interval_hours" || key == "verify_interval_hours" || key == "max_generations" is
+            if !str::is_numeric(val) is return ParsedConfig { ok: false, cfg: config_default() } end
+            let n: int = conv::str_to_int(val)
+            if key == "sync_interval_hours" is cfg.sync_interval_hours = n end
+            if key == "check_interval_hours" is cfg.check_interval_hours = n end
+            if key == "verify_interval_hours" is cfg.verify_interval_hours = n end
+            if key == "max_generations" is cfg.max_generations = n end
+        elsif key == "notify" || key == "auto_security_upgrade" is
+            if val != "true" && val != "false" is return ParsedConfig { ok: false, cfg: config_default() } end
+            if key == "notify" is cfg.notify = val == "true" end
+            if key == "auto_security_upgrade" is cfg.auto_security_upgrade = val == "true" end
+        elsif key == "log_level" is
+            if string_len(val) < 2 || string_at(val, 0) != "\"" is return ParsedConfig { ok: false, cfg: config_default() } end
+            cfg.log_level = unquote(val)
+        end
+    end
+    return ParsedConfig { ok: true, cfg: cfg }
+end
+
+pub fn config_load() -> DaemonConfig is
+    if !fs::exists(config_file()) is return config_default() end
+    let pc: ParsedConfig = config_parse(fs::read(config_file()))
+    return pc.cfg
+end
+
+pub fn config_to_toml(c: DaemonConfig) -> string is
+    return "sync_interval_hours = " + to_string(c.sync_interval_hours) + "\n" +
+        "check_interval_hours = " + to_string(c.check_interval_hours) + "\n" +
+        "verify_interval_hours = " + to_string(c.verify_interval_hours) + "\n" +
+        "notify = " + (if c.notify then "true" else "false") + "\n" +
+        "log_level = \"" + c.log_level + "\"\n" +
+        "auto_security_upgrade = " + (if c.auto_security_upgrade then "true" else "false") + "\n" +
+        "max_generations = " + to_string(c.max_generations) + "\n"
+end
+
+pub fn config_save(c: DaemonConfig) -> string is
+    proc::shell("mkdir -p " + shq(compat::path_parent(config_file())))
+    if !fs::write(config_file(), config_to_toml(c)) is return "Cannot write " + config_file() end
+    return ""
+end
+
+;; Zapisuje domyslna konfiguracje, jesli pliku nie ma.
+pub fn config_init_default() -> string is
+    if fs::exists(config_file()) is return "" end
+    return config_save(config_default())
+end
+
+;; ── Testy ────────────────────────────────────────────────────────────────
+
+fn t_int(label: string, got: int, want: int) -> int is
+    if got == want is return 0 end
+    write("hd_config::self_test FAIL: " + label + " got " + to_string(got) + " want " + to_string(want))
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow.
+pub fn self_test() -> int is
+    let mut f: int = 0
+    let d: DaemonConfig = config_default()
+    f += t_int("default sync", d.sync_interval_hours, 6)
+    f += t_int("default verify", d.verify_interval_hours, 24)
+    let p: ParsedConfig = config_parse("# komentarz\nsync_interval_hours = 12\nnotify = false\nlog_level = \"debug\"\nmax_generations = 5\nunknown = 7\n")
+    f += t_int("parse ok", if p.ok then 1 else 0, 1)
+    f += t_int("parse sync", p.cfg.sync_interval_hours, 12)
+    f += t_int("parse check keeps default", p.cfg.check_interval_hours, 6)
+    f += t_int("parse notify", if p.cfg.notify then 1 else 0, 0)
+    f += t_int("parse log_level", if p.cfg.log_level == "debug" then 1 else 0, 1)
+    f += t_int("parse max_gen", p.cfg.max_generations, 5)
+    let bad: ParsedConfig = config_parse("sync_interval_hours = abc\n")
+    f += t_int("bad value => not ok", if bad.ok then 1 else 0, 0)
+    f += t_int("bad value => defaults", bad.cfg.sync_interval_hours, 6)
+    let back: ParsedConfig = config_parse(config_to_toml(p.cfg))
+    f += t_int("roundtrip sync", back.cfg.sync_interval_hours, 12)
+    f += t_int("roundtrip log_level", if back.cfg.log_level == "debug" then 1 else 0, 1)
+    f += t_int("roundtrip notify", if back.cfg.notify then 1 else 0, 0)
+    return f
+end
