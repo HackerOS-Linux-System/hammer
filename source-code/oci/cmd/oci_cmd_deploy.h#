@@ -1,0 +1,51 @@
+mod internal
+mod ui
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_deploy   (port cmd/deploy.rs)
+;; Odejscia: `async` zbedne; blokada zwalniana (`lock_release`) na kazdej
+;; sciezce wyjscia (brak `Drop`). Jak w Rust `.incomplete` ZOSTAJE przy
+;; bledzie, a `mark_complete` tylko po sukcesie/zakonczonym deployu.
+
+fn deploy_locked(image_ref: string, cfg: oci_types::Config, lock: oci_transaction_lock::TransactionLock) -> string is
+    if oci_transaction_lock::found_incomplete(lock) is
+        ui::eprint_line("  " + ui::yellow_bold("!") + " A previous 'hammer oci' transaction was interrupted.")
+        ui::eprint_line("    Run " + ui::cyan("hammer oci cleanup --repair") + " before continuing.")
+    end
+
+    write("  " + ui::bright_cyan_bold("↓") + " Pulling base image " + ui::bold(image_ref) + "…")
+    let pull: oci_puller::PullResult = oci_puller::pull_and_unpack(compat::path_join(cfg.overlay_work_dir, "pull"), image_ref)
+    if pull.err != "" is return pull.err end
+
+    write("  " + ui::dim("·") + " Committing to OSTree repo " + cfg.ostree_repo_path + "…")
+    let rr: oci_ostree_repo::RepoResult = oci_ostree_repo::repo_open_or_create(cfg.ostree_repo_path)
+    if rr.err != "" is return rr.err end
+    let refspec: string = "hammer-oci/" + oci_types::sanitize_ref(image_ref)
+    let cr: oci_ostree_repo::CommitResult = oci_ostree_repo::commit_directory(rr.repo, pull.rootfs, refspec, "Initial deploy from " + image_ref, "")
+    if cr.err != "" is return cr.err end
+    oci_process::run_capture("rm", ["-rf", pull.rootfs])
+
+    write("  " + ui::dim("·") + " Registering deployment…")
+    let sr: oci_sysroot::SysrootResult = oci_sysroot::sysroot_open(cfg.sysroot_path, cfg.ostree_repo_path, cfg.osname)
+    if sr.err != "" is return sr.err end
+    let origin: string = "hammer-oci:" + image_ref
+    let none: [oci_types::PackageLayer] = []
+    let result: oci_types::TransactionResult = oci_sysroot::deploy_commit(sr.sysroot, cr.checksum, origin, none)
+    oci_transaction_lock::mark_complete(lock)
+
+    if !result.success is return "Deploy failed: " + result.error_message end
+    write("  " + ui::bright_green_bold("✔") + " Deployed " + ui::bold(image_ref) + " as " + oci_types::short_sum(cr.checksum))
+    write("    Reboot to activate this deployment.")
+    return ""
+end
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    if args.len() == 0 is
+        return "Usage: hammer oci deploy <image-ref>\n  e.g. hammer oci deploy ghcr.io/example/hackeros-base:trixie"
+    end
+    let lr: oci_transaction_lock::LockResult = oci_transaction_lock::lock_acquire(cfg.overlay_work_dir)
+    if lr.err != "" is return lr.err end
+    let e: string = deploy_locked(args[0], cfg, lr.lock)
+    oci_transaction_lock::lock_release(lr.lock)
+    return e
+end
