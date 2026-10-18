@@ -1,0 +1,719 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+use "bit -> progress-bar" from "pb"
+use "bit -> colors"
+
+mod internal
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+mod ui
+
+;; hammer -> ui::download
+;;
+;; Port of source-code/ui/download.rs (Rust) to H#: klient HTTP, rownolegle
+;; pobieranie paczek .deb z wznawianiem, ponowieniami i weryfikacja SHA-256,
+;; paski postepu, cache pobranych archiwow, `UnpackSpinner`.
+;;
+;; ── Dlaczego `curl`, a nie `std -> http` ────────────────────────────────
+;; `std -> http` zwraca cialo odpowiedzi jako `string` (bez trybu
+;; binarnego, bez strumieniowania, bez naglowkow, bez `Range`, bez
+;; limitow czasu, bez User-Agent) — dla plikow `.deb` (binarne, z bajtami
+;; NUL, dziesiatki MB) to niewystarczajace; Rust uzywal `reqwest` ze
+;; strumieniem, `Range`, `If-Modified-Since` i limitami. Dlatego pobieranie
+;; idzie przez `curl` (argv jak w `Command`, kazdy argument cytowany):
+;; binarnie bezpieczne, wznawianie (`-C -`), `--connect-timeout 20`,
+;; `--max-time 300` (jak `connect_timeout`/`timeout` w reqwest),
+;; `-z` (If-Modified-Since), `-D` (naglowki), `--compressed` dla metadanych
+;; (jak `gzip(true)/deflate(true)`). WYMAGANE: `curl` w PATH.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. API bajtowe `get_bytes*` -> API plikowe: `get_file(c, url, dest)`,
+;;    `get_file_if_modified`, `get_file_with_meta`, `get_file_retry`;
+;;    `get_string` czyta tekst (InRelease, metadane) przez plik tymczasowy.
+;;    `Vec<u8>` nie ma sensu w H# dla plikow tej wielkosci (patrz pkg/deb.h#).
+;; 2. Wspolbieznosc: `tokio` + `Semaphore(4)` -> `xargs -P 4` uruchamiajacy
+;;    skrypty robocze (po jednym na paczke) w tle; H# odpytuje co ~150 ms
+;;    rozmiary plikow `.part` i rysuje paski (patrz nizej).
+;; 3. Paski postepu: `indicatif` -> biblioteka `progress-bar` (bit): stan paska,
+;;    tor ▰▱, ETA i spinner liczy i renderuje ona (`builder`,
+;;    `ProgressBar.line()`); hammer zostawia sobie petle odpytujaca rozmiary
+;;    `.part` (postep z rozmiaru pliku — curl, nie strumien) i przesuwanie
+;;    kursora (`ESC[nA`). Szczegoly:
+;;      * bajty i predkosc formatuje `ui::human_size` (przez `{msg}`), a NIE
+;;        placeholdery `{bytes}`/`{speed}` biblioteki — jej `format_bytes` ma
+;;        blad przesuniecia jednostek (1024 B -> "1.0 MB", a jej wlasny test
+;;        oczekuje "1.0 KB");
+;;      * tor rysowany przez biblioteke ma na sztywno cyjan (`ESC[36m`) —
+;;        podmieniam go na kolor marki hammera (`accent_open`);
+;;      * paski o nieznanym rozmiarze (0 B w metadanych) sa NIEOKRESLONE
+;;        (animacja ping-pong z biblioteki), a nie pelne jak dotad;
+;;      * gdy stdout nie jest terminalem — brak paskow (jak w indicatif).
+;; 4. Wznawianie: `Range` recznie -> `curl -C -`. Odpowiedz 416 lub kod
+;;    curl 33 (serwer zignorowal Range) => kasuj `.part` i zacznij od nowa
+;;    (jak w Rust; maks. jedno takie natychmiastowe wznowienie na probe).
+;;    404 => blad bez ponowien (`"404 Not Found: URL"`).
+;; 5. SHA-256 pliku: `sha256sum` (coreutils) zamiast wczytywania do pamieci.
+;; 6. `UnpackSpinner`: bez animacji w tle (w H# nie ma watkow) — jedna
+;;    linia `⠋ unpacking <etykieta>`, `finish_ok` zastepuje ja linia z `✔`,
+;;    `finish` ja czysci. Tylko na terminalu.
+;; 7. `std::time::SystemTime` atime w `evict_cache_lru` -> `find -printf %A@`.
+;; 8. Wyniki zbiorcze: `anyhow::Result<Vec<DownloadResult>>` -> `DownloadOutcome`.
+;; 9. Spinner/brajl: te same znaki co w Rust; tick co ~150 ms z zegara.
+
+pub fn dl_dir() -> string is return "/var/cache/hammer/archives" end
+
+fn max_concurrent() -> int is return 4 end
+fn max_retries() -> int is return 3 end
+fn retry_delay() -> int is return 2 end
+
+fn user_agent() -> string is
+    return "hammer/" + log::hammer_version() + " (https://github.com/HackerOS-Linux-System/hammer)"
+end
+
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sys_ok(cmd: string) -> bool is
+    return system(cmd) == 0
+end
+
+fn is_numeric_str(s: string) -> bool is
+    return s != "" && str::is_numeric(s)
+end
+
+fn int_or(s: string, default: int) -> int is
+    let t: string = str::trim(s)
+    if is_numeric_str(t) is return conv::str_to_int(t) end
+    return default
+end
+
+;; ── HttpClient ───────────────────────────────────────────────────────────
+
+pub struct HttpClient is
+    pub agent: string
+end
+
+pub fn client_new() -> HttpClient is
+    return HttpClient { agent: user_agent() }
+end
+
+;; Wynik jednego wywolania curl.
+struct CurlOut is
+    pub code: int      ;; kod HTTP (0 gdy brak odpowiedzi)
+    pub rc:   int      ;; kod wyjscia curl
+    pub err:  string   ;; stderr curl (skrocony)
+end
+
+fn tmp_name(tag: string) -> string is
+    return str::trim(proc::shell("mktemp /tmp/hammer-dl-" + tag + ".XXXXXX 2>/dev/null"))
+end
+
+;; GET -> plik. `extra` = dodatkowe argumenty curl (juz cytowane), `hdr` = plik
+;; naglowkow albo "" (-D).
+fn curl_get(url: string, dest: string, hdr: string, extra: string, max_time: int, compressed: bool) -> CurlOut is
+    let errf: string = tmp_name("err")
+    let mut cmd: string = "curl -sS -L -A " + shq(user_agent()) + " --connect-timeout 20 --max-time " + to_string(max_time)
+    if compressed is cmd = cmd + " --compressed" end
+    if hdr != "" is cmd = cmd + " -D " + shq(hdr) end
+    cmd = cmd + " " + extra + " -o " + shq(dest) + " -w '%{{http_code}}' " + shq(url) + " 2>" + shq(errf)
+    let script: string = "code=$(" + cmd + "); rc=$?; echo \"$code $rc\""
+    let out: string = str::trim(proc::shell("sh -c " + shq(script)))
+    let parts: [string] = str::split(out, " ")
+    let code: int = if parts.len() >= 1 then int_or(parts[0], 0) else 0
+    let rc: int = if parts.len() >= 2 then int_or(parts[1], 1) else 1
+    let mut err: string = ""
+    if errf != "" && fs::exists(errf) is
+        err = str::trim(fs::read(errf))
+        fs::remove(errf)
+    end
+    return CurlOut { code: code, rc: rc, err: err }
+end
+
+;; "" = Ok, inaczej komunikat: `curl: ...` albo `HTTP <kod> for <url>`.
+fn describe_failure(o: CurlOut, url: string) -> string is
+    if o.rc != 0 is
+        return "GET " + url + ": " + (if o.err != "" then o.err else "curl exit " + to_string(o.rc))
+    end
+    return "HTTP " + to_string(o.code) + " for " + url
+end
+
+fn ok_code(code: int) -> bool is
+    return code >= 200 && code < 300
+end
+
+;; Pobiera `url` do pliku `dest`. "" = Ok.
+pub fn get_file(c: HttpClient, url: string, dest: string) -> string is
+    let o: CurlOut = curl_get(url, dest, "", "", 300, true)
+    if o.rc == 0 && ok_code(o.code) is return "" end
+    if fs::exists(dest) is fs::remove(dest) end
+    return describe_failure(o, url)
+end
+
+;; Tekst (InRelease, listy) — przez plik tymczasowy; "" w `err` = Ok.
+pub struct StringResult is
+    pub text: string
+    pub err:  string
+end
+
+pub fn get_string(c: HttpClient, url: string) -> StringResult is
+    let tmp: string = tmp_name("str")
+    let err: string = get_file(c, url, tmp)
+    if err != "" is
+        if fs::exists(tmp) is fs::remove(tmp) end
+        return StringResult { text: "", err: err }
+    end
+    let text: string = fs::read(tmp)
+    fs::remove(tmp)
+    return StringResult { text: text, err: "" }
+end
+
+;; `get_string` z limitem czasu w sekundach (Rust: `tokio::time::timeout`).
+pub fn get_string_timeout(c: HttpClient, url: string, secs: int) -> StringResult is
+    let tmp: string = tmp_name("str")
+    let o: CurlOut = curl_get(url, tmp, "", "", secs, true)
+    if o.rc == 28 is
+        if fs::exists(tmp) is fs::remove(tmp) end
+        return StringResult { text: "", err: "Request timed out after " + to_string(secs) + "s: " + url }
+    end
+    if o.rc != 0 || !ok_code(o.code) is
+        if fs::exists(tmp) is fs::remove(tmp) end
+        return StringResult { text: "", err: describe_failure(o, url) }
+    end
+    let text: string = fs::read(tmp)
+    fs::remove(tmp)
+    return StringResult { text: text, err: "" }
+end
+
+;; Wynik warunkowego GET-a.
+pub struct CondResult is
+    pub modified:      bool     ;; false => 304 Not Modified (cache nadal wazny)
+    pub last_modified: string?
+    pub err:           string
+end
+
+;; Wartosc naglowka `Last-Modified` z pliku naglowkow curl (ostatnia odpowiedz
+;; po przekierowaniach), albo nil.
+fn last_modified_of(hdr_file: string) -> string? is
+    if !fs::exists(hdr_file) is return nil end
+    let lines: [string] = str::split(fs::read(hdr_file), "\n")
+    let mut found: string? = nil
+    let mut i: int = 0
+    while i < lines.len() is
+        let l: string = str::trim(lines[i])
+        i += 1
+        if string_len(l) > 14 && str::to_lower(str::slice(l, 0, 14)) == "last-modified:" is
+            found = str::trim(str::slice(l, 14, string_len(l)))
+        end
+    end
+    return found
+end
+
+;; Odpowiednik `get_bytes_if_modified`: jesli `last_modified` podane -> `-z`.
+pub fn get_file_if_modified(c: HttpClient, url: string, dest: string, last_modified: string?) -> CondResult is
+    let hdr: string = tmp_name("hdr")
+    let mut extra: string = ""
+    if last_modified != nil is
+        let lm: string = last_modified
+        extra = "-z " + shq(lm)
+    end
+    let o: CurlOut = curl_get(url, dest, hdr, extra, 300, true)
+    let lm_out: string? = last_modified_of(hdr)
+    if fs::exists(hdr) is fs::remove(hdr) end
+    if o.rc == 0 && o.code == 304 is
+        if fs::exists(dest) && fs::size(dest) == 0 is fs::remove(dest) end
+        return CondResult { modified: false, last_modified: lm_out, err: "" }
+    end
+    if o.rc != 0 || !ok_code(o.code) is
+        if fs::exists(dest) is fs::remove(dest) end
+        return CondResult { modified: true, last_modified: nil, err: describe_failure(o, url) }
+    end
+    return CondResult { modified: true, last_modified: lm_out, err: "" }
+end
+
+;; Odpowiednik `get_bytes_with_meta`: plik + wartosc `Last-Modified`.
+pub fn get_file_with_meta(c: HttpClient, url: string, dest: string) -> CondResult is
+    let hdr: string = tmp_name("hdr")
+    let o: CurlOut = curl_get(url, dest, hdr, "", 300, true)
+    let lm: string? = last_modified_of(hdr)
+    if fs::exists(hdr) is fs::remove(hdr) end
+    if o.rc != 0 || !ok_code(o.code) is
+        if fs::exists(dest) is fs::remove(dest) end
+        return CondResult { modified: true, last_modified: nil, err: describe_failure(o, url) }
+    end
+    return CondResult { modified: true, last_modified: lm, err: "" }
+end
+
+;; `get_bytes_retry`: do `attempts` prob, odstep 2^i sekund. "" = Ok.
+pub fn get_file_retry(c: HttpClient, url: string, dest: string, attempts: int) -> string is
+    let mut last: string = "All " + to_string(attempts) + " attempts failed for " + url
+    let mut i: int = 0
+    while i < attempts is
+        let err: string = get_file(c, url, dest)
+        if err == "" is return "" end
+        last = err
+        if i + 1 < attempts is
+            let mut delay: int = 1
+            let mut k: int = 0
+            while k < i is
+                delay = delay * 2
+                k += 1
+            end
+            compat::time_sleep_ms(delay * 1000)
+        end
+        i += 1
+    end
+    return last
+end
+
+;; ── Sciezki / cache ──────────────────────────────────────────────────────
+
+pub fn pkg_dest_path(pkg: package::Package) -> string is
+    let safe_ver: string = str::replace_all(str::replace_all(pkg.version, ":", "%3A"), "/", "%2F")
+    return compat::path_join(dl_dir(), pkg.name + "_" + safe_ver + "_" + pkg.architecture + ".deb")
+end
+
+;; Rust: `dest.with_extension("part")` (zastepuje `.deb`).
+fn part_path_of(dest: string) -> string is
+    return compat::path_with_extension(dest, "part")
+end
+
+pub struct CacheResult is
+    pub count: int
+    pub err:   string
+end
+
+pub fn clean_cache() -> CacheResult is
+    let dir: string = dl_dir()
+    if !fs::exists(dir) is return CacheResult { count: 0, err: "" } end
+    let names: [string] = fs::list_dir(dir)
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < names.len() is
+        let n: string = names[i]
+        i += 1
+        if n.ends_with(".deb") is
+            if !sys_ok("rm -f -- " + shq(compat::path_join(dir, n))) is
+                return CacheResult { count: count, err: "Cannot remove " + compat::path_join(dir, n) }
+            end
+            count += 1
+        end
+    end
+    return CacheResult { count: count, err: "" }
+end
+
+;; Usuwa najdawniej uzywane (po atime) `.deb`, az suma < `max_bytes`.
+pub fn evict_cache_lru(max_bytes: int) -> CacheResult is
+    let dir: string = dl_dir()
+    if !fs::exists(dir) is return CacheResult { count: 0, err: "" } end
+    let listing: string = proc::shell("find " + shq(dir) + " -maxdepth 1 -type f -name '*.deb' -printf '%A@ %s %p\\n' 2>/dev/null | sort -n")
+    let lines: [string] = str::split(listing, "\n")
+    let mut sizes: [int] = []
+    let mut paths: [string] = []
+    let mut total: int = 0
+    let mut i: int = 0
+    while i < lines.len() is
+        let l: string = lines[i]
+        i += 1
+        if l != "" is
+            let p1: int = compat::str_index_of(l, " ")
+            if p1 > 0 is
+                let rest: string = str::slice(l, p1 + 1, string_len(l))
+                let p2: int = compat::str_index_of(rest, " ")
+                if p2 > 0 is
+                    let sz: int = int_or(str::slice(rest, 0, p2), 0)
+                    sizes.push(sz)
+                    paths.push(str::slice(rest, p2 + 1, string_len(rest)))
+                    total += sz
+                end
+            end
+        end
+    end
+    if total <= max_bytes is return CacheResult { count: 0, err: "" } end
+
+    let mut removed: int = 0
+    let mut k: int = 0
+    while k < paths.len() && total > max_bytes is
+        if sys_ok("rm -f -- " + shq(paths[k])) is
+            total -= sizes[k]
+            removed += 1
+        end
+        k += 1
+    end
+    return CacheResult { count: removed, err: "" }
+end
+
+;; ── Skrypt roboczy jednej paczki ─────────────────────────────────────────
+;;
+;; `-f` jest WAZNE: bez niego curl zapisuje TRESC odpowiedzi bledu (np. HTML
+;; strony 500) do pliku `.part`, a nastepna proba z `-C -` wznawialaby
+;; "pobieranie" od konca tego smieca — uszkodzony plik przeszedlby
+;; niezauwazony przy braku sumy SHA-256 (sprawdzone na serwerze testowym).
+;; Semantyka `download_with_retry` + `download_one`:
+;;   - istnieje niepusty `dest`: z SHA => zgodny OK / niezgodny kasuj;
+;;     bez SHA => OK;
+;;   - do 3 prob, przed proba n>0 sen 2*n s, kasowanie bledow;
+;;   - `-C -` wznawia z `.part`; 404 => blad bez ponowien;
+;;     416 / curl 33 => kasuj `.part`, natychmiastowy restart (max 1 na probe);
+;;   - po pobraniu: `mv .part dest`, weryfikacja SHA (niezgodny => kasuj, ponow);
+;;   - wynik do `res` ("ok" albo "err:<tekst>") zapisany atomowo.
+fn job_script(url: string, dest: string, part: string, sha: string, res: string) -> string is
+    return "url=" + shq(url) + "; dest=" + shq(dest) + "; part=" + shq(part) + "; sha=" + shq(sha) +
+        "; res=" + shq(res) + "; ua=" + shq(user_agent()) + "\n" +
+        "fin() {{ printf '%s' \"$1\" > \"$res.tmp\"; mv -f \"$res.tmp\" \"$res\"; exit 0; }}\n" +
+        "sha_ok() {\n" +
+        "  [ -z \"$sha\" ] && return 0\n" +
+        "  got=$(sha256sum -- \"$1\" 2>/dev/null | cut -d' ' -f1)\n" +
+        "  [ \"$(printf %s \"$got\" | tr A-F a-f)\" = \"$(printf %s \"$sha\" | tr A-F a-f)\" ]\n" +
+        "}\n" +
+        "if [ -s \"$dest\" ]; then\n" +
+        "  if [ -z \"$sha\" ]; then fin ok; fi\n" +
+        "  if sha_ok \"$dest\"; then fin ok; fi\n" +
+        "  rm -f -- \"$dest\"\n" +
+        "fi\n" +
+        "last='No attempts made'; attempt=0\n" +
+        "while [ $attempt -lt " + to_string(max_retries()) + " ]; do\n" +
+        "  if [ $attempt -gt 0 ]; then sleep $(( " + to_string(retry_delay()) + " * attempt )); fi\n" +
+        "  restarted=0\n" +
+        "  while : ; do\n" +
+        "    code=$(curl -sS -f -L -A \"$ua\" --connect-timeout 20 --max-time 300 -C - -o \"$part\" -w '%{{http_code}}' \"$url\" 2>\"$res.err\"); rc=$?\n" +
+        "    if [ \"$code\" = 404 ]; then fin \"err:404 Not Found: $url\"; fi\n" +
+        "    if {{ [ \"$code\" = 416 ] || [ $rc -eq 33 ]; }} && [ $restarted -eq 0 ]; then rm -f -- \"$part\"; restarted=1; continue; fi\n" +
+        "    break\n" +
+        "  done\n" +
+        "  case \"$code\" in 2*) okcode=1 ;; *) okcode=0 ;; esac\n" +
+        "  if [ $rc -eq 0 ] && [ $okcode -eq 1 ]; then\n" +
+        "    mv -f -- \"$part\" \"$dest\"\n" +
+        "    if sha_ok \"$dest\"; then fin ok; fi\n" +
+        "    rm -f -- \"$dest\"; last=\"SHA256 mismatch for $url\"\n" +
+        "  elif [ $rc -eq 22 ] && [ -n \"$code\" ] && [ \"$code\" != 000 ]; then\n" +
+        "    last=\"HTTP $code for $url\"\n" +
+        "  elif [ $rc -ne 0 ]; then\n" +
+        "    last=\"GET $url: $(head -c 300 \"$res.err\" 2>/dev/null | tr '\\n' ' ')\"\n" +
+        "  else\n" +
+        "    last=\"HTTP $code for $url\"\n" +
+        "  fi\n" +
+        "  attempt=$((attempt+1))\n" +
+        "done\n" +
+        "fin \"err:$last\"\n"
+end
+
+;; ── Rysowanie ────────────────────────────────────────────────────────────
+
+fn bar_theme() -> string is
+    return theme::custom_theme("", "", "\u{25B0}", "\u{25B1}", "")
+end
+
+;; Poczatek sekwencji koloru marki (np. `ESC[38;2;255;165;0m`) albo "" gdy
+;; kolory sa wylaczone — wyciagniety z probki, zeby nie dublowac tablicy
+;; kolorow z biblioteki `colors`.
+fn accent_open() -> string is
+    let probe: string = ui::accent("\u{1}")
+    let idx: int = compat::str_index_of(probe, "\u{1}")
+    if idx <= 0 is return "" end
+    return str::slice(probe, 0, idx)
+end
+
+;; Tor paska rysowany przez biblioteke ma na sztywno cyjan (`ESC[36m`);
+;; podmieniamy go na kolor marki.
+fn brand_bar(line: string) -> string is
+    let open: string = accent_open()
+    if open == "" is return line end
+    return str::replace_all(line, "\x1b[36m", open)
+end
+
+fn new_pkg_bar(label: string, size: int) -> bar::ProgressBar is
+    let mut b: builder::ProgressBuilder = builder::new_bar(size, ui::bold(ui::pad(label, 42)))
+    b = b.theme(bar_theme())
+    b = b.width(28)
+    b = b.template("{{label}}  [{{bar}}]  {{msg}}")
+    if !colors::support::enabled() is b = b.no_color() end
+    return b.build()
+end
+
+fn new_total_bar(total: int) -> bar::ProgressBar is
+    let mut b: builder::ProgressBuilder = builder::new_bar(total, "Downloading")
+    b = b.theme(bar_theme())
+    b = b.width(38)
+    b = b.spinner_style("dots")
+    b = b.template("  {{spinner}}  " + ui::bold("Downloading") + "  [{{bar}}]  {{msg}}  ETA {{eta}}")
+    if !colors::support::enabled() is b = b.no_color() end
+    return b.build()
+end
+
+;; ── Paski licznikowe (dla innych modulow: oci, ...) ──────────────────────
+
+pub fn stdout_is_tty() -> bool is
+    return sys_ok("test -t 1")
+end
+
+;; Pasek "n/m + komunikat" w stylu hammera (ten sam tor ▰▱ i kolor marki).
+pub fn count_bar(total: int, label: string) -> bar::ProgressBar is
+    let mut b: builder::ProgressBuilder = builder::new_bar(total, label)
+    b = b.theme(bar_theme())
+    b = b.width(24)
+    b = b.spinner_style("dots")
+    b = b.template("  {{spinner}}  " + ui::bold(label) + "  [{{bar}}]  {{pos}}/{{len}}  {{msg}}")
+    if !colors::support::enabled() is b = b.no_color() end
+    return b.build()
+end
+
+;; Rysuje pasek w biezacej linii (nadpisuje); tylko gdy `tty`.
+pub fn draw_bar(b: bar::ProgressBar, tty: bool) is
+    if tty is
+        io::write_no_nl("\r\x1b[2K" + brand_bar(b.line()))
+        io::flush()
+    end
+end
+
+pub fn clear_bar(tty: bool) is
+    if tty is
+        io::write_no_nl("\r\x1b[2K")
+        io::flush()
+    end
+end
+
+;; ── download_packages ────────────────────────────────────────────────────
+
+pub struct DownloadResult is
+    pub package: package::Package
+    pub path:    string
+end
+
+pub struct DownloadOutcome is
+    pub ok:      bool
+    pub err:     string
+    pub results: [DownloadResult]
+end
+
+fn dl_failed(err: string) -> DownloadOutcome is
+    let none: [DownloadResult] = []
+    return DownloadOutcome { ok: false, err: err, results: none }
+end
+
+;; Jedna ramka pasków: linie paczek (powyzej) + linia calosci (na dole).
+fn render_frame(bars: [bar::ProgressBar], total: bar::ProgressBar) -> [string] is
+    let mut lines: [string] = []
+    let mut i: int = 0
+    while i < bars.len() is
+        lines.push("    " + brand_bar(bars[i].line()))
+        i += 1
+    end
+    lines.push(brand_bar(total.line()))
+    return lines
+end
+
+fn draw_frame(lines: [string], prev_count: int) is
+    let mut out: string = ""
+    if prev_count > 0 is out = out + "\x1b[" + to_string(prev_count) + "A" end
+    let mut i: int = 0
+    while i < lines.len() is
+        out = out + "\x1b[2K" + lines[i] + "\n"
+        i += 1
+    end
+    io::write_no_nl(out)
+    io::flush()
+end
+
+fn clear_frame(count: int) is
+    if count > 0 is
+        io::write_no_nl("\x1b[" + to_string(count) + "A\x1b[J")
+        io::flush()
+    end
+end
+
+;; Jedno wywolanie powloki: "<bajty>\t<wynik>" dla kazdej paczki (kolejnosc
+;; jak w `parts`/`dests`/`ress`); bajty = max(rozmiar .part, rozmiar dest).
+fn poll_script(parts: [string], dests: [string], ress: [string]) -> string is
+    let mut s: string = ""
+    let mut i: int = 0
+    while i < parts.len() is
+        s = s + "a=$(stat -c %s -- " + shq(parts[i]) + " 2>/dev/null || echo 0); " +
+            "b=$(stat -c %s -- " + shq(dests[i]) + " 2>/dev/null || echo 0); " +
+            "[ \"$b\" -gt \"$a\" ] && a=$b; " +
+            "r=''; [ -f " + shq(ress[i]) + " ] && r=$(cat " + shq(ress[i]) + "); " +
+            "printf '%s\\t%s\\n' \"$a\" \"$r\"\n"
+        i += 1
+    end
+    return s
+end
+
+;; Rownolegle pobieranie (do 4 naraz) z paskami. Wymaga, by kazda paczka miala
+;; `repo_base_uri` i `filename`.
+pub fn download_packages(c: HttpClient, packages: [package::Package]) -> DownloadOutcome is
+    let none: [DownloadResult] = []
+    if packages.len() == 0 is return DownloadOutcome { ok: true, err: "", results: none } end
+
+    fs::mkdir(dl_dir())
+    if !fs::is_dir(dl_dir()) is return dl_failed("Cannot create download cache dir") end
+
+    ;; walidacja metadanych (Rust: `bail!` przy pierwszej paczce bez URI/nazwy pliku)
+    let mut urls: [string] = []
+    let mut dests: [string] = []
+    let mut parts: [string] = []
+    let mut sizes: [int] = []
+    let mut shas: [string] = []
+    let mut labels: [string] = []
+    let mut total_bytes: int = 0
+    let mut i: int = 0
+    while i < packages.len() is
+        let pkg: package::Package = packages[i]
+        i += 1
+        if pkg.repo_base_uri == nil is
+            return dl_failed("Package '" + pkg.name + "' has no repository URI — run `hammer sync` first.")
+        end
+        if pkg.filename == nil is
+            return dl_failed("Package '" + pkg.name + "' has no filename in metadata — run `hammer sync` first.")
+        end
+        let base: string = pkg.repo_base_uri
+        let fname: string = pkg.filename
+        let mut base_t: string = base
+        while base_t.ends_with("/") is base_t = str::slice(base_t, 0, string_len(base_t) - 1) end
+        urls.push(base_t + "/" + fname)
+        let dest: string = pkg_dest_path(pkg)
+        dests.push(dest)
+        parts.push(part_path_of(dest))
+        let mut size: int = 0
+        if pkg.download_size != nil is size = pkg.download_size end
+        sizes.push(size)
+        total_bytes += size
+        if pkg.sha256 != nil is shas.push(pkg.sha256) else is shas.push("") end
+        labels.push(pkg.name + " " + pkg.version)
+    end
+
+    ;; skrypty robocze + katalog wynikow
+    let work: string = str::trim(proc::shell("mktemp -d /tmp/hammer-dl.XXXXXX 2>/dev/null"))
+    if work == "" is return dl_failed("Cannot create temp dir for downloads") end
+    let mut ress: [string] = []
+    let mut k: int = 0
+    while k < packages.len() is
+        let res: string = work + "/job-" + to_string(k) + ".res"
+        ress.push(res)
+        fs::write(work + "/job-" + to_string(k) + ".sh", job_script(urls[k], dests[k], parts[k], shas[k], res))
+        k += 1
+    end
+
+    ;; start w tle: xargs -P 4, znacznik zakonczenia
+    system("( ls " + shq(work) + "/job-*.sh | xargs -n1 -P " + to_string(max_concurrent()) +
+        " sh >/dev/null 2>&1; : > " + shq(work + "/done") + " ) >/dev/null 2>&1 &")
+
+    let tty: bool = sys_ok("test -t 1")
+    let started: int = compat::time_now_ms()
+    let mut tick: int = 0
+    let mut drawn: int = 0
+    let mut finished: bool = false
+    let mut cur: [int] = []
+    let mut bars: [bar::ProgressBar] = []
+    let mut j: int = 0
+    while j < packages.len() is
+        cur.push(0)
+        bars.push(new_pkg_bar(labels[j], sizes[j]))
+        j += 1
+    end
+    let mut total_bar: bar::ProgressBar = new_total_bar(total_bytes)
+
+    while !finished is
+        let out: string = proc::shell("sh -c " + shq(poll_script(parts, dests, ress)))
+        let rows: [string] = str::split(out, "\n")
+        let mut done_count: int = 0
+        let mut total_done: int = 0
+        let mut r: int = 0
+        while r < packages.len() is
+            if r < rows.len() is
+                let cols: [string] = str::split(rows[r], "\t")
+                cur[r] = int_or(cols[0], 0)
+                if cols.len() > 1 && cols[1] != "" is done_count += 1 end
+            end
+            total_done += cur[r]
+            r += 1
+        end
+        if tty is
+            let mut b: int = 0
+            while b < bars.len() is
+                ;; bez lancuchow metod: kodegen LLVM nie zna typu odbiorcy po `.set(..)`
+                let mut one: bar::ProgressBar = bars[b]
+                one = one.set(cur[b])
+                one = one.set_message(ui::pad_vis_left(ui::human_size(cur[b]), 9) + "/" + ui::human_size(sizes[b]))
+                bars[b] = one
+                b += 1
+            end
+            let el_ms: int = compat::time_now_ms() - started
+            let speed: int = if el_ms > 0 then total_done * 1000 / el_ms else 0
+            total_bar = total_bar.set(total_done)
+            total_bar = total_bar.set_message(ui::human_size(total_done) + "/" + ui::human_size(total_bytes) + "  " + ui::human_size(speed) + "/s")
+            total_bar = total_bar.tick()
+            let lines: [string] = render_frame(bars, total_bar)
+            draw_frame(lines, drawn)
+            drawn = lines.len()
+        end
+        tick += 1
+        if done_count >= packages.len() || fs::exists(work + "/done") is
+            finished = true
+        else is
+            compat::time_sleep_ms(150)
+        end
+    end
+    if tty is clear_frame(drawn) end
+
+    ;; zbierz wyniki
+    let mut results: [DownloadResult] = []
+    let mut failures: [string] = []
+    let mut f: int = 0
+    while f < packages.len() is
+        let res: string = if fs::exists(ress[f]) then str::trim(fs::read(ress[f])) else "err:no result (worker aborted)"
+        if res == "ok" is
+            results.push(DownloadResult { package: packages[f], path: dests[f] })
+        elsif res.starts_with("err:") is
+            failures.push(str::slice(res, 4, string_len(res)))
+        else is
+            failures.push("worker aborted")
+        end
+        f += 1
+    end
+    system("rm -rf -- " + shq(work))
+
+    if failures.len() > 0 is
+        ui::eprint_line("")
+        ui::eprint_line("  " + ui::red_bold("✗") + " " + to_string(failures.len()) + " download(s) failed:")
+        let mut x: int = 0
+        while x < failures.len() is
+            ui::eprint_line("    " + ui::dim("·") + " " + failures[x])
+            x += 1
+        end
+        ui::eprint_line("")
+        return dl_failed(to_string(failures.len()) + " package(s) could not be downloaded.\nTransaction aborted.")
+    end
+    return DownloadOutcome { ok: true, err: "", results: results }
+end
+
+;; ── UnpackSpinner ────────────────────────────────────────────────────────
+
+pub struct UnpackSpinner is
+    pub tty: bool
+end
+
+pub fn unpack_spinner_new(label: string) -> UnpackSpinner is
+    let tty: bool = sys_ok("test -t 1")
+    if tty is
+        let sp: spinner::Spinner = pb::quick_spinner("unpacking  " + label)
+        io::write_no_nl("  " + brand_bar(sp.line()))
+        io::flush()
+    end
+    return UnpackSpinner { tty: tty }
+end
+
+pub fn spinner_finish_ok(s: UnpackSpinner, label: string) is
+    if s.tty is
+        io::write_no_nl("\r\x1b[2K  " + ui::green("✔") + " " + label + "\n")
+        io::flush()
+    end
+end
+
+pub fn spinner_finish(s: UnpackSpinner) is
+    if s.tty is
+        io::write_no_nl("\r\x1b[2K")
+        io::flush()
+    end
+end
