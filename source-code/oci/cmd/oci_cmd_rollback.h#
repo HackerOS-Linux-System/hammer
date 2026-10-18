@@ -1,0 +1,23 @@
+mod internal
+mod ui
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_rollback   (port cmd/rollback.rs)
+
+fn rollback_locked(cfg: oci_types::Config, lock: oci_transaction_lock::TransactionLock) -> string is
+    let sr: oci_sysroot::SysrootResult = oci_sysroot::sysroot_open(cfg.sysroot_path, cfg.ostree_repo_path, cfg.osname)
+    if sr.err != "" is return sr.err end
+    let result: oci_types::TransactionResult = oci_sysroot::rollback(sr.sysroot)
+    oci_transaction_lock::mark_complete(lock)
+    if !result.success is return "Rollback failed: " + result.error_message end
+    write("  " + ui::bright_green_bold("✔") + " Rolled back to " + oci_types::short_sum(result.new_checksum) + " — reboot to activate.")
+    return ""
+end
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    let lr: oci_transaction_lock::LockResult = oci_transaction_lock::lock_acquire(cfg.overlay_work_dir)
+    if lr.err != "" is return lr.err end
+    let e: string = rollback_locked(cfg, lr.lock)
+    oci_transaction_lock::lock_release(lr.lock)
+    return e
+end
