@@ -1,0 +1,874 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+use "bit -> hk-parser" from "hkp"
+
+mod internal
+mod ui
+
+;; hammer -> repo
+;;
+;; Port of source-code/repo.rs (Rust) to H#: lista zrodel pakietow
+;; (/etc/hammer/sources-list.hk), fallbacki (repos.toml, apt sources.list),
+;; budowanie adresow indeksow i komenda `hammer repo`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `.hk` czyta biblioteka `hk-parser` z bit.io (jak Rust: crate
+;;    `hk_parser`) — `hkp::parse_file`, `resolve`, `has`, `get`, `array`,
+;;    `keys`. UWAGA: ta biblioteka laduje natywne `libhk_parser` DYNAMICZNIE
+;;    (`extern dynamic`), wiec binarka hammera nie jest w pelni statyczna.
+;;    Sciezki dostepu sa kropkowe ("sekcja.klucz"), wiec nazwa sekcji z
+;;    kropka w sobie (np. "ppa.example") nie zadziala — `save_to` zamienia
+;;    kropki w nazwach sekcji na '-'.
+;; 2. Stan niemutowalny: `add_entry`, `remove_*`, `set_*` zwracaja NOWA
+;;    `SourcesList` (H# nie ma `&mut self`).
+;; 3. `Result<..>` -> `RepoLoad { list, err }` / `string` ("" = Ok).
+;; 4. `Option<String>` -> `string?`. `eprintln!` -> `ui::eprint_line`.
+;; 5. Legacy `repos.toml`: brak parsera TOML w H# — czytam PODZBIOR uzywany
+;;    przez hammer (`[[repo]]` z `name`, `baseurl`, `suite`, `components`,
+;;    `arch`, `enabled`, `gpgkey`; napisy w "...", tablice ["a","b"], bool).
+;;    Brak wymaganego pola => blad "Parsing repos.toml" (serde tez dawal blad).
+;; 6. `index_urls` zwraca `[IndexUrl]`; `Vec<&str>`/`.to_string()` bez roznicy.
+;;
+;; ── BLEDY ORYGINALU, KTORE NAPRAWIAM (swiadomie; do cofniecia na zyczenie) ─
+;; A. `save_to` zapisywal linie w stylu apt (`deb URI SUITE COMP...`) do pliku
+;;    `.hk`. Po `hammer repo add|remove|enable|disable|set-default` plik
+;;    przestawal byc poprawnym `.hk` — `load_hk` nie znajdowal sekcji i
+;;    LISTA ZRODEL ZNIKALA. Teraz `save_to` zapisuje sekcje `.hk` (name,
+;;    type, baseurl, suite, components, arch, gpgkey, enabled) w formacie,
+;;    ktory `write_default` juz uzywa.
+;; B. `load_hk` pomijal wpisy z `enabled => false` (`continue`), wiec
+;;    `hammer repo disable X` + zapis + ponowne wczytanie GUBILO wpis, a
+;;    `repo_list` (ktory pokazuje `✘` dla wylaczonych) nigdy nie mial co
+;;    pokazac. Teraz wpisy wylaczone sa wczytywane z `enabled=false`;
+;;    `index_urls` i tak je pomija (filtr `!entry.enabled`).
+
+pub fn sources_hk() -> string is return "/etc/hammer/sources-list.hk" end
+
+pub enum EntryKind is
+    Deb
+    DebSrc
+end
+
+fn is_deb_src(k: EntryKind) -> bool is
+    match k is
+        EntryKind::DebSrc => is return true end
+        _ => is return false end
+    end
+end
+
+pub struct SourceEntry is
+    pub kind:       EntryKind
+    pub uri:        string
+    pub suite:      string
+    pub components: [string]
+    pub arches:     [string]
+    pub signed_by:  string?
+    pub enabled:    bool
+    pub name:       string?
+end
+
+pub struct SourcesList is
+    pub entries: [SourceEntry]
+end
+
+pub struct RepoLoad is
+    pub list: SourcesList
+    pub err:  string
+end
+
+pub struct IndexUrl is
+    pub url:           string
+    pub inrelease_url: string
+    pub base_uri:      string
+    pub suite:         string
+    pub component:     string
+    pub arch:          string
+    pub signed_by:     string?
+    pub name:          string
+end
+
+pub fn known_suites() -> [string] is
+    return [
+        "bookworm", "bookworm-updates", "bookworm-security", "bookworm-backports",
+        "trixie", "trixie-updates", "trixie-security", "trixie-backports",
+        "sid", "unstable", "forky", "experimental",
+        "stable", "stable-updates", "stable-security", "stable-backports",
+        "testing", "testing-updates", "testing-security",
+        "oldstable", "oldstable-security"
+    ]
+end
+
+pub fn list_empty() -> SourcesList is
+    let none: [SourceEntry] = []
+    return SourcesList { entries: none }
+end
+
+;; ── Pomocnicze ───────────────────────────────────────────────────────────
+
+fn opt(v: string?) -> string is
+    if v == nil is return "" end
+    let s: string = v
+    return s
+end
+
+fn contains(s: string, sub: string) -> bool is
+    return compat::str_index_of(s, sub) >= 0
+end
+
+fn trim_end_char(s: string, ch: string) -> string is
+    let mut n: int = string_len(s)
+    while n > 0 && str::slice(s, n - 1, n) == ch is
+        n -= 1
+    end
+    return str::slice(s, 0, n)
+end
+
+fn lines_of(s: string) -> [string] is
+    let parts: [string] = str::split(s, "\n")
+    let mut out: [string] = []
+    let n: int = if parts.len() > 0 && parts[parts.len() - 1] == "" then parts.len() - 1 else parts.len()
+    let mut i: int = 0
+    while i < n is
+        out.push(parts[i])
+        i += 1
+    end
+    return out
+end
+
+;; `split_whitespace()`
+fn split_ws(s: string) -> [string] is
+    let norm: string = str::replace_all(str::replace_all(s, "\t", " "), "\r", " ")
+    let raw: [string] = str::split(norm, " ")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < raw.len() is
+        if raw[i] != "" is out.push(raw[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; `s.splitn(n, ' ')` — ostatni element zawiera reszte (bez zwijania spacji).
+fn splitn_space(s: string, n: int) -> [string] is
+    let mut out: [string] = []
+    let mut rest: string = s
+    while out.len() < n - 1 is
+        let p: int = compat::str_index_of(rest, " ")
+        if p < 0 is
+            out.push(rest)
+            return out
+        end
+        out.push(str::slice(rest, 0, p))
+        rest = str::slice(rest, p + 1, string_len(rest))
+    end
+    out.push(rest)
+    return out
+end
+
+;; `id.parse::<usize>()` -> -1 gdy to nie liczba.
+fn parse_usize(s: string) -> int is
+    if s != "" && str::is_numeric(s) is return conv::str_to_int(s) end
+    return -1
+end
+
+fn sat_sub1(n: int) -> int is
+    if n <= 0 is return 0 end
+    return n - 1
+end
+
+;; ── Operacje na liscie (zwracaja nowa liste) ─────────────────────────────
+
+pub fn add_entry(l: SourcesList, e: SourceEntry) -> SourcesList is
+    let mut out: [SourceEntry] = l.entries
+    out.push(e)
+    return SourcesList { entries: out }
+end
+
+pub fn remove_entry_by_index(l: SourcesList, idx: int) -> SourcesList is
+    if idx < 0 || idx >= l.entries.len() is return l end
+    let mut out: [SourceEntry] = []
+    let mut i: int = 0
+    while i < l.entries.len() is
+        if i != idx is out.push(l.entries[i]) end
+        i += 1
+    end
+    return SourcesList { entries: out }
+end
+
+;; `retain(|e| !e.uri.contains(uri))`
+pub fn remove_entry_by_uri(l: SourcesList, uri: string) -> SourcesList is
+    let mut out: [SourceEntry] = []
+    let mut i: int = 0
+    while i < l.entries.len() is
+        if !contains(l.entries[i].uri, uri) is out.push(l.entries[i]) end
+        i += 1
+    end
+    return SourcesList { entries: out }
+end
+
+pub fn set_enabled_by_index(l: SourcesList, idx: int, enabled: bool) -> SourcesList is
+    let mut out: [SourceEntry] = l.entries
+    if idx >= 0 && idx < out.len() is out[idx].enabled = enabled end
+    return SourcesList { entries: out }
+end
+
+pub fn set_enabled_by_uri(l: SourcesList, uri: string, enabled: bool) -> SourcesList is
+    let mut out: [SourceEntry] = l.entries
+    let mut i: int = 0
+    while i < out.len() is
+        if contains(out[i].uri, uri) is out[i].enabled = enabled end
+        i += 1
+    end
+    return SourcesList { entries: out }
+end
+
+;; Przenosi wpis z `idx` na pozycje 0.
+pub fn set_default_by_index(l: SourcesList, idx: int) -> SourcesList is
+    if idx < 0 || idx >= l.entries.len() is return l end
+    let mut out: [SourceEntry] = [l.entries[idx]]
+    let mut i: int = 0
+    while i < l.entries.len() is
+        if i != idx is out.push(l.entries[i]) end
+        i += 1
+    end
+    return SourcesList { entries: out }
+end
+
+pub fn set_default_by_uri(l: SourcesList, uri: string) -> SourcesList is
+    let mut i: int = 0
+    while i < l.entries.len() is
+        if contains(l.entries[i].uri, uri) is return set_default_by_index(l, i) end
+        i += 1
+    end
+    return l
+end
+
+;; ── Zapis (.hk — patrz BLAD A) ───────────────────────────────────────────
+
+fn quote_list(items: [string]) -> string is
+    let mut q: [string] = []
+    let mut i: int = 0
+    while i < items.len() is
+        q.push("\"" + items[i] + "\"")
+        i += 1
+    end
+    return "[" + str::join(q, ", ") + "]"
+end
+
+;; Nazwa sekcji: [A-Za-z0-9_-] (kropki i reszta -> '-'), unikalna w pliku.
+fn section_name(e: SourceEntry, idx: int, used: [string]) -> string is
+    let base: string = if e.name != nil then opt(e.name) else "repo-" + to_string(idx + 1)
+    let mut clean: string = ""
+    let n: int = string_len(base)
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(base, i)
+        let ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "_" || c == "-"
+        clean = clean + (if ok then c else "-")
+        i += 1
+    end
+    if clean == "" is clean = "repo-" + to_string(idx + 1) end
+    let mut name: string = clean
+    let mut k: int = 2
+    while list_has(used, name) is
+        name = clean + "-" + to_string(k)
+        k += 1
+    end
+    return name
+end
+
+fn list_has(list: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < list.len() is
+        if list[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn to_hk(l: SourcesList) -> string is
+    let mut out: string = "! Hammer sources list — format: .hk\n! Edit then run: hammer sync\n"
+    let mut used: [string] = []
+    let mut i: int = 0
+    while i < l.entries.len() is
+        let e: SourceEntry = l.entries[i]
+        let sec: string = section_name(e, i, used)
+        used.push(sec)
+        out = out + "\n[" + sec + "]\n"
+        out = out + "-> name       => " + (if e.name != nil then opt(e.name) else sec) + "\n"
+        if is_deb_src(e.kind) is out = out + "-> type       => deb-src\n" end
+        out = out + "-> baseurl    => " + e.uri + "\n"
+        out = out + "-> suite      => " + e.suite + "\n"
+        out = out + "-> components => " + quote_list(e.components) + "\n"
+        if e.arches.len() > 0 is out = out + "-> arch       => " + quote_list(e.arches) + "\n" end
+        if e.signed_by != nil is out = out + "-> gpgkey     => " + opt(e.signed_by) + "\n" end
+        out = out + "-> enabled    => " + (if e.enabled then "true" else "false") + "\n"
+        i += 1
+    end
+    return out
+end
+
+pub fn save_to(l: SourcesList, file: string) -> string is
+    let dir: string = compat::path_parent(file)
+    if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+    fs::write(file, to_hk(l))
+    return ""
+end
+
+pub fn save(l: SourcesList) -> string is
+    return save_to(l, sources_hk())
+end
+
+;; ── Wczytywanie ──────────────────────────────────────────────────────────
+
+fn load_failed(err: string) -> RepoLoad is
+    return RepoLoad { list: list_empty(), err: err }
+end
+
+;; Sekcja `[name]` -> wpis; nil gdy brak `baseurl`/`suite` (ostrzezenie na stderr).
+fn entry_from_section(cfg: hkp::HkConfig, sec: string) -> SourceEntry? is
+    let enabled: bool = if cfg.has(sec + ".enabled") then cfg.get_bool(sec + ".enabled") else true
+
+    let mut kind: EntryKind = EntryKind::Deb
+    if cfg.has(sec + ".type") && cfg.get(sec + ".type") == "deb-src" is kind = EntryKind::DebSrc end
+
+    if !cfg.has(sec + ".baseurl") is
+        ui::eprint_line("  " + ui::yellow("warn:") + " Section [" + sec + "] missing 'baseurl', skipped.")
+        return nil
+    end
+    let uri: string = cfg.get(sec + ".baseurl")
+
+    if !cfg.has(sec + ".suite") is
+        ui::eprint_line("  " + ui::yellow("warn:") + " Section [" + sec + "] missing 'suite', skipped.")
+        return nil
+    end
+    let suite: string = cfg.get(sec + ".suite")
+
+    let mut components: [string] = ["main"]
+    if cfg.array_len(sec + ".components") >= 0 is components = cfg.array(sec + ".components") end
+
+    let mut arches: [string] = []
+    if cfg.array_len(sec + ".arch") >= 0 is arches = cfg.array(sec + ".arch") end
+
+    let mut signed_by: string? = nil
+    if cfg.has(sec + ".gpgkey") is signed_by = cfg.get(sec + ".gpgkey") end
+    let mut name: string = sec
+    if cfg.has(sec + ".name") is name = cfg.get(sec + ".name") end
+
+    return SourceEntry { kind: kind, uri: uri, suite: suite, components: components, arches: arches,
+        signed_by: signed_by, enabled: enabled, name: name }
+end
+
+fn load_hk(file: string) -> RepoLoad is
+    let cfg: hkp::HkConfig = hkp::parse_file(file)
+    if !cfg.is_valid() is return load_failed("Parsing " + file + ": " + hkp::last_error()) end
+    if !cfg.resolve() is
+        let e: string = hkp::last_error()
+        cfg.free()
+        return load_failed("Resolving interpolations in " + file + ": " + e)
+    end
+
+    let mut entries: [SourceEntry] = []
+    let sections: [string] = cfg.keys("")
+    let mut i: int = 0
+    while i < sections.len() is
+        let sec: string = sections[i]
+        i += 1
+        if !sec.starts_with("_") && sec != "meta" && cfg.type_of(sec) == "map" is
+            let e: SourceEntry? = entry_from_section(cfg, sec)
+            if e != nil is
+                let ent: SourceEntry = e
+                entries.push(ent)
+            end
+        end
+    end
+    cfg.free()
+    return RepoLoad { list: SourcesList { entries: entries }, err: "" }
+end
+
+;; ── legacy repos.toml (podzbior) ─────────────────────────────────────────
+
+;; `"a"` -> a ; reszta bez zmian.
+fn toml_unquote(v: string) -> string is
+    let t: string = str::trim(v)
+    if string_len(t) >= 2 && t.starts_with("\"") && t.ends_with("\"") is
+        return str::slice(t, 1, string_len(t) - 1)
+    end
+    return t
+end
+
+fn toml_array(v: string) -> [string] is
+    let t: string = str::trim(v)
+    let mut out: [string] = []
+    if !t.starts_with("[") || !t.ends_with("]") is return out end
+    let inner: string = str::slice(t, 1, string_len(t) - 1)
+    let parts: [string] = str::split(inner, ",")
+    let mut i: int = 0
+    while i < parts.len() is
+        let item: string = toml_unquote(parts[i])
+        if item != "" is out.push(item) end
+        i += 1
+    end
+    return out
+end
+
+struct TomlRepo is
+    pub name:       string?
+    pub baseurl:    string?
+    pub suite:      string?
+    pub components: [string]?
+    pub arch:       [string]
+    pub enabled:    bool
+    pub gpgkey:     string?
+end
+
+fn toml_repo_new() -> TomlRepo is
+    let none: [string] = []
+    return TomlRepo { name: nil, baseurl: nil, suite: nil, components: nil, arch: none, enabled: true, gpgkey: nil }
+end
+
+fn toml_repo_to_entry(r: TomlRepo) -> SourceEntry? is
+    if r.name == nil || r.baseurl == nil || r.suite == nil || r.components == nil is return nil end
+    let comps: [string] = r.components
+    return SourceEntry { kind: EntryKind::Deb, uri: opt(r.baseurl), suite: opt(r.suite), components: comps,
+        arches: r.arch, signed_by: r.gpgkey, enabled: true, name: r.name }
+end
+
+fn load_legacy_toml(file: string) -> RepoLoad is
+    let lines: [string] = lines_of(fs::read(file))
+    let mut repos: [TomlRepo] = []
+    let mut cur: TomlRepo = toml_repo_new()
+    let mut have: bool = false
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = str::trim(lines[i])
+        i += 1
+        if line == "" || line.starts_with("#") is
+            ;; pomijamy
+        elsif line == "[[repo]]" is
+            if have is repos.push(cur) end
+            cur = toml_repo_new()
+            have = true
+        elsif have is
+            let eq: int = compat::str_index_of(line, "=")
+            if eq > 0 is
+                let k: string = str::trim(str::slice(line, 0, eq))
+                let v: string = str::trim(str::slice(line, eq + 1, string_len(line)))
+                if k == "name" is cur.name = toml_unquote(v) end
+                if k == "baseurl" is cur.baseurl = toml_unquote(v) end
+                if k == "suite" is cur.suite = toml_unquote(v) end
+                if k == "components" is cur.components = toml_array(v) end
+                if k == "arch" is cur.arch = toml_array(v) end
+                if k == "enabled" is cur.enabled = (v == "true") end
+                if k == "gpgkey" is cur.gpgkey = toml_unquote(v) end
+            end
+        end
+    end
+    if have is repos.push(cur) end
+
+    let mut entries: [SourceEntry] = []
+    let mut k: int = 0
+    while k < repos.len() is
+        let e: SourceEntry? = toml_repo_to_entry(repos[k])
+        if e == nil is return load_failed("Parsing " + file) end
+        let ent: SourceEntry = e
+        if repos[k].enabled is entries.push(ent) end
+        k += 1
+    end
+    return RepoLoad { list: SourcesList { entries: entries }, err: "" }
+end
+
+;; ── apt sources.list (fallback) ──────────────────────────────────────────
+
+struct AptOpts is
+    pub arches:    [string]
+    pub signed_by: string?
+end
+
+fn parse_apt_options(opts: string?) -> AptOpts is
+    let mut arches: [string] = []
+    let mut signed_by: string? = nil
+    if opts != nil is
+        let o: string = opts
+        let toks: [string] = split_ws(o)
+        let mut i: int = 0
+        while i < toks.len() is
+            let tok: string = toks[i]
+            i += 1
+            if tok.starts_with("arch=") is
+                arches = str::split(str::slice(tok, 5, string_len(tok)), ",")
+            end
+            if tok.starts_with("signed-by=") is
+                signed_by = str::slice(tok, 10, string_len(tok))
+            end
+        end
+    end
+    return AptOpts { arches: arches, signed_by: signed_by }
+end
+
+fn trim_start(s: string) -> string is
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n && (string_at(s, i) == " " || string_at(s, i) == "\t") is
+        i += 1
+    end
+    return str::slice(s, i, n)
+end
+
+pub fn parse_apt_deb822_line(line: string) -> SourceEntry? is
+    let mut kind: EntryKind = EntryKind::Deb
+    let mut rest: string = ""
+    if line.starts_with("deb-src") is
+        kind = EntryKind::DebSrc
+        rest = trim_start(str::slice(line, 7, string_len(line)))
+    elsif line.starts_with("deb") is
+        rest = trim_start(str::slice(line, 3, string_len(line)))
+    else is
+        return nil
+    end
+
+    let mut options: string? = nil
+    if rest.starts_with("[") is
+        let end_pos: int = compat::str_index_of(rest, "]")
+        if end_pos < 0 is return nil end
+        options = str::slice(rest, 1, end_pos)
+        rest = trim_start(str::slice(rest, end_pos + 1, string_len(rest)))
+    end
+
+    let tokens: [string] = split_ws(rest)
+    if tokens.len() < 2 is return nil end
+    let mut components: [string] = []
+    let mut i: int = 2
+    while i < tokens.len() is
+        components.push(tokens[i])
+        i += 1
+    end
+    let ao: AptOpts = parse_apt_options(options)
+    return SourceEntry { kind: kind, uri: tokens[0], suite: tokens[1], components: components,
+        arches: ao.arches, signed_by: ao.signed_by, enabled: true, name: nil }
+end
+
+pub fn parse_apt_sources_list(content: string) -> [SourceEntry] is
+    let mut out: [SourceEntry] = []
+    let lines: [string] = lines_of(content)
+    let mut i: int = 0
+    while i < lines.len() is
+        let l: string = str::trim(lines[i])
+        i += 1
+        if l != "" && !l.starts_with("#") is
+            let e: SourceEntry? = parse_apt_deb822_line(l)
+            if e != nil is
+                let ent: SourceEntry = e
+                out.push(ent)
+            end
+        end
+    end
+    return out
+end
+
+pub fn load() -> RepoLoad is
+    let hk_path: string = sources_hk()
+    if fs::exists(hk_path) is return load_hk(hk_path) end
+
+    ;; legacy TOML
+    let toml_path: string = "/etc/hammer/repos.toml"
+    if fs::exists(toml_path) is
+        ui::eprint_line("  " + ui::yellow("warn:") + " Using legacy repos.toml — migrate to /etc/hammer/sources-list.hk")
+        return load_legacy_toml(toml_path)
+    end
+
+    ;; ostatnia deska ratunku: /etc/apt/sources.list
+    let mut entries: [SourceEntry] = []
+    let main_path: string = "/etc/apt/sources.list"
+    if fs::exists(main_path) is
+        entries = parse_apt_sources_list(fs::read(main_path))
+    end
+    return RepoLoad { list: SourcesList { entries: entries }, err: "" }
+end
+
+;; ── Adresy indeksow ──────────────────────────────────────────────────────
+
+pub fn index_urls(l: SourcesList, arch: string) -> [IndexUrl] is
+    let mut out: [IndexUrl] = []
+    let mut i: int = 0
+    while i < l.entries.len() is
+        let e: SourceEntry = l.entries[i]
+        i += 1
+        if e.enabled && !is_deb_src(e.kind) is
+            let arch_list: [string] = if e.arches.len() == 0 then [arch] else e.arches
+            let mut a: int = 0
+            while a < arch_list.len() is
+                let ar: string = arch_list[a]
+                a += 1
+                let mut c: int = 0
+                while c < e.components.len() is
+                    let comp: string = e.components[c]
+                    c += 1
+                    let base: string = trim_end_char(e.uri, "/")
+                    out.push(IndexUrl {
+                        url:           base + "/dists/" + e.suite + "/" + comp + "/binary-" + ar + "/Packages",
+                        inrelease_url: base + "/dists/" + e.suite + "/InRelease",
+                        base_uri:      e.uri,
+                        suite:         e.suite,
+                        component:     comp,
+                        arch:          ar,
+                        signed_by:     e.signed_by,
+                        name:          if e.name != nil then opt(e.name) else e.suite
+                    })
+                end
+            end
+        end
+    end
+    return out
+end
+
+;; ── Domyslny plik .hk ────────────────────────────────────────────────────
+
+pub fn write_default(arch: string, suite: string) -> string is
+    fs::mkdir("/etc/hammer")
+    if !fs::is_dir("/etc/hammer") is return "Cannot create /etc/hammer" end
+
+    let mut security_suite: string = suite + "-security"
+    if suite == "forky" || suite == "sid" || suite == "unstable" || suite == "experimental" is
+        security_suite = ""
+    end
+
+    let mut security_block: string = ""
+    if security_suite != "" is
+        security_block = "\n[debian-" + suite + "-security]\n" +
+            "-> name       => debian-" + suite + "-security\n" +
+            "-> baseurl    => http://security.debian.org/debian-security\n" +
+            "-> suite      => " + security_suite + "\n" +
+            "-> components => [\"main\", \"contrib\", \"non-free\"]\n" +
+            "-> arch       => [\"" + arch + "\"]\n" +
+            "-> enabled    => true\n"
+    end
+
+    let mut backports_block: string = ""
+    if suite == "bookworm" || suite == "trixie" || suite == "stable" || suite == "testing" is
+        backports_block = "\n[debian-" + suite + "-backports]\n" +
+            "-> name       => debian-" + suite + "-backports\n" +
+            "-> baseurl    => http://deb.debian.org/debian\n" +
+            "-> suite      => " + suite + "-backports\n" +
+            "-> components => [\"main\", \"contrib\", \"non-free\"]\n" +
+            "-> arch       => [\"" + arch + "\"]\n" +
+            "-> enabled    => false\n"
+    end
+
+    let content: string = "! Hammer sources list — format: .hk\n" +
+        "! Edit then run: hammer sync\n\n" +
+        "[debian-" + suite + "]\n" +
+        "-> name       => debian-" + suite + "\n" +
+        "-> baseurl    => http://deb.debian.org/debian\n" +
+        "-> suite      => " + suite + "\n" +
+        "-> components => [\"main\", \"contrib\", \"non-free\", \"non-free-firmware\"]\n" +
+        "-> arch       => [\"" + arch + "\"]\n" +
+        "-> enabled    => true\n\n" +
+        "[debian-" + suite + "-updates]\n" +
+        "-> name       => debian-" + suite + "-updates\n" +
+        "-> baseurl    => http://deb.debian.org/debian\n" +
+        "-> suite      => " + suite + "-updates\n" +
+        "-> components => [\"main\", \"contrib\", \"non-free\"]\n" +
+        "-> arch       => [\"" + arch + "\"]\n" +
+        "-> enabled    => true\n" +
+        security_block + backports_block
+
+    fs::write(sources_hk(), content)
+    log::info("repo: wrote " + sources_hk())
+    return ""
+end
+
+;; ── hammer repo ──────────────────────────────────────────────────────────
+
+;; `hammer repo <sub> [args…]`; "" = Ok, inaczej tresc bledu.
+pub fn cmd_repo(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "list"
+    let rest: [string] = tail_args(args)
+    if sub == "list" || sub == "ls" is return repo_list() end
+    if sub == "add" is return repo_add(rest) end
+    if sub == "remove" || sub == "rm" || sub == "delete" is return repo_remove(rest) end
+    if sub == "enable" is return repo_enable(rest, true) end
+    if sub == "disable" is return repo_enable(rest, false) end
+    if sub == "info" is return repo_info(rest) end
+    if sub == "set-default" is return repo_set_default(rest) end
+    return "Unknown repo subcommand '" + sub + "'\n  " +
+        "Usage: hammer repo [list|add <url>|remove <id>|enable <id>|disable <id>|info <id>]"
+end
+
+fn tail_args(args: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 1
+    while i < args.len() is
+        out.push(args[i])
+        i += 1
+    end
+    return out
+end
+
+fn repo_list() -> string is
+    let lr: RepoLoad = load()
+    if lr.err != "" is return lr.err end
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Configured repositories  (" + ui::dim(sources_hk()) + ")")
+    write("  " + ui::rule(70))
+    write("  " + ui::bold(ui::pad("#", 4)) + " " + ui::bold(ui::pad("URI", 36)) + " " +
+          ui::bold(ui::pad("Suite", 14)) + " " + ui::bold("Components"))
+    write("  " + ui::rule(70))
+
+    let entries: [SourceEntry] = lr.list.entries
+    if entries.len() == 0 is
+        write("  " + ui::dim("·") + " No repositories configured.")
+        write("  Hint: " + ui::cyan("hammer repo add <uri> <suite> <components>"))
+        return ""
+    end
+
+    let mut i: int = 0
+    while i < entries.len() is
+        let e: SourceEntry = entries[i]
+        let status: string = if e.enabled then ui::bright_green("✔") else ui::red("✘")
+        let uri_short: string = if string_len(e.uri) > 34 then str::slice(e.uri, 0, 33) + "…" else e.uri
+        write("  " + status + " " + ui::dim(ui::pad(to_string(i + 1), 2)) + " " + ui::cyan(ui::pad(uri_short, 36)) + " " +
+              ui::bold(ui::pad(e.suite, 14)) + " " + ui::dim(str::join(e.components, " ")))
+        i += 1
+    end
+    write("")
+    write("  " + to_string(entries.len()) + " entries. Toggle with " + ui::cyan("hammer repo enable/disable <#>") + ".")
+    return ""
+end
+
+fn repo_add(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer repo add <uri> <suite> [main contrib non-free …]" end
+
+    let mut uri: string = ""
+    let mut suite: string = ""
+    let mut components: [string] = []
+    if args[0].starts_with("deb ") || args[0].starts_with("deb-src ") is
+        let parts: [string] = splitn_space(args[0], 4)
+        if parts.len() < 3 is return "Invalid apt-style source: '" + args[0] + "'" end
+        if parts.len() >= 4 is
+            components = split_ws(parts[3])
+        else is
+            components = ["main"]
+        end
+        uri = parts[1]
+        suite = parts[2]
+    elsif args.len() >= 2 is
+        uri = args[0]
+        suite = args[1]
+        if args.len() >= 3 is
+            let mut i: int = 2
+            while i < args.len() is
+                components.push(args[i])
+                i += 1
+            end
+        else is
+            components = ["main"]
+        end
+    else is
+        return "Usage: hammer repo add <uri> <suite> [main contrib non-free …]"
+    end
+
+    let lr: RepoLoad = load()
+    if lr.err != "" is return lr.err end
+    let mut i: int = 0
+    while i < lr.list.entries.len() is
+        if lr.list.entries[i].uri == uri && lr.list.entries[i].suite == suite is
+            write("  " + ui::yellow("·") + " Repository already configured: " + uri + " " + suite)
+            return ""
+        end
+        i += 1
+    end
+
+    let none_arch: [string] = []
+    let updated: SourcesList = add_entry(lr.list, SourceEntry {
+        kind: EntryKind::Deb, uri: uri, suite: suite, components: components, arches: none_arch,
+        signed_by: nil, enabled: true, name: nil })
+    let err: string = save(updated)
+    if err != "" is return err end
+
+    write("  " + ui::bright_green_bold("✔") + " Added: " + ui::cyan(uri) + " " + ui::bold(suite) + " " +
+          ui::dim(str::join(components, " ")))
+    write("  Run " + ui::cyan("hammer sync") + " to update the package index.")
+    return ""
+end
+
+fn repo_remove(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer repo remove <# or uri>" end
+    let id: string = args[0]
+    let lr: RepoLoad = load()
+    if lr.err != "" is return lr.err end
+    let before: int = lr.list.entries.len()
+
+    ;; najpierw indeks (od 1), potem podciag URI
+    let idx: int = parse_usize(id)
+    let after_list: SourcesList = if idx >= 0 then remove_entry_by_index(lr.list, sat_sub1(idx)) else remove_entry_by_uri(lr.list, id)
+
+    if after_list.entries.len() == before is return "No repository matched '" + id + "'" end
+    let err: string = save(after_list)
+    if err != "" is return err end
+    write("  " + ui::bright_green("✔") + " Removed repository " + ui::cyan(id) + ".")
+    return ""
+end
+
+fn repo_enable(args: [string], enable: bool) -> string is
+    if args.len() == 0 is
+        return "Usage: hammer repo " + (if enable then "enable" else "disable") + "/disable <# or uri>"
+    end
+    let id: string = args[0]
+    let lr: RepoLoad = load()
+    if lr.err != "" is return lr.err end
+    let verb: string = if enable then "Enabled" else "Disabled"
+
+    let idx: int = parse_usize(id)
+    let updated: SourcesList = if idx >= 0 then set_enabled_by_index(lr.list, sat_sub1(idx), enable) else set_enabled_by_uri(lr.list, id, enable)
+    let err: string = save(updated)
+    if err != "" is return err end
+    write("  " + ui::bright_green("✔") + " " + verb + " repository " + ui::cyan(id) + ".")
+    return ""
+end
+
+fn find_entry(l: SourcesList, id: string) -> SourceEntry? is
+    let idx: int = parse_usize(id)
+    if idx >= 0 is
+        let i: int = sat_sub1(idx)
+        if i < l.entries.len() is return l.entries[i] end
+        return nil
+    end
+    let mut k: int = 0
+    while k < l.entries.len() is
+        if contains(l.entries[k].uri, id) is return l.entries[k] end
+        k += 1
+    end
+    return nil
+end
+
+fn repo_info(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer repo info <# or uri>" end
+    let id: string = args[0]
+    let lr: RepoLoad = load()
+    if lr.err != "" is return lr.err end
+    let found: SourceEntry? = find_entry(lr.list, id)
+    if found == nil is return "No repository matched '" + id + "'" end
+    let e: SourceEntry = found
+    write("")
+    write("  " + ui::bold(ui::pad("URI:", 20)) + " " + ui::cyan(e.uri))
+    write("  " + ui::bold(ui::pad("Suite:", 20)) + " " + e.suite)
+    write("  " + ui::bold(ui::pad("Components:", 20)) + " " + str::join(e.components, " "))
+    write("  " + ui::bold(ui::pad("Enabled:", 20)) + " " + (if e.enabled then ui::bright_green("yes") else ui::red("no")))
+    return ""
+end
+
+fn repo_set_default(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer repo set-default <# or uri>" end
+    let id: string = args[0]
+    let lr: RepoLoad = load()
+    if lr.err != "" is return lr.err end
+    let idx: int = parse_usize(id)
+    let updated: SourcesList = if idx >= 0 then set_default_by_index(lr.list, sat_sub1(idx)) else set_default_by_uri(lr.list, id)
+    let err: string = save(updated)
+    if err != "" is return err end
+    write("  " + ui::bright_green("✔") + " Default repository set to " + ui::cyan(id) + ".")
+    return ""
+end
