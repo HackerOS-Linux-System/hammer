@@ -1,0 +1,589 @@
+use "std -> strings" from "str"
+use "std -> fmt"     from "fmt"
+use "std -> io"      from "io"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+use "bit -> colors"
+
+mod internal
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+;; [mod db pominiete: source-code/pkg/db.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania db::fn dzialaja bez zmian]
+;; [mod profile pominiete: source-code/system/profile.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania profile::fn dzialaja bez zmian]
+;; [mod diff pominiete: source-code/internal/diff.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez internal/mod.h# — wywolania diff::fn dzialaja bez zmian]
+;; [mod solver pominiete: source-code/pkg/solver/mod.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania solver::fn dzialaja bez zmian]
+
+;; hammer -> ui::ui
+;;
+;; Port of source-code/ui/ui.rs (Rust) to H#: naglowek, bledy, potwierdzenie,
+;; rozmiary, wyszukiwanie, info o pakiecie, historia, wpis listy.
+;; To tez centralny zestaw KOLOROW ANSI (`bold`, `dim`, `cyan`, ...), ktory
+;; zastepuje lokalne helpery w `pkg/*.h#` (przy okazji kolejnej
+;; przerobki tych plikow: `ui::cyan(..)` zamiast lokalnego `cyan(..)`).
+;;
+;; ── NIE przepisane (czekaja na moduly, ktorych typy biora w argumentach) ─
+;;   (wszystko przepisane: `print_transaction_table/summary` i `print_diff` sa
+;;   na koncu pliku, po przepisaniu `pkg/solver/` i `diff`.)
+;; (print_activation_result / print_generations / print_status — juz sa,
+;;  po przepisaniu `system/profile`.)
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `owo_colors` -> kody ANSI; jak w Rust (owo-colors przekazuje
+;;    specyfikator szerokosci do wartosci), kolumny dopelniamy WIDOCZNYM
+;;    tekstem, a dopiero potem kolorujemy: `cyan(pad_right(x, 16))`.
+;;    `fmt::pad_right` liczy `len()` (bajty) — dla nazw ASCII to samo co
+;;    znaki; dla UTF-8 (np. opis) kolumny moga sie przesunac.
+;; 2. `env!("CARGO_PKG_VERSION")` -> `log::hammer_version()`.
+;; 3. `Result<bool>` (confirm) -> `bool`; blad czytania stdin == odpowiedz
+;;    pusta (czyli "tak", jak Enter w oryginale).
+;; 4. `eprintln!` -> `eprint_line` przez `printf ... >&2` (std nie ma
+;;    stderr). `io::read_line` jest LLVM-owe, ale `read_char` nie — uzywam
+;;    tylko `read_line`.
+;; 5. Znacznik czasu w historii: baza trzyma RFC3339 ("YYYY-MM-DDTHH:MM:SSZ"),
+;;    `format("%Y-%m-%d %H:%M")` -> wyciecie znakow 0..10 i 11..16.
+;; 6. `take(n)` po znakach -> `take_chars` po bajtach (opisy sa glownie ASCII).
+
+;; ── Kolory ───────────────────────────────────────────────────────────────
+
+;; Wszystkie kolory przechodza przez biblioteke `colors` (bit): automatyczne
+;; wykrywanie terminala (NO_COLOR, CLICOLOR, FORCE_COLOR, TERM=dumb,
+;; COLORTERM), zubazanie truecolor -> 256 -> 16 i poprawne zagniezdzanie.
+;; Nazwy funkcji zostaly bez zmian, wiec reszta portu (`ui::cyan(..)` itd.)
+;; dziala jak dotad.
+
+;; Surowy kod SGR — TYLKO dla kodow, ktorych `colors` nie wystawia; uwzglednia
+;; wykrycie terminala (przy NO_COLOR zwraca tekst bez zmian).
+pub fn c(code: string, s: string) -> string is
+    if !colors::support::enabled() is return s end
+    return "\x1b[" + code + "m" + s + "\x1b[0m"
+end
+
+pub fn bold(s: string) -> string is return colors::bold(s) end
+pub fn dim(s: string) -> string is return colors::dim(s) end
+pub fn italic(s: string) -> string is return colors::italic(s) end
+pub fn underline(s: string) -> string is return colors::underline(s) end
+pub fn red(s: string) -> string is return colors::red(s) end
+pub fn green(s: string) -> string is return colors::green(s) end
+pub fn yellow(s: string) -> string is return colors::yellow(s) end
+pub fn blue(s: string) -> string is return colors::blue(s) end
+pub fn magenta(s: string) -> string is return colors::magenta(s) end
+pub fn cyan(s: string) -> string is return colors::cyan(s) end
+pub fn bright_red(s: string) -> string is return colors::bright_red(s) end
+pub fn bright_green(s: string) -> string is return colors::bright_green(s) end
+pub fn bright_yellow(s: string) -> string is return colors::bright_yellow(s) end
+pub fn bright_cyan(s: string) -> string is return colors::bright_cyan(s) end
+pub fn bright_white(s: string) -> string is return colors::bright_white(s) end
+pub fn red_bold(s: string) -> string is return colors::bold(colors::red(s)) end
+pub fn green_bold(s: string) -> string is return colors::bold(colors::green(s)) end
+pub fn yellow_bold(s: string) -> string is return colors::bold(colors::yellow(s)) end
+pub fn cyan_bold(s: string) -> string is return colors::bold(colors::cyan(s)) end
+pub fn bright_green_bold(s: string) -> string is return colors::bold(colors::bright_green(s)) end
+pub fn bright_yellow_bold(s: string) -> string is return colors::bold(colors::bright_yellow(s)) end
+pub fn bright_cyan_bold(s: string) -> string is return colors::bold(colors::bright_cyan(s)) end
+pub fn bright_red_bold(s: string) -> string is return colors::bold(colors::bright_red(s)) end
+
+;; ── Motyw hammera ────────────────────────────────────────────────────────
+;; Kolor marki (kowadlo/mlot): ciepla pomaranczowo-bursztynowa gama; w
+;; terminalu 16-kolorowym `colors` zubaza ja do najblizszego odpowiednika.
+
+pub fn accent(s: string) -> string is return colors::fg::orange(s) end
+pub fn accent_bold(s: string) -> string is return colors::bold(colors::fg::orange(s)) end
+pub fn muted(s: string) -> string is return colors::theme::muted(s) end
+pub fn key(s: string) -> string is return colors::theme::key(s) end
+pub fn code(s: string) -> string is return colors::theme::code(s) end
+pub fn link(s: string) -> string is return colors::theme::link(s) end
+pub fn title(s: string) -> string is return colors::theme::title(s) end
+
+;; Komunikaty z ikona: `✔ ...`, `✖ ...`, `⚠ ...`, `ℹ ...`, `➜ ...`.
+pub fn msg_ok(s: string) -> string is return colors::theme::success(s) end
+pub fn msg_err(s: string) -> string is return colors::theme::error(s) end
+pub fn msg_warn(s: string) -> string is return colors::theme::warning(s) end
+pub fn msg_info(s: string) -> string is return colors::theme::info(s) end
+pub fn msg_hint(s: string) -> string is return colors::theme::hint(s) end
+
+pub fn badge_ok() -> string is return colors::theme::ok_badge() end
+pub fn badge_fail() -> string is return colors::theme::fail_badge() end
+pub fn badge_warn() -> string is return colors::theme::warn_badge() end
+pub fn badge_info() -> string is return colors::theme::info_badge() end
+pub fn badge(label: string, color: string) -> string is return colors::theme::badge(label, color) end
+
+;; `[2/5] tekst`
+pub fn step(n: int, total: int, msg: string) -> string is
+    return colors::theme::step(n, total, msg)
+end
+
+;; Dopelnienie WIDOCZNYM tekstem (kolory sie nie licza, UTF-8 liczony w
+;; znakach) — zastepuje `fmt::pad_right` (bajty) w tabelach.
+pub fn pad_vis(s: string, width: int) -> string is
+    return colors::util::pad_right(s, width)
+end
+
+pub fn pad_vis_left(s: string, width: int) -> string is
+    return colors::util::pad_left(s, width)
+end
+
+pub fn vis_len(s: string) -> int is
+    return colors::util::visible_len(s)
+end
+
+pub fn strip_colors(s: string) -> string is
+    return colors::strip(s)
+end
+
+;; Naglowek sekcji: `  ⬡ Tytul` + linia.
+pub fn section(text: string) -> string is
+    return "  " + accent_bold("⬡") + " " + bold(text)
+end
+
+;; Wiersz `klucz  wartosc` (klucz dopelniony do `width`).
+pub fn kv(k: string, v: string, width: int) -> string is
+    return "  " + dim(pad_vis(k, width)) + " " + v
+end
+
+;; Gradientowy znak firmowy.
+pub fn brand() -> string is
+    return colors::gradient::text("⬡ hammer", "#ffb347", "#ff4e50")
+end
+
+pub fn rule(width: int) -> string is
+    return dim(str::repeat("─", width))
+end
+
+pub fn pad(s: string, width: int) -> string is
+    return fmt::pad_right(s, width)
+end
+
+;; stderr (std nie ma eprintln).
+;; Diagnostyka: `HAMMER_TRACE=1 hammer <cmd>` wypisuje na stderr kolejne etapy (znacznik `[trace]`),
+;; zeby bylo widac, gdzie program staje. Bez zmiennej nic nie robi (i nic nie kosztuje poza `sh`).
+pub fn trace(stage: string) is
+    proc::shell("[ \"$HAMMER_TRACE\" = 1 ] && printf '[trace] %s\\n' '" + str::replace_all(stage, "'", "'\\''") + "' >&2; true")
+end
+
+pub fn eprint_line(line: string) is
+    proc::shell("printf '%s\n' '" + str::replace_all(line, "'", "'\\''") + "' >&2")
+end
+
+;; stderr bez nowej linii (kody ANSI/kursor) — `printf '%s'`, bez interpretacji `\\`.
+pub fn eprint_raw(s: string) is
+    proc::shell("printf '%s' '" + str::replace_all(s, "'", "'\\''") + "' >&2")
+end
+
+fn take_chars(s: string, n: int) -> string is
+    if string_len(s) <= n is return s end
+    return str::slice(s, 0, n)
+end
+
+;; ── Naglowek / bledy / pomocnicze ────────────────────────────────────────
+
+pub fn print_header() is
+    write("")
+    write("  " + brand() + " " + dim("v" + log::hammer_version()))
+    write("  " + rule(60))
+end
+
+pub fn fatal(msg: string) is
+    eprint_line("")
+    eprint_line("  " + red_bold("✗ error:") + " " + msg)
+    eprint_line("")
+end
+
+pub fn nothing_to_do() is
+    write("  " + dim("·") + " Nothing to do.")
+end
+
+pub fn deps_resolved() is
+    write("  " + bright_green("✔") + " Dependencies resolved.")
+end
+
+;; Puste/Enter, "y", "yes" => true.
+pub fn confirm(prompt: string) -> bool is
+    let line: string = io::read_line("\n  " + bold(prompt) + " [Y/n] ")
+    let t: string = str::to_lower(str::trim(line))
+    return t == "" || t == "y" || t == "yes"
+end
+
+;; 0 -> "" (jak w Rust). Arytmetyka calkowita, wyniki zgodne z `{:.1}`/`{:.0}`
+;; na zaokragleniu polowek w gore (sprawdzone na 7 wartosciach).
+pub fn human_size(nbytes: int) -> string is
+    if nbytes >= 1073741824 is return tenths(nbytes, 1073741824) + " GiB" end
+    if nbytes >= 1048576 is return tenths(nbytes, 1048576) + " MiB" end
+    if nbytes >= 1024 is return to_string((nbytes + 512) / 1024) + " KiB" end
+    if nbytes > 0 is return to_string(nbytes) + " B" end
+    return ""
+end
+
+fn tenths(nbytes: int, div: int) -> string is
+    let t: int = (nbytes * 10 + div / 2) / div
+    return to_string(t / 10) + "." + to_string(t % 10)
+end
+
+;; ── Pending ──────────────────────────────────────────────────────────────
+
+pub fn print_pending_notice(gen_num: int) is
+    write("")
+    write("  " + rule(60))
+    write("  " + bright_yellow_bold("⬡") + "  Changes staged as " + bright_yellow_bold("gen-" + to_string(gen_num)))
+    write("  " + dim("·") + "  Reboot to activate, or:")
+    write("    " + cyan("hammer diff") + "    show what changed")
+    write("    " + cyan("hammer pending cancel") + "   cancel pending changes")
+    write("    " + cyan("hammer pending apply-live") + "  apply without reboot")
+    write("")
+end
+
+;; ── Wyszukiwanie ─────────────────────────────────────────────────────────
+
+pub fn print_search_header(query: string, count: int) is
+    write("")
+    if count == 0 is
+        write("  " + dim("·") + " No packages found matching '" + bold(query) + "'.")
+        write("  Run " + cyan("hammer sync") + " to refresh the index.")
+    else is
+        let plural: string = if count == 1 then "" else "s"
+        write("  " + bright_green("✔") + " " + bold(to_string(count)) + " package" + plural +
+              " matching '" + bold(query) + "'")
+    end
+    write("  " + rule(70))
+end
+
+pub fn print_search_result(pkg: package::Package, installed: bool) is
+    let inst_mark: string = if installed then bright_green("✔") else dim("·")
+    let name_pad: string = pad(pkg.name, 36)
+    let name_col: string = if installed then c("1;92", name_pad) else bold(name_pad)
+    let mut desc: string = ""
+    if pkg.description_short != nil is
+        let d: string = pkg.description_short
+        desc = take_chars(d, 52)
+    end
+    write("  " + inst_mark + " " + name_col + " " + cyan(pad(pkg.version, 16)) + "  " + dim(desc))
+end
+
+;; ── Info o pakiecie ──────────────────────────────────────────────────────
+
+fn label(s: string) -> string is return bold(pad(s, 20)) end
+
+pub fn print_package_info(pkg: package::Package, installed: bool, installed_version: string?) is
+    write("")
+    write("  " + c("1;96", pkg.name) + " " + cyan(pkg.version))
+    write("  " + rule(60))
+
+    let mut status: string = dim("not installed")
+    if installed is
+        let up_to_date: bool = installed_version == nil || installed_version == pkg.version
+        if up_to_date is
+            status = bright_green("installed (up to date)")
+        else is
+            let iv: string = if installed_version == nil then "?" else installed_version
+            status = yellow("installed (" + iv + ") — upgrade available")
+        end
+    end
+
+    write("  " + label("Status:") + " " + status)
+    write("  " + label("Architecture:") + " " + dim(pkg.architecture))
+    if pkg.section != nil is
+        let s: string = pkg.section
+        write("  " + label("Section:") + " " + dim(s))
+    end
+    if pkg.maintainer != nil is
+        let m: string = pkg.maintainer
+        write("  " + label("Maintainer:") + " " + dim(m))
+    end
+    if pkg.installed_size_kb != nil is
+        let sz: int = pkg.installed_size_kb
+        write("  " + label("Installed size:") + " " + cyan(human_size(sz * 1024)))
+    end
+    if pkg.description_short != nil is
+        let d: string = pkg.description_short
+        write("")
+        write("  " + bold(d))
+    end
+    if pkg.description_long != nil is
+        let d: string = pkg.description_long
+        write("")
+        let lines: [string] = str::split(d, "\n")
+        let mut i: int = 0
+        while i < lines.len() && i < 8 is
+            write("  " + dim(str::trim(lines[i])))
+            i += 1
+        end
+    end
+    if pkg.depends != nil is
+        let deps: string = pkg.depends
+        write("")
+        write("  " + bold("Depends:"))
+        write("  " + dim(deps))
+    end
+    write("")
+end
+
+;; ── Historia ─────────────────────────────────────────────────────────────
+
+;; "2026-09-30T18:13:29Z" -> "2026-09-30 18:13"; inny format zostaje bez zmian.
+pub fn format_ts(ts: string) -> string is
+    if string_len(ts) >= 16 && string_at(ts, 10) == "T" is
+        return str::slice(ts, 0, 10) + " " + str::slice(ts, 11, 16)
+    end
+    return ts
+end
+
+pub fn print_history(entries: [db::HistoryEntry]) is
+    write("")
+    write("  " + bright_cyan_bold("⬡") + "  Transaction history")
+    write("  " + rule(70))
+    if entries.len() == 0 is
+        write("  " + dim("·") + " No transaction history.")
+        return
+    end
+    let mut i: int = 0
+    while i < entries.len() is
+        let e: db::HistoryEntry = entries[i]
+        i += 1
+        let ts: string = format_ts(e.timestamp)
+        let op: string = pad(e.action, 12)
+        let mut op_col: string = cyan(op)
+        if e.action == "install" is
+            op_col = bright_green(op)
+        elsif e.action == "remove" is
+            op_col = red(op)
+        elsif e.action == "upgrade" is
+            op_col = yellow(op)
+        end
+        write("  " + dim(ts) + "  " + op_col + " " + bold(pad(e.package, 36)) + " gen-" + cyan(to_string(e.generation)))
+    end
+end
+
+;; ── Wpis listy ───────────────────────────────────────────────────────────
+
+pub fn print_list_entry(name: string, version: string, arch: string, installed: bool, repo: string, new_ver: string?) is
+    let inst_mark: string = if installed then bright_green("✔") else dim("·")
+    let name_pad: string = pad(name, 36)
+    let name_col: string = if installed then c("1;92", name_pad) else name_pad
+    let mut upgrade: string = ""
+    if new_ver != nil is
+        let nv: string = new_ver
+        upgrade = " → " + bright_cyan(nv)
+    end
+    write("  " + inst_mark + " " + name_col + " " + cyan(pad(version, 20)) + " " + dim(pad(arch, 10)) + " " + dim(repo) + upgrade)
+end
+
+;; ── Aktywacja ────────────────────────────────────────────────────────────
+
+pub fn print_activation_result(r: profile::ActivationResult) is
+    write("")
+    write("  " + bright_cyan_bold("⬡") + "  Boot activation complete")
+    write("  " + rule(60))
+
+    if r.already_active is
+        write("  " + dim("·") + "  gen-" + to_string(r.gen_number) + " already active — relinking binaries")
+    else is
+        write("  " + bold(pad("Activated generation:", 28)) + " gen-" + bright_green_bold(to_string(r.gen_number)))
+    end
+
+    if r.packages_linked > 0 is
+        write("  " + bold(pad("Binaries linked to PATH:", 28)) + " " + bright_green(to_string(r.packages_linked)))
+    else is
+        write("  " + bold(pad("Binaries linked to PATH:", 28)) + " " +
+              yellow("0 — run `hammer relink` if commands are missing"))
+    end
+
+    if r.scripts_failed.len() > 0 is
+        write("")
+        write("  " + yellow_bold("!") + " " + to_string(r.scripts_failed.len()) + " postinst script(s) failed:")
+        let mut i: int = 0
+        while i < r.scripts_failed.len() is
+            write("    " + yellow("·") + " " + yellow(r.scripts_failed[i]))
+            i += 1
+        end
+        write("  Try: " + cyan("hammer fix-broken"))
+    end
+    write("")
+end
+
+;; ── Status ───────────────────────────────────────────────────────────────
+
+pub fn print_status(idb: db::InstalledDb) is
+    write("")
+    write("  " + bright_cyan_bold("⬡") + "  hammer status")
+    write("  " + rule(60))
+    write("  " + bold(pad("Installed packages:", 26)) + " " + cyan_bold(to_string(idb.count())))
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err == "" is
+        let gdb: profile::GenerationsDb = lr.db
+        write("  " + bold(pad("Current generation:", 26)) + " gen-" + bright_green(to_string(gdb.current)))
+        if gdb.pending != nil is
+            let n: int = gdb.pending
+            write("  " + bold(pad("Pending (on reboot):", 26)) + " gen-" + yellow(to_string(n)) + " " +
+                  dim("(run `hammer diff` to see changes)"))
+        end
+        write("  " + bold(pad("Total generations:", 26)) + " " + dim(to_string(gdb.generations.len())))
+    end
+end
+
+;; ── Generacje ────────────────────────────────────────────────────────────
+
+;; Sortowanie malejaco po numerze (wstawianie, stabilne).
+fn sort_gens_desc(items: [profile::Generation]) -> [profile::Generation] is
+    let mut a: [profile::Generation] = items
+    let mut i: int = 1
+    while i < a.len() is
+        let cur: profile::Generation = a[i]
+        let mut j: int = i - 1
+        while j >= 0 && a[j].number < cur.number is
+            a[j + 1] = a[j]
+            j -= 1
+        end
+        a[j + 1] = cur
+        i += 1
+    end
+    return a
+end
+
+pub fn print_generations(gdb: profile::GenerationsDb) is
+    write("")
+    write("  " + bright_cyan_bold("⬡") + "  Generations")
+    write("  " + rule(70))
+    write("  " + bold(pad("Gen", 8)) + " " + bold(pad("Date", 22)) + " " + bold(pad("Pkgs", 8)) + " " + bold("Note"))
+    write("  " + rule(70))
+    let gens: [profile::Generation] = sort_gens_desc(gdb.generations)
+    let mut i: int = 0
+    while i < gens.len() is
+        let g: profile::Generation = gens[i]
+        i += 1
+        let active: bool = g.number == gdb.current
+        let pending: bool = gdb.pending != nil && gdb.pending == g.number
+        let mut marker: string = ""
+        if active is
+            marker = bright_green(" ← active")
+        elsif pending is
+            marker = yellow(" ← pending")
+        end
+        let ts: string = format_ts(g.timestamp)
+        let mut note: string = ""
+        if g.note != nil is
+            let nt: string = g.note
+            note = take_chars(nt, 36)
+        end
+        let gen_label: string = pad("gen-" + to_string(g.number), 8)
+        let gen_str: string = if active then c("1;92", gen_label) else dim(gen_label)
+        write("  " + gen_str + " " + dim(pad(ts, 22)) + " " + cyan(pad(to_string(g.packages.len()), 8)) + " " + dim(note) + marker)
+    end
+    write("  " + rule(70))
+    write("")
+    write("  Rollback: " + cyan("hammer rollback") + "     Switch: " + cyan("hammer gen switch <N>"))
+end
+
+
+;; ── Diff (ui.rs::print_diff — wariant skrocony; pelny jest w internal/diff.h#) ──
+
+fn diff_ver_or_q(v: string?) -> string is
+    if v == nil is return "?" end
+    let s: string = v
+    return s
+end
+
+pub fn print_diff(d: diff::GenDiff) is
+    if diff::diff_is_empty(d) is
+        write("  " + dim("·") + " No changes between gen-" + to_string(d.from_gen) + " and gen-" + to_string(d.to_gen) + ".")
+        return
+    end
+    let mut i: int = 0
+    while i < d.pkg_changes.len() is
+        let c: diff::PkgChange = d.pkg_changes[i]
+        ;; Wzorce `match` nie przyjmuja kwalifikatora modulu (`diff::ChangeKind::X`
+        ;; to 3 segmenty), wiec rozrozniamy po etykiecie z `diff::kind_label`.
+        let k: string = diff::kind_label(c.kind)
+        if k == "added" is
+            write("  " + bright_green("++") + " " + bold(c.name) + "  " + green(diff_ver_or_q(c.to_ver)))
+        elsif k == "removed" is
+            write("  " + red("--") + " " + bold(c.name) + "  " + dim(diff_ver_or_q(c.from_ver)))
+        elsif k == "upgraded" is
+            write("  " + bright_yellow("~~") + " " + bold(c.name) + ":  " + dim(diff_ver_or_q(c.from_ver)) + " → " + bright_yellow(diff_ver_or_q(c.to_ver)))
+        else is
+            write("  " + red("↓↓") + " " + bold(c.name) + ":  " + dim(diff_ver_or_q(c.from_ver)) + " → " + red(diff_ver_or_q(c.to_ver)))
+        end
+        i += 1
+    end
+    write("")
+    write("  " + bold("Summary:") + " +" + green(to_string(diff::n_added(d))) + "  ↑" + yellow(to_string(diff::n_upgraded(d))) + "  -" + red(to_string(diff::n_removed(d))))
+end
+
+;; ── Tabela transakcji (ui.rs::print_transaction_table / _summary) ────────
+
+fn tx_rule(n: int) -> string is
+    return "  " + dim(str::repeat("─", n))
+end
+
+fn dl_size(p: package::Package) -> string is
+    let n: int = if p.download_size == nil then 0 else p.download_size
+    return human_size(n)
+end
+
+;; Kolumny jak `{:<36} {:<16} {:<10} {}` — dopelnienie na tekscie BEZ kolorow.
+pub fn print_transaction_table(plan: solver::TransactionPlan, arch: string) is
+    if plan.to_install.len() > 0 is
+        write("")
+        write("  " + bold("Packages to install:"))
+        write(tx_rule(80))
+        let mut i: int = 0
+        while i < plan.to_install.len() is
+            let pkg: package::Package = plan.to_install[i]
+            write("  " + bright_green_bold(fmt::pad_right(pkg.name, 36)) + " " + cyan(fmt::pad_right(pkg.version, 16)) + " " + dim(fmt::pad_right(pkg.architecture, 10)) + " " + dim(dl_size(pkg)))
+            i += 1
+        end
+    end
+
+    if plan.to_upgrade.len() > 0 is
+        write("")
+        write("  " + bold("Packages to upgrade:"))
+        write(tx_rule(80))
+        let mut u: int = 0
+        while u < plan.to_upgrade.len() is
+            let pkg2: package::Package = plan.to_upgrade[u]
+            let old_o: string? = solver::plan_upgrade_from(plan, pkg2.name)
+            let old: string = if old_o == nil then "?" else old_o
+            write("  " + yellow_bold(fmt::pad_right(pkg2.name, 36)) + " " + dim(old) + " → " + bright_yellow(pkg2.version) + " " + dim(dl_size(pkg2)))
+            u += 1
+        end
+    end
+
+    if plan.to_remove.len() > 0 is
+        write("")
+        write("  " + bold("Packages to remove:"))
+        write(tx_rule(80))
+        let mut r: int = 0
+        while r < plan.to_remove.len() is
+            write("  " + red_bold(plan.to_remove[r]))
+            r += 1
+        end
+    end
+
+    if plan.to_autoremove.len() > 0 is
+        write("")
+        write("  " + bold("Auto-remove (no longer needed):"))
+        write(tx_rule(80))
+        let mut parts: [string] = []
+        let mut a: int = 0
+        while a < plan.to_autoremove.len() is
+            parts.push(dim(plan.to_autoremove[a]))
+            a += 1
+        end
+        write("  " + str::join(parts, "  "))
+    end
+end
+
+pub fn print_transaction_summary(plan: solver::TransactionPlan) is
+    write("")
+    write(tx_rule(60))
+    let install: int = plan.to_install.len() + plan.to_upgrade.len()
+    let remove: int = plan.to_remove.len() + plan.to_autoremove.len()
+    if install > 0 is write("  " + bold(fmt::pad_right("Install/upgrade:", 28)) + " " + bright_green(to_string(install))) end
+    if remove > 0 is write("  " + bold(fmt::pad_right("Remove:", 28)) + " " + red(to_string(remove))) end
+    if plan.download_bytes > 0 is write("  " + bold(fmt::pad_right("Download:", 28)) + " " + cyan(human_size(plan.download_bytes))) end
+    if plan.install_bytes > 0 is write("  " + bold(fmt::pad_right("Installed size:", 28)) + " " + cyan(human_size(plan.install_bytes))) end
+    if plan.freed_bytes > 0 is write("  " + bold(fmt::pad_right("Freed:", 28)) + " " + green(human_size(plan.freed_bytes))) end
+    let mut w: int = 0
+    while w < plan.warnings.len() is
+        write("  " + yellow_bold("warn:") + " " + yellow(plan.warnings[w]))
+        w += 1
+    end
+    write("")
+end
