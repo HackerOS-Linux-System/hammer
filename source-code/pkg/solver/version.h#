@@ -1,0 +1,135 @@
+use "std -> strings" from "str"
+
+use "bit -> libhammer" from "lh"
+
+;; hammer -> pkg::solver::version
+;;
+;; Port of source-code/pkg/solver/version.rs (Rust) to H#.
+;; `VersionReq` + porownywanie wersji Debiana + `satisfies`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `Ordering` -> `int` (-1 / 0 / 1). Sam algorytm dpkg (epoka, wersja
+;;    upstream, rewizja, tylda) jest juz przepisany w `libhammer`
+;;    (`lhversion::version_cmp`), wiec `compare` tylko deleguje —
+;;    Rust tez ma dwie kopie (libhammer i hammer) o tej samej semantyce.
+;; 2. `satisfies` NIE deleguje do `lhversion::version_satisfies`, bo ta
+;;    zna mniej operatorow niz oryginal (`==`, `!=`, `<>`, `=<`, `=>`).
+;;    Tu zachowana jest pelna tabela operatorow z `version.rs`.
+;; 3. `impl Display for VersionReq` -> `req_to_string`; `VersionReq::new/
+;;    parse/satisfies` -> `req_new/req_parse/req_satisfies`.
+;; 4. `#[cfg(test)]` -> `self_test()`: zwraca liczbe niezdanych przypadkow
+;;    (0 = wszystko dobrze). Te same przypadki co w testach Rusta.
+
+pub struct VersionReq is
+    pub op:      string
+    pub version: string
+end
+
+pub fn req_new(op: string, version: string) -> VersionReq is
+    return VersionReq { op: op, version: version }
+end
+
+;; Czy `ver` spelnia wymaganie.
+pub fn req_satisfies(r: VersionReq, ver: string) -> bool is
+    return satisfies(ver, r.op, r.version)
+end
+
+fn is_paren(c: string) -> bool is
+    return c == "(" || c == ")"
+end
+
+;; Rust: `s.trim().trim_matches(|c| c == '(' || c == ')').trim()`.
+fn strip_parens(s0: string) -> string is
+    let s: string = str::trim(s0)
+    let mut a: int = 0
+    let mut b: int = string_len(s)
+    while a < b && is_paren(string_at(s, a)) is
+        a += 1
+    end
+    while b > a && is_paren(string_at(s, b - 1)) is
+        b -= 1
+    end
+    return str::trim(str::slice(s, a, b))
+end
+
+;; Parsuje `"(>= 1.2)"` albo `">= 1.2"`; nil gdy brak operatora.
+pub fn req_parse(s0: string) -> VersionReq? is
+    let s: string = strip_parens(s0)
+    let ops: [string] = [">=", "<=", ">>", "<<", "!=", "=", ">", "<"]
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < ops.len() is
+        let op: string = ops[i]
+        let ol: int = string_len(op)
+        if n >= ol && str::slice(s, 0, ol) == op is
+            return VersionReq { op: op, version: str::trim(str::slice(s, ol, n)) }
+        end
+        i += 1
+    end
+    return nil
+end
+
+;; Rust: `Display` -> "(op version)".
+pub fn req_to_string(r: VersionReq) -> string is
+    return "(" + r.op + " " + r.version + ")"
+end
+
+;; Porownuje dwa napisy wersji Debiana: -1 / 0 / 1.
+pub fn compare(a: string, b: string) -> int is
+    return lhversion::version_cmp(a, b)
+end
+
+;; `installed <op> constraint`.
+pub fn satisfies(installed: string, op: string, constraint: string) -> bool is
+    let ord: int = compare(installed, constraint)
+    if op == "=" || op == "==" is return ord == 0 end
+    if op == "!=" || op == "<>" is return ord != 0 end
+    if op == "<<" || op == "<" is return ord < 0 end
+    if op == "<=" || op == "=<" is return ord <= 0 end
+    if op == ">>" || op == ">" is return ord > 0 end
+    if op == ">=" || op == "=>" is return ord >= 0 end
+    return false
+end
+
+;; ── Testy (z version.rs) ─────────────────────────────────────────────────
+
+fn t_cmp(a: string, b: string, want: int) -> int is
+    if compare(a, b) == want is return 0 end
+    write("version::self_test FAIL: cmp(" + a + ", " + b + ") != " + to_string(want))
+    return 1
+end
+
+fn t_sat(v: string, op: string, c: string, want: bool) -> int is
+    if satisfies(v, op, c) == want is return 0 end
+    write("version::self_test FAIL: satisfies(" + v + ", " + op + ", " + c + ")")
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow.
+pub fn self_test() -> int is
+    let mut f: int = 0
+    f += t_cmp("1.0", "2.0", -1)
+    f += t_cmp("1.0", "1.0", 0)
+    f += t_cmp("2.0", "1.0", 1)
+    f += t_cmp("2:1.0", "1:9.9", 1)
+    f += t_cmp("1:1.0", "1:1.0", 0)
+    f += t_cmp("1.0", "0:1.0", 0)
+    f += t_cmp("1.0~rc1", "1.0", -1)
+    f += t_cmp("1.0~rc1", "1.0~rc2", -1)
+    f += t_cmp("1.0", "1.0~rc1", 1)
+    f += t_cmp("1.0-1", "1.0-2", -1)
+    f += t_cmp("1.0-1", "1.0-1", 0)
+    f += t_cmp("1.0", "1.0-0", 0)
+    f += t_cmp("1.0", "1.0.0", -1)
+    f += t_cmp("1.01", "1.1", 0)
+    f += t_sat("2.0", ">=", "1.0", true)
+    f += t_sat("1.0", ">>", "1.0", false)
+    f += t_sat("1.0", "=", "1.0", true)
+    f += t_sat("1.1", "!=", "1.0", true)
+    f += t_sat("1.0~beta", "<=", "1.0", true)
+    f += t_cmp("4.14.1-1", "4.14.1-2", -1)
+    f += t_cmp("1:7.4.052-1", "8.0.1220-1", 1)
+    f += t_cmp("0.9.8zh-1", "1.0.0-1", -1)
+    f += t_cmp("2.1.1+dfsg-1", "2.1.1-1", 1)
+    return f
+end
