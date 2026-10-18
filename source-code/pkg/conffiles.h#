@@ -1,0 +1,459 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> fmt"     from "fmt"
+
+mod internal
+mod ui
+mod deb
+
+;; hammer -> pkg::conffiles
+;;
+;; Port of source-code/pkg/conffiles.rs (Rust) to H#: sledzenie plikow
+;; konfiguracyjnych pakietow (/hammer/db/conffiles/<pkg>/{list,orig/<key>}),
+;; trojstronny merge przy upgrade, `hammer etc diff|reset|show`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. TRESC PLIKOW jako `string`, nie `Vec<u8>`. `fs::read` zwraca tekst,
+;;    wiec conffile BINARNY (rzadkie, ale mozliwe) moze sie zepsuc przy
+;;    odczycie/zapisie; hash `sha256` liczony jest po tym samym tekscie
+;;    po obu stronach, wiec status Unchanged/Modified pozostaje spojny.
+;;    Jesli to okaze sie problemem: przejsc na `fs::read_bytes/write_bytes`
+;;    (sa w std, typ wyniku do sprawdzenia na v0.9).
+;; 2. `extract_from_deb(deb)` dziala na `deb::DebPackage` z pkg/deb.h#, ktory
+;;    trzyma czlonki .deb jako PLIKI w katalogu roboczym (patrz naglowek
+;;    deb.h#); zwraca `ConfOriginals` (rownolegle tablice sciezek i tresci)
+;;    zamiast `Vec<(PathBuf, Vec<u8>)>`. `register_package_conffiles`
+;;    przyjmuje tylko nazwe pakietu (Rust ignoruje `_deb` i tylko loguje).
+;;    Zapis oryginalow robi `record(pkg, paths, contents)`.
+;; 3. `MergeResult` (enum z danymi) -> struct z polem `kind`
+;;    ("auto-updated" | "merged" | "conflict" | "user-deleted") + `content`
+;;    (nowa/scalona tresc) + `current` (tylko dla "conflict"). `Option<..>`
+;;    wyniku `merge_upgrade` -> nil gdy stara i nowa tresc sa identyczne.
+;; 4. `Result<..>` -> `string` ("" = Ok) tam, gdzie Rust zwracal `Result<()>`.
+;; 5. `three_way_merge` zwraca `MergeOutcome {ok, text}`; ok=false odpowiada
+;;    `Err("conflict markers present")`. Sprawdzenie "czy UTF-8" (Rust:
+;;    `from_utf8`) pomijam — tresc jest juz tekstem (patrz 1).
+;; 6. `.lines()` -> `lines_of`: dzieli po '\n' i odrzuca ostatni pusty
+;;    element po koncowym '\n' (jak `str::lines`).
+
+pub fn conffiles_dir() -> string is return "/hammer/db/conffiles" end
+
+pub enum ConffileStatus is
+    Unchanged
+    Modified
+    Deleted
+    New
+end
+
+pub struct ConffileEntry is
+    pub path:      string
+    pub package:   string
+    pub status:    ConffileStatus
+    pub orig_hash: string?
+    pub curr_hash: string?
+end
+
+pub struct MergeResult is
+    pub kind:    string
+    pub content: string
+    pub current: string
+end
+
+pub struct ConfOriginals is
+    pub paths:    [string]
+    pub contents: [string]
+end
+
+pub struct MergeOutcome is
+    pub ok:   bool
+    pub text: string
+end
+
+;; ── Pomocniki ────────────────────────────────────────────────────────────
+
+fn sha256_hex(data: string) -> string is
+    return compat::crypto_sha256(data)
+end
+
+;; Pierwsze 16 znakow sha256 sciezki — nazwa pliku z oryginalem.
+fn path_key(p: string) -> string is
+    return str::slice(sha256_hex(p), 0, 16)
+end
+
+;; `str::lines`: bez pustego elementu po koncowym '\n'.
+fn lines_of(s: string) -> [string] is
+    let mut parts: [string] = str::split(s, "\n")
+    if parts.len() > 0 && parts[parts.len() - 1] == "" is
+        let mut out: [string] = []
+        let mut i: int = 0
+        while i < parts.len() - 1 is
+            out.push(parts[i])
+            i += 1
+        end
+        return out
+    end
+    return parts
+end
+
+
+fn ensure_parent(p: string) is
+    let dir: string = compat::path_parent(p)
+    if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+end
+
+fn line_at(lines: [string], i: int) -> string? is
+    if i < lines.len() is return lines[i] end
+    return nil
+end
+
+fn max3(a: int, b: int, c: int) -> int is
+    let mut m: int = a
+    if b > m is m = b end
+    if c > m is m = c end
+    return m
+end
+
+;; ── ConffileDb ───────────────────────────────────────────────────────────
+
+;; Zapisuje oryginaly (`paths[i]` -> `contents[i]`) i liste dla pakietu.
+pub fn record(pkg_name: string, paths: [string], contents: [string]) -> string is
+    let base: string = compat::path_join(conffiles_dir(), pkg_name)
+    let orig_dir: string = compat::path_join(base, "orig")
+    fs::mkdir(orig_dir)
+
+    let mut list: string = ""
+    let mut i: int = 0
+    while i < paths.len() is
+        list = list + paths[i] + "\n"
+        fs::write(compat::path_join(orig_dir, path_key(paths[i])), contents[i])
+        i += 1
+    end
+    fs::write(compat::path_join(base, "list"), list)
+    log::info("conffiles: recorded " + to_string(paths.len()) + " entries for " + pkg_name)
+    return ""
+end
+
+;; Oryginalne conffiles z paczki .deb: rozpakowuje data.tar do katalogu
+;; tymczasowego, czyta pliki wskazane przez `conffiles` z control.tar i
+;; sprzata. Pusta tablica gdy rozpakowanie sie nie powiodlo (Rust:
+;; `if let Ok(extract_result)`; tmp: `hammer_conffiles_<pid>`).
+pub fn extract_from_deb(d: deb::DebPackage) -> ConfOriginals is
+    let tmp: string = "/tmp/hammer_conffiles_" + to_string(compat::os_pid())
+    let r: deb::ExtractResult = deb::extract_data(d, tmp)
+    system("rm -rf '" + tmp + "'")
+    if r.err != "" is
+        let none_p: [string] = []
+        let none_c: [string] = []
+        return ConfOriginals { paths: none_p, contents: none_c }
+    end
+    return ConfOriginals { paths: r.conf_paths, contents: r.conf_contents }
+end
+
+;; Rust tylko loguje ("ensure tracking is set up").
+pub fn register_package_conffiles(pkg: string) -> string is
+    log::info("conffiles: registered for " + pkg)
+    return ""
+end
+
+fn status_of(orig_hash: string?, curr_hash: string?) -> ConffileStatus is
+    if orig_hash != nil && curr_hash != nil is
+        let o: string = orig_hash
+        let c: string = curr_hash
+        if o == c is return ConffileStatus::Unchanged end
+        return ConffileStatus::Modified
+    end
+    if orig_hash != nil && curr_hash == nil is return ConffileStatus::Deleted end
+    return ConffileStatus::New
+end
+
+pub fn entries_for(pkg_name: string) -> [ConffileEntry] is
+    let mut out: [ConffileEntry] = []
+    let base: string = compat::path_join(conffiles_dir(), pkg_name)
+    let list_path: string = compat::path_join(base, "list")
+    let orig_dir: string = compat::path_join(base, "orig")
+    if !fs::exists(list_path) is return out end
+
+    let lines: [string] = lines_of(fs::read(list_path))
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i] != "" is
+            let p: string = str::trim(lines[i])
+            let orig_file: string = compat::path_join(orig_dir, path_key(p))
+            let mut orig_hash: string? = nil
+            if fs::exists(orig_file) is orig_hash = sha256_hex(fs::read(orig_file)) end
+            let mut curr_hash: string? = nil
+            if fs::exists(p) && fs::is_file(p) is curr_hash = sha256_hex(fs::read(p)) end
+            out.push(ConffileEntry {
+                path:      p,
+                package:   pkg_name,
+                status:    status_of(orig_hash, curr_hash),
+                orig_hash: orig_hash,
+                curr_hash: curr_hash
+            })
+        end
+        i += 1
+    end
+    return out
+end
+
+fn is_unchanged(e: ConffileEntry) -> bool is
+    match e.status is
+        ConffileStatus::Unchanged => is return true end
+        _ => is return false end
+    end
+end
+
+pub fn all_modified() -> [ConffileEntry] is
+    let mut out: [ConffileEntry] = []
+    let base: string = conffiles_dir()
+    if !fs::exists(base) is return out end
+    let pkgs: [string] = fs::list_dir(base)
+    let mut i: int = 0
+    while i < pkgs.len() is
+        let es: [ConffileEntry] = entries_for(pkgs[i])
+        let mut j: int = 0
+        while j < es.len() is
+            if !is_unchanged(es[j]) is out.push(es[j]) end
+            j += 1
+        end
+        i += 1
+    end
+    return out
+end
+
+;; Trojstronny merge liniowy (indeks po indeksie, jak w Rust — to NIE jest
+;; diff3; przesuniecie linii daje konflikt).
+pub fn three_way_merge(base: string, ours: string, theirs: string) -> MergeOutcome is
+    let bl: [string] = lines_of(base)
+    let ol: [string] = lines_of(ours)
+    let tl: [string] = lines_of(theirs)
+
+    let mut result: [string] = []
+    let mut conflict: bool = false
+    let mx: int = max3(bl.len(), ol.len(), tl.len())
+
+    let mut i: int = 0
+    while i < mx is
+        let b: string? = line_at(bl, i)
+        let o: string? = line_at(ol, i)
+        let t: string? = line_at(tl, i)
+
+        if o != nil && t != nil is
+            let ov: string = o
+            let tv: string = t
+            if ov == tv is
+                result.push(ov)
+            elsif b != nil && ov == b is
+                result.push(tv)
+            elsif b != nil && tv == b is
+                result.push(ov)
+            else is
+                conflict = true
+                result.push("<<<<<<< current")
+                result.push(ov)
+                result.push("=======")
+                result.push(tv)
+                result.push(">>>>>>> package")
+            end
+        elsif o != nil && t == nil is
+            result.push(o)
+        elsif o == nil && t != nil is
+            result.push(t)
+        end
+        i += 1
+    end
+
+    if conflict is return MergeOutcome { ok: false, text: "" } end
+    return MergeOutcome { ok: true, text: str::join(result, "\n") + "\n" }
+end
+
+;; Co zrobic z conffile'em przy upgrade; nil gdy stara == nowa tresc.
+pub fn merge_upgrade(file: string, old_content: string, new_content: string) -> MergeResult? is
+    if old_content == new_content is return nil end
+
+    if !fs::exists(file) is
+        return MergeResult { kind: "user-deleted", content: "", current: "" }
+    end
+    let curr: string = fs::read(file)
+
+    if sha256_hex(curr) == sha256_hex(old_content) is
+        return MergeResult { kind: "auto-updated", content: new_content, current: "" }
+    end
+
+    let m: MergeOutcome = three_way_merge(old_content, curr, new_content)
+    if m.ok is
+        return MergeResult { kind: "merged", content: m.text, current: "" }
+    end
+    return MergeResult { kind: "conflict", content: new_content, current: curr }
+end
+
+;; "" = Ok.
+pub fn apply_merge(file: string, r: MergeResult) -> string is
+    if r.kind == "auto-updated" is
+        ensure_parent(file)
+        fs::write(file, r.content)
+        log::info("conffiles: auto-updated " + file)
+    elsif r.kind == "merged" is
+        ensure_parent(file)
+        fs::write(file, r.content)
+        log::info("conffiles: merged " + file)
+    elsif r.kind == "conflict" is
+        let new_path: string = compat::path_with_extension(file, "dpkg-new")
+        fs::write(new_path, r.content)
+        log::warn("conffiles: conflict in " + file + " — new saved as " + new_path)
+    elsif r.kind == "user-deleted" is
+        log::info("conffiles: " + file + " was deleted by user, keeping deleted")
+    end
+    return ""
+end
+
+;; Czy `list` zawiera sciezke `file` (porownanie po `trim`).
+fn list_has(list: string, file: string) -> bool is
+    let lines: [string] = lines_of(list)
+    let mut i: int = 0
+    while i < lines.len() is
+        if str::trim(lines[i]) == file is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Przywraca oryginal z bazy. "" = Ok, inaczej blad.
+pub fn reset(file: string) -> string is
+    let base: string = conffiles_dir()
+    if !fs::exists(base) is return "No conffile database found." end
+
+    let pkgs: [string] = fs::list_dir(base)
+    let mut i: int = 0
+    while i < pkgs.len() is
+        let pkg: string = pkgs[i]
+        let pdir: string = compat::path_join(base, pkg)
+        let list_path: string = compat::path_join(pdir, "list")
+        if fs::exists(list_path) is
+            if list_has(fs::read(list_path), file) is
+                let orig: string = compat::path_join(compat::path_join(pdir, "orig"), path_key(file))
+                if fs::exists(orig) is
+                    let content: string = fs::read(orig)
+                    ensure_parent(file)
+                    fs::write(file, content)
+                    write("  " + ui::bright_green("✔") + " Reset " + file + " to original (from " + ui::cyan(pkg) + ")")
+                    log::info("conffiles: reset " + file + " to original from " + pkg)
+                    return ""
+                end
+            end
+        end
+        i += 1
+    end
+    return "No conffile record found for " + file + "."
+end
+
+;; ── CLI ──────────────────────────────────────────────────────────────────
+
+pub fn cmd_etc_diff() -> string is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Modified conffiles")
+    write("  " + ui::dim(str::repeat("─", 70)))
+
+    let modified: [ConffileEntry] = all_modified()
+    if modified.len() == 0 is
+        write("  " + ui::bright_green("✔") + " No conffiles modified.")
+        return ""
+    end
+
+    write("  " + ui::bold(fmt::pad_right("File", 40)) + " " + ui::bold(fmt::pad_right("Status", 12)) + " " + ui::bold("Package"))
+    write("  " + ui::dim(str::repeat("─", 70)))
+
+    let mut i: int = 0
+    while i < modified.len() is
+        let e: ConffileEntry = modified[i]
+        let mut label: string = "unchanged"
+        let mut col: string = ui::dim("unchanged")
+        match e.status is
+            ConffileStatus::Modified  => is
+                label = "modified"
+                col = ui::yellow("modified")
+            end
+            ConffileStatus::Deleted   => is
+                label = "deleted"
+                col = ui::red("deleted")
+            end
+            ConffileStatus::New       => is
+                label = "new"
+                col = ui::bright_green("new")
+            end
+            ConffileStatus::Unchanged => is end
+        end
+        ;; kolumna dopelniana po dlugosci BEZ kodow ANSI (Rust dopelnial
+        ;; pokolorowany tekst do 20 znakow — rozjezdzalo szerokosc)
+        let pad: string = str::repeat(" ", 12 - string_len(label))
+        write("  " + ui::bold(fmt::pad_right(e.path, 40)) + " " + col + pad + " " + ui::cyan(e.package))
+        i += 1
+    end
+
+    write("")
+    write("  " + ui::yellow(to_string(modified.len())) + " file(s) modified.")
+    write("  Reset: " + ui::cyan("hammer etc reset <file>"))
+    return ""
+end
+
+pub fn cmd_etc_reset(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer etc reset <file>" end
+    let file: string = args[0]
+    if !compat::path_is_absolute(file) is
+        return "Please provide an absolute path (e.g. /etc/ssh/sshd_config)"
+    end
+    return reset(file)
+end
+
+fn print_simple_diff(orig: [string], curr: [string]) is
+    let mx: int = if orig.len() > curr.len() then orig.len() else curr.len()
+    let mut i: int = 0
+    while i < mx is
+        let o: string? = line_at(orig, i)
+        let c: string? = line_at(curr, i)
+        if o != nil && c != nil is
+            let ov: string = o
+            let cv: string = c
+            if ov == cv is
+                write("   " + ov)
+            else is
+                write("  " + ui::red("-") + " " + ui::red(ov))
+                write("  " + ui::bright_green("+") + " " + ui::bright_green(cv))
+            end
+        elsif o != nil is
+            write("  " + ui::red("-") + " " + ui::red(o))
+        elsif c != nil is
+            write("  " + ui::bright_green("+") + " " + ui::bright_green(c))
+        end
+        i += 1
+    end
+end
+
+;; Rust: `read_dir(base)?` -> blad gdy katalogu brak; tu ten sam komunikat
+;; co na koncu oryginalu ("not tracked").
+pub fn cmd_etc_show(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer etc show <file>" end
+    let file: string = args[0]
+
+    let base: string = conffiles_dir()
+    if !fs::exists(base) is return "File " + file + " is not tracked as a conffile." end
+
+    let pkgs: [string] = fs::list_dir(base)
+    let mut i: int = 0
+    while i < pkgs.len() is
+        let pdir: string = compat::path_join(base, pkgs[i])
+        let list_path: string = compat::path_join(pdir, "list")
+        if fs::exists(list_path) && list_has(fs::read(list_path), file) is
+            let orig_path: string = compat::path_join(compat::path_join(pdir, "orig"), path_key(file))
+            let orig: string = if fs::exists(orig_path) then fs::read(orig_path) else "(binary or missing)"
+            let curr: string = if fs::exists(file) then fs::read(file) else "(deleted)"
+
+            write("  " + ui::accent_bold("⬡") + "  diff: " + file)
+            write("  " + ui::dim(str::repeat("─", 70)))
+            print_simple_diff(lines_of(orig), lines_of(curr))
+            return ""
+        end
+        i += 1
+    end
+    return "File " + file + " is not tracked as a conffile."
+end
