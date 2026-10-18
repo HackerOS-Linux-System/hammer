@@ -1,0 +1,1540 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> fmt"     from "fmt"
+use "std -> conv"    from "conv"
+use "std -> env"     from "env"
+
+mod internal
+mod cli
+mod pkg
+mod ui
+mod system
+mod tools
+mod repo
+mod hammerd
+
+;; hammer -> cli::cli_sys
+;;
+;; Port of source-code/cli/sys.rs (Rust) to H#: komendy systemowe — status,
+;; history, service, log, immutable, diff, gen, rollback, pending, verify,
+;; doctor, export/import, key, gc, clean, init, relink, store, boot, why,
+;; why-not, fsck, check, daemon, db. (Czesc 1: do `doctor`; reszta nizej.)
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `async fn` -> zwykle funkcje; `anyhow::Result<()>` -> `string`.
+;; 2. Blokada: `let _lock = lock::system_lock()?` (zwalniana przez `Drop`) ->
+;;    kazda komenda bierze blokade i zwalnia ja w KAZDEJ sciezce wyjscia
+;;    (`unlock`).
+;; 3. `hk_tools::list_tools()` (sekcje "HackerOS tools" w `cmd_status` i
+;;    `cmd_doctor`) POMINIETE — `tools/hk_tools.rs` nie jest przepisany.
+;; 4. `walkdir` (sprawdzenie zawieszonych dowiazan w `cmd_verify`) -> `find`
+;;    ze skryptem `sh`; kryterium jak w Rust: dowiazanie jest OK, jesli jego
+;;    cel istnieje lub (`symlink_metadata`) sam jest dowiazaniem. UWAGA: Rust
+;;    sprawdza cel wzgledem BIEZACEGO katalogu procesu (nie katalogu
+;;    dowiazania) — dla celow wzglednych daje falszywe "dangling"; zachowane.
+;; 5. `serde_json::json!(..)` w `history --diff` drukowane kompaktowo (jedna
+;;    linia), a `history --json` pretty — klucze alfabetycznie (serde_json).
+;; 6. `HashSet::difference` -> petle z `sorting::sorted`.
+;; 7. `gdb.generations.retain(..)` w `gen gc/delete` -> przebudowa tablicy.
+;; 8. `gpgv --version` sprawdzane przez `command -v gpgv`.
+;; 9. ZACHOWANE: `cmd_history -n N` wymaga OSOBNEGO argumentu (`-n 20`); forma
+;;    `-n20` (jak w `json_output::cmd_history` i `cmd_log`) jest tu ignorowana.
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+fn append_str(a: [string], x: string) -> [string] is
+    let mut o: [string] = a
+    o.push(x)
+    return o
+end
+
+fn rule(n: int) -> string is
+    return "  " + ui::dim(str::repeat("─", n))
+end
+
+fn count_str(n: int, one: string, many: string) -> string is
+    if n == 1 is return one end
+    return many
+end
+
+;; Bierze blokade systemowa; przy bledzie zwraca (lock, err).
+fn take_lock() -> lock::LockResult is
+    return lock::system_lock()
+end
+
+;; ── status ───────────────────────────────────────────────────────────────
+
+fn count_active_bins() -> int is
+    let active: string = store::active_link()
+    if !fs::exists(active) is return 0 end
+    let subs: [string] = ["usr/bin", "usr/sbin", "usr/local/bin", "bin"]
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < subs.len() is
+        let dir: string = compat::path_join(active, subs[i])
+        if fs::is_dir(dir) is
+            let out: string = str::trim(proc::shell("ls -A1 " + shq(dir) + " 2>/dev/null | wc -l"))
+            if str::is_numeric(out) is count += conv::str_to_int(out) end
+        end
+        i += 1
+    end
+    return count
+end
+
+pub fn cmd_status() -> string is
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    ui::print_status(idb)
+    write("  " + ui::bold(fmt::pad_right("GRUB integration:", 26)) + " " + ui::dim(grub::grub_status()))
+    let bg: int? = grub::read_boot_gen()
+    if bg != nil is
+        let n: int = bg
+        write("  " + ui::bold(fmt::pad_right("Booted with:", 26)) + " gen-" + ui::cyan_bold(to_string(n)))
+    end
+    let active: int? = profile::read_active_gen()
+    if active != nil is
+        let a: int = active
+        write("  " + ui::bold(fmt::pad_right("Active profile:", 26)) + " gen-" + ui::bright_green(to_string(a)))
+        write("  " + ui::bold(fmt::pad_right("Binaries in PATH:", 26)) + " " + ui::cyan(to_string(count_active_bins())))
+    end
+    let imm: bool = immutable::is_immutable_enabled()
+    let imm_s: string = if imm then ui::bright_green("enabled") else ui::yellow("disabled (run `hammer immutable enable`)")
+    write("  " + ui::bold(fmt::pad_right("Immutable filesystem:", 26)) + " " + imm_s)
+    ;; sekcja "HackerOS tools" pominieta (patrz odejscie 3)
+    return ""
+end
+
+;; ── history ──────────────────────────────────────────────────────────────
+
+fn history_json(entries: [db::HistoryEntry]) -> string is
+    let mut items: [string] = []
+    let mut i: int = 0
+    while i < entries.len() is
+        let e: db::HistoryEntry = entries[i]
+        items.push(json_output::jobj([
+            json_output::jfield("action", json_output::jstr(e.action)),
+            json_output::jfield("generation", json_output::jint(e.generation)),
+            json_output::jfield("id", json_output::jint(e.id)),
+            json_output::jfield("new_ver", json_output::jstr_opt(e.new_ver)),
+            json_output::jfield("old_ver", json_output::jstr_opt(e.old_ver)),
+            json_output::jfield("package", json_output::jstr(e.package)),
+            json_output::jfield("timestamp", json_output::jstr(e.timestamp))]))
+        i += 1
+    end
+    return json_output::pretty(json_output::jarr(items))
+end
+
+fn print_history_entry(e: db::HistoryEntry) is
+    let mut sym_col: string = ui::dim("·")
+    if e.action == "install" is sym_col = ui::bright_green_bold("↓") end
+    if e.action == "remove" is sym_col = ui::red_bold("✗") end
+    if e.action == "upgrade" is sym_col = ui::bright_yellow_bold("↑") end
+    let mut ver_info: string = ""
+    if e.old_ver != nil && e.new_ver != nil is
+        let o: string = e.old_ver
+        let n: string = e.new_ver
+        ver_info = ui::dim(o) + " → " + ui::bright_white(n)
+    elsif e.new_ver != nil is
+        let n2: string = e.new_ver
+        ver_info = n2
+    elsif e.old_ver != nil is
+        let o2: string = e.old_ver
+        ver_info = ui::dim(o2)
+    end
+    write("  " + sym_col + "  " + ui::bold(fmt::pad_right(e.package, 32)) + " " + fmt::pad_right(ver_info, 26) + " gen-" + ui::dim(to_string(e.generation)) + "  " + ui::dim(ui::format_ts(e.timestamp)))
+end
+
+fn arg_after(args: [string], flag: string, offset: int) -> string? is
+    let mut i: int = 0
+    while i < args.len() is
+        if args[i] == flag is
+            if i + offset < args.len() is return args[i + offset] end
+            return nil
+        end
+        i += 1
+    end
+    return nil
+end
+
+fn parse_gen_arg(s: string) -> int is
+    let n: string = if string_starts_with(s, "gen-") then str::slice(s, 4, string_len(s)) else s
+    if str::is_numeric(n) is return conv::str_to_int(n) end
+    return -1
+end
+
+fn gen_found(gdb: profile::GenerationsDb, n: int) -> profile::Generation? is
+    return profile::db_get(gdb, n)
+end
+
+pub fn cmd_history(args: [string]) -> string is
+    let mut limit: int = 50
+    let mut w: int = 0
+    while w + 1 < args.len() is
+        if args[w] == "-n" is
+            if str::is_numeric(args[w + 1]) is limit = conv::str_to_int(args[w + 1]) end
+            w = args.len()
+        else is
+            w += 1
+        end
+    end
+    let json_out: bool = cli_types::has_flag(args, "--json")
+
+    ;; hammer history --diff <gen-A> <gen-B>
+    if cli_types::has_flag(args, "--diff") is
+        let a_s: string? = arg_after(args, "--diff", 1)
+        let b_s: string? = arg_after(args, "--diff", 2)
+        if a_s == nil || b_s == nil is return "Usage: hammer history --diff <gen-A> <gen-B>" end
+        let a_str: string = a_s
+        let b_str: string = b_s
+        let gen_a: int = parse_gen_arg(a_str)
+        if gen_a < 0 is return "Invalid generation: " + a_str end
+        let gen_b: int = parse_gen_arg(b_str)
+        if gen_b < 0 is return "Invalid generation: " + b_str end
+
+        let lr: profile::LoadResult = profile::db_load()
+        if lr.err != "" is return lr.err end
+        let ao: profile::Generation? = profile::db_get(lr.db, gen_a)
+        if ao == nil is return "Generation gen-" + to_string(gen_a) + " not found" end
+        let bo: profile::Generation? = profile::db_get(lr.db, gen_b)
+        if bo == nil is return "Generation gen-" + to_string(gen_b) + " not found" end
+        let a: profile::Generation = ao
+        let b: profile::Generation = bo
+
+        let mut added: [string] = []
+        let mut removed: [string] = []
+        let mut changed: [string] = []
+        let mut i: int = 0
+        while i < b.packages.len() is
+            let mut found: bool = false
+            let mut k: int = 0
+            while k < a.packages.len() is
+                if a.packages[k].name == b.packages[i].name is found = true end
+                k += 1
+            end
+            if !found && !contains_str(added, b.packages[i].name) is added.push(b.packages[i].name) end
+            i += 1
+        end
+        let mut j: int = 0
+        while j < a.packages.len() is
+            let mut bp: int = -1
+            let mut m: int = 0
+            while m < b.packages.len() is
+                if b.packages[m].name == a.packages[j].name is bp = m end
+                m += 1
+            end
+            if bp < 0 is
+                if !contains_str(removed, a.packages[j].name) is removed.push(a.packages[j].name) end
+            elsif b.packages[bp].version != a.packages[j].version is
+                changed.push(a.packages[j].name + ": " + a.packages[j].version + " → " + b.packages[bp].version)
+            end
+            j += 1
+        end
+        let added_s: [string] = sorting::sorted(added)
+        let removed_s: [string] = sorting::sorted(removed)
+
+        if json_out is
+            write(json_output::jobj([
+                json_output::jfield("added", json_output::jstr_arr(added_s)),
+                json_output::jfield("changed", json_output::jstr_arr(changed)),
+                json_output::jfield("gen_a", json_output::jint(gen_a)),
+                json_output::jfield("gen_b", json_output::jint(gen_b)),
+                json_output::jfield("removed", json_output::jstr_arr(removed_s))]))
+            return ""
+        end
+
+        write("")
+        write("  " + ui::accent_bold("⬡") + "  Diff: gen-" + to_string(gen_a) + " → gen-" + to_string(gen_b))
+        write(rule(70))
+        let mut x: int = 0
+        while x < added_s.len() is
+            write("  " + ui::bright_green("+") + " " + ui::bright_green(added_s[x]))
+            x += 1
+        end
+        let mut y: int = 0
+        while y < removed_s.len() is
+            write("  " + ui::red("−") + " " + ui::red(removed_s[y]))
+            y += 1
+        end
+        let mut z: int = 0
+        while z < changed.len() is
+            write("  " + ui::bright_yellow("↑") + " " + ui::bright_yellow(changed[z]))
+            z += 1
+        end
+        if added_s.len() == 0 && removed_s.len() == 0 && changed.len() == 0 is
+            write("  " + ui::dim("·") + " No differences between gen-" + to_string(gen_a) + " and gen-" + to_string(gen_b) + ".")
+        end
+        write("")
+        return ""
+    end
+
+    ;; hammer history --search <package>
+    if cli_types::has_flag(args, "--search") is
+        let pn: string? = arg_after(args, "--search", 1)
+        if pn == nil is return "Usage: hammer history --search <package>" end
+        let pkg_name: string = pn
+        let idb: db::InstalledDb = db::InstalledDb::open()
+        let all: [db::HistoryEntry] = idb.history(10000)
+        let mut matches: [db::HistoryEntry] = []
+        let mut i2: int = 0
+        while i2 < all.len() is
+            if compat::str_index_of(all[i2].package, pkg_name) >= 0 is matches.push(all[i2]) end
+            i2 += 1
+        end
+        if json_out is
+            write(history_json(matches))
+            return ""
+        end
+        write("")
+        write("  " + ui::accent_bold("⬡") + "  History for '" + ui::bold(pkg_name) + "'")
+        write(rule(70))
+        if matches.len() == 0 is
+            write("  " + ui::dim("·") + " No history found for '" + pkg_name + "'.")
+        else is
+            let mut k2: int = 0
+            while k2 < matches.len() is
+                print_history_entry(matches[k2])
+                k2 += 1
+            end
+        end
+        write("")
+        return ""
+    end
+
+    ;; domyslnie: ostatnie N wpisow
+    let idb2: db::InstalledDb = db::InstalledDb::open()
+    let entries: [db::HistoryEntry] = idb2.history(limit)
+    if json_out is
+        write(history_json(entries))
+        return ""
+    end
+    ui::print_history(entries)
+    return ""
+end
+
+;; ── service / log / immutable ────────────────────────────────────────────
+
+pub fn cmd_service(args: [string]) -> string is
+    return service::cmd_service(args)
+end
+
+pub fn cmd_log(args: [string]) -> string is
+    let mut lines: int = 50
+    let mut i: int = 0
+    while i < args.len() is
+        if string_starts_with(args[i], "-n") is
+            let rest: string = str::trim(str::slice(args[i], 2, string_len(args[i])))
+            if str::is_numeric(rest) is lines = conv::str_to_int(rest) end
+            i = args.len()
+        else is
+            i += 1
+        end
+    end
+
+    let log_path: string = log::log_file()
+    if !fs::exists(log_path) is
+        write("  " + ui::dim("·") + " No log file at " + log_path)
+        return ""
+    end
+    write("  " + ui::accent_bold("⬡") + "  hammer log  (last " + to_string(lines) + " lines from " + log_path + ")")
+    write(rule(70))
+
+    let all_lines: [string] = str::split(fs::read(log_path), "\n")
+    ;; `str.lines()` nie zwraca ostatniej pustej linii po koncowym `\n`
+    let mut total: int = all_lines.len()
+    if total > 0 && all_lines[total - 1] == "" is total -= 1 end
+    let start: int = if total > lines then total - lines else 0
+    let mut k: int = start
+    while k < total is
+        let line: string = all_lines[k]
+        if compat::str_index_of(line, "ERROR") >= 0 is
+            write("  " + ui::red(line))
+        elsif compat::str_index_of(line, "WARN") >= 0 is
+            write("  " + ui::yellow(line))
+        elsif string_starts_with(line, "──") is
+            write("  " + ui::dim(line))
+        else is
+            write("  " + line)
+        end
+        k += 1
+    end
+    return ""
+end
+
+pub fn cmd_immutable(args: [string]) -> string is
+    return immutable::cmd_immutable(args)
+end
+
+;; ── diff / gen / rollback / pending ──────────────────────────────────────
+
+pub fn cmd_diff(args: [string]) -> string is
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let gdb: profile::GenerationsDb = lr.db
+    let mut a: int = 0
+    let mut b: int = 0
+    if args.len() == 0 is
+        if gdb.pending == nil is return "No pending generation. Use: hammer diff <A> <B>" end
+        let p: int = gdb.pending
+        a = gdb.current
+        b = p
+    elsif args.len() == 1 is
+        if !str::is_numeric(args[0]) is return "invalid digit found in string" end
+        a = conv::str_to_int(args[0])
+        b = gdb.current
+    else is
+        if !str::is_numeric(args[0]) || !str::is_numeric(args[1]) is return "invalid digit found in string" end
+        a = conv::str_to_int(args[0])
+        b = conv::str_to_int(args[1])
+    end
+    ui::print_diff(diff::compute_diff(a, b, gdb))
+    return ""
+end
+
+fn remove_generation_dirs(gens: [profile::Generation]) is
+    let mut i: int = 0
+    while i < gens.len() is
+        proc::shell("rm -rf -- " + shq(profile::gen_profile_path(gens[i])))
+        i += 1
+    end
+end
+
+pub fn cmd_gen(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "list"
+
+    if sub == "list" || sub == "ls" is
+        let lr: profile::LoadResult = profile::db_load()
+        if lr.err != "" is return lr.err end
+        ui::print_generations(lr.db)
+        return ""
+    end
+
+    if sub == "switch" is
+        if args.len() < 2 is return "Usage: hammer gen switch <N>" end
+        if !str::is_numeric(args[1]) is return "invalid digit found in string" end
+        let n: int = conv::str_to_int(args[1])
+        let lr: profile::LoadResult = profile::db_load()
+        if lr.err != "" is return lr.err end
+        let go: profile::Generation? = profile::db_get(lr.db, n)
+        if go == nil is return "Generation " + to_string(n) + " not found." end
+        let gen: profile::Generation = go
+
+        let lk: lock::LockResult = take_lock()
+        if lk.err != "" is return lk.err end
+        let e: string = switch_to_generation(gen, n)
+        lock::lock_release(lk.lock)
+        if e != "" is return e end
+        write("  " + ui::bright_green("✔") + " Now running gen-" + to_string(n) + ".")
+        return ""
+    end
+
+    if sub == "gc" is
+        ;; --keep=N albo kolejny argument; domyslnie 20
+        let mut keep: int = 20
+        let kv: string? = cli_types::flag_value(args, "--keep=")
+        if kv != nil is
+            let kvs: string = kv
+            if str::is_numeric(kvs) is keep = conv::str_to_int(kvs) end
+        elsif args.len() > 1 && str::is_numeric(args[1]) is
+            keep = conv::str_to_int(args[1])
+        end
+        return gen_gc(keep)
+    end
+
+    if sub == "delete" is
+        if args.len() < 2 is return "Usage: hammer gen delete <N>" end
+        if !str::is_numeric(args[1]) is return "invalid digit found in string" end
+        let n2: int = conv::str_to_int(args[1])
+        let lr2: profile::LoadResult = profile::db_load()
+        if lr2.err != "" is return lr2.err end
+        let mut gdb: profile::GenerationsDb = lr2.db
+        if n2 == gdb.current is
+            return "Cannot delete the currently active generation (" + to_string(n2) + ")."
+        end
+        let go2: profile::Generation? = profile::db_get(gdb, n2)
+        if go2 == nil is return "Generation " + to_string(n2) + " not found." end
+        let g2: profile::Generation = go2
+        proc::shell("rm -rf -- " + shq(profile::gen_profile_path(g2)))
+        let mut kept: [profile::Generation] = []
+        let mut i: int = 0
+        while i < gdb.generations.len() is
+            if gdb.generations[i].number != n2 is kept.push(gdb.generations[i]) end
+            i += 1
+        end
+        gdb.generations = kept
+        let se: string = profile::db_save(gdb)
+        if se != "" is return se end
+        write("  " + ui::bright_green("✔") + " Deleted gen-" + to_string(n2) + ".")
+        return ""
+    end
+
+    return "Unknown gen subcommand: '" + sub + "'. Try: list, switch, gc [--keep=N], delete <N>"
+end
+
+;; switch_active + relink + aktualizacja bazy + grub (pod blokada).
+fn switch_to_generation(gen: profile::Generation, n: int) -> string is
+    let se: string = profile::switch_active(gen)
+    if se != "" is return se end
+    let rr: profile::RelinkResult = profile::relink_bins(profile::gen_profile_path(gen))
+    if rr.err != "" is return rr.err end
+    let lr2: profile::LoadResult = profile::db_load()
+    if lr2.err != "" is return lr2.err end
+    let mut gdb2: profile::GenerationsDb = lr2.db
+    gdb2.current = n
+    gdb2.pending = nil
+    profile::clear_pending()
+    let sv: string = profile::db_save(gdb2)
+    if sv != "" is return sv end
+    grub::update_grub(gdb2)
+    return ""
+end
+
+fn gen_gc(keep: int) -> string is
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let mut gdb: profile::GenerationsDb = lr.db
+    let before: int = gdb.generations.len()
+
+    ;; `keep` najnowszych (malejaco po numerze) + biezaca
+    let mut keep_nums: [int] = []
+    let mut used: [bool] = []
+    let mut u: int = 0
+    while u < gdb.generations.len() is
+        used.push(false)
+        u += 1
+    end
+    let mut taken: int = 0
+    while taken < keep && taken < gdb.generations.len() is
+        let mut best: int = -1
+        let mut g: int = 0
+        while g < gdb.generations.len() is
+            if !used[g] && (best < 0 || gdb.generations[g].number > gdb.generations[best].number) is best = g end
+            g += 1
+        end
+        used[best] = true
+        keep_nums.push(gdb.generations[best].number)
+        taken += 1
+    end
+    keep_nums.push(gdb.current)
+
+    let mut kept: [profile::Generation] = []
+    let mut to_remove: [profile::Generation] = []
+    let mut i: int = 0
+    while i < gdb.generations.len() is
+        let mut keep_it: bool = false
+        let mut k: int = 0
+        while k < keep_nums.len() is
+            if keep_nums[k] == gdb.generations[i].number is keep_it = true end
+            k += 1
+        end
+        if keep_it is kept.push(gdb.generations[i]) else is to_remove.push(gdb.generations[i]) end
+        i += 1
+    end
+    remove_generation_dirs(to_remove)
+    gdb.generations = kept
+    let se: string = profile::db_save(gdb)
+    if se != "" is return se end
+    let removed: int = if before > gdb.generations.len() then before - gdb.generations.len() else 0
+    write("  " + ui::bright_green("✔") + " GC complete: removed " + to_string(removed) + " generation(s), kept " + to_string(gdb.generations.len()) + ".")
+    return ""
+end
+
+pub fn cmd_rollback(args: [string]) -> string is
+    return undo::cmd_undo(args)
+end
+
+pub fn cmd_pending(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "show"
+
+    if sub == "show" || sub == "status" is
+        let lr: profile::LoadResult = profile::db_load()
+        if lr.err != "" is return lr.err end
+        let pn: int? = profile::read_pending_gen()
+        if pn == nil is
+            write("  " + ui::dim("·") + " No pending changes.")
+            return ""
+        end
+        let n: int = pn
+        write("")
+        write("  " + ui::bright_yellow_bold("⬡") + " Pending: gen-" + ui::bright_yellow(ui::bold(to_string(n))))
+        let go: profile::Generation? = profile::db_get(lr.db, n)
+        if go != nil is
+            let gen: profile::Generation = go
+            if gen.note != nil is
+                let note: string = gen.note
+                write("  Operation : " + ui::cyan(note))
+            end
+            write("  Packages  : " + to_string(profile::gen_package_count(gen)))
+        end
+        write("")
+        write("  Will activate on next reboot.")
+        write("  Cancel:     " + ui::cyan("hammer pending cancel"))
+        write("  Apply now:  " + ui::cyan("hammer pending apply-live"))
+        return ""
+    end
+
+    if sub == "cancel" is
+        let pn2: int? = profile::read_pending_gen()
+        if pn2 == nil is
+            write("  " + ui::dim("·") + " No pending changes.")
+            return ""
+        end
+        let n2: int = pn2
+        let lk: lock::LockResult = take_lock()
+        if lk.err != "" is return lk.err end
+        let e: string = cancel_pending(n2)
+        lock::lock_release(lk.lock)
+        if e != "" is return e end
+        write("  " + ui::bright_green("✔") + " Pending gen-" + to_string(n2) + " cancelled.")
+        return ""
+    end
+
+    if sub == "apply-live" is return cmd_apply_live() end
+    return "Unknown pending subcommand: '" + sub + "'. Try: show, cancel, apply-live"
+end
+
+fn cancel_pending(n: int) -> string is
+    let ce: string = profile::clear_pending()
+    if ce != "" is return ce end
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let mut gdb: profile::GenerationsDb = lr.db
+    gdb.pending = nil
+    let mut gens: [profile::Generation] = []
+    let mut i: int = 0
+    while i < gdb.generations.len() is
+        let mut g: profile::Generation = gdb.generations[i]
+        if g.number == n is g.state = "Old" end
+        gens.push(g)
+        i += 1
+    end
+    gdb.generations = gens
+    let se: string = profile::db_save(gdb)
+    if se != "" is return se end
+    grub::update_grub(gdb)
+    return ""
+end
+
+fn cmd_apply_live() -> string is
+    let pn: int? = profile::read_pending_gen()
+    if pn == nil is
+        write("  " + ui::dim("·") + " No pending changes.")
+        return ""
+    end
+    let pending_num: int = pn
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let gdb: profile::GenerationsDb = lr.db
+    let go: profile::Generation? = profile::db_get(gdb, pending_num)
+    if go == nil is return "Pending gen not in DB" end
+    let gen: profile::Generation = go
+
+    ;; pakiety obecne w pending, ale nie w biezacej generacji
+    let mut current_pkgs: [string] = []
+    let cg: profile::Generation? = profile::db_get(gdb, gdb.current)
+    if cg != nil is
+        let c: profile::Generation = cg
+        let mut ci: int = 0
+        while ci < c.packages.len() is
+            current_pkgs.push(c.packages[ci].name)
+            ci += 1
+        end
+    end
+    let mut new_entries: [store::StoreEntry] = []
+    let mut i: int = 0
+    while i < gen.packages.len() is
+        let p: profile::GenPackage = gen.packages[i]
+        if !contains_str(current_pkgs, p.name) is
+            let path: string = compat::path_join(store::store_dir(), p.name + "-" + p.version + "-" + p.store_hash)
+            if fs::exists(path) is
+                new_entries.push(store::StoreEntry { name: p.name, version: p.version, hash: p.store_hash,
+                    path: path, backend: store::StoreBackend::Hardlink })
+            end
+        end
+        i += 1
+    end
+
+    let analysis: livepatch::PatchAnalysis = livepatch::analyse(livepatch::collect_files(new_entries))
+    if !analysis.can_live_patch is
+        write("  " + ui::red_bold("✗") + " Cannot apply live — reboot required.")
+        write("  Reason(s): " + ui::yellow(str::join(analysis.reboot_reasons, ", ")))
+        return ""
+    end
+    let result: livepatch::LivePatchResult = livepatch::apply_live(new_entries, store::active_link())
+    let lk: lock::LockResult = take_lock()
+    if lk.err != "" is return lk.err end
+    let e: string = finish_apply_live(gen, pending_num)
+    lock::lock_release(lk.lock)
+    if e != "" is return e end
+    write("  " + ui::bright_green_bold("✔") + " Live patch applied (" + ui::bold(to_string(result.updated_files)) + " files, binaries relinked).")
+    return ""
+end
+
+fn finish_apply_live(gen: profile::Generation, pending_num: int) -> string is
+    let se: string = profile::switch_active(gen)
+    if se != "" is return se end
+    let rr: profile::RelinkResult = profile::relink_bins(profile::gen_profile_path(gen))
+    if rr.err != "" is return rr.err end
+    let lr2: profile::LoadResult = profile::db_load()
+    if lr2.err != "" is return lr2.err end
+    let mut gdb2: profile::GenerationsDb = lr2.db
+    gdb2.current = pending_num
+    gdb2.pending = nil
+    let sv: string = profile::db_save(gdb2)
+    if sv != "" is return sv end
+    return profile::clear_pending()
+end
+
+;; ── verify ───────────────────────────────────────────────────────────────
+
+pub fn cmd_verify(args: [string]) -> string is
+    let has_filter: bool = args.len() > 0
+    ui::print_header()
+    write("  " + ui::accent_bold("⬡") + "  Verifying package integrity…")
+    write(rule(60))
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let mut ok: int = 0
+    let mut failed: int = 0
+    let mut missing: int = 0
+    let packages: [db::InstalledPackage] = idb.list_all()
+    let mut checked: int = 0
+    let mut i: int = 0
+    while i < packages.len() is
+        let pkg: db::InstalledPackage = packages[i]
+        if !has_filter || pkg.name == args[0] is
+            checked += 1
+            let store_path: string = compat::path_join(store::store_dir(), pkg.name + "-" + pkg.version + "-" + pkg.store_hash)
+            if !fs::exists(store_path) is
+                write("  " + ui::red_bold("✗") + " " + ui::bold(pkg.name) + " " + ui::dim(pkg.version) + " — store entry missing")
+                missing += 1
+            else is
+                ;; zawieszone dowiazania (patrz odejscie 4)
+                let script: string = "for f in \"$@\"; do t=$(readlink -- \"$f\") || continue; if [ -e \"$t\" ] || [ -L \"$t\" ]; then :; else echo bad; fi; done"
+                let bad: string = proc::shell("find " + shq(store_path) + " -mindepth 1 -type l -exec sh -c " + shq(script) + " sh {{}} + 2>/dev/null")
+                if compat::str_index_of(bad, "bad") < 0 is
+                    ok += 1
+                    if has_filter is
+                        write("  " + ui::bright_green("✔") + " " + ui::bold(pkg.name) + " " + ui::dim(pkg.version) + " — OK")
+                    end
+                else is
+                    write("  " + ui::red_bold("✗") + " " + ui::bold(pkg.name) + " " + ui::dim(pkg.version) + " — dangling symlinks")
+                    failed += 1
+                end
+            end
+        end
+        i += 1
+    end
+    write("")
+    write(rule(60))
+    write("  " + ui::bold(fmt::pad_right("Checked:", 20)) + " " + to_string(checked))
+    write("  " + ui::bold(fmt::pad_right("OK:", 20)) + " " + ui::bright_green(to_string(ok)))
+    if missing > 0 is write("  " + ui::bold(fmt::pad_right("Missing:", 20)) + " " + ui::red(to_string(missing))) end
+    if failed > 0 is
+        write("  " + ui::bold(fmt::pad_right("Failed:", 20)) + " " + ui::red(to_string(failed)))
+        write("  Run " + ui::cyan("hammer fix-broken") + " to fix.")
+    else is
+        write("")
+        write("  " + ui::bright_green("✔") + " Store integrity OK.")
+    end
+    return ""
+end
+
+;; ── doctor ───────────────────────────────────────────────────────────────
+
+pub struct Doctor is
+    pub issues: int
+end
+
+fn check_item(d: Doctor, label: string, ok: bool, fix: string) -> Doctor is
+    if ok is
+        write("  " + ui::bright_green("✔") + "  " + label)
+        return d
+    end
+    write("  " + ui::red_bold("✗") + "  " + label + " — " + ui::yellow(fix))
+    return Doctor { issues: d.issues + 1 }
+end
+
+fn warn_item(label: string, ok: bool, fix: string) is
+    if ok is
+        write("  " + ui::bright_green("✔") + "  " + label)
+    else is
+        write("  " + ui::yellow_bold("!") + "  " + label + " — " + ui::yellow(fix))
+    end
+end
+
+fn dir_nonempty(p: string) -> bool is
+    if !fs::is_dir(p) is return false end
+    return str::trim(proc::shell("ls -A " + shq(p) + " 2>/dev/null | head -n1")) != ""
+end
+
+pub fn cmd_doctor() -> string is
+    ui::print_header()
+    write("  " + ui::accent_bold("⬡") + "  hammer doctor — system health check")
+    write(rule(65))
+    write("")
+    let mut d: Doctor = Doctor { issues: 0 }
+
+    d = check_item(d, "/hammer directory exists", fs::exists("/hammer"), "run `hammer init`")
+    let tgt: string = str::trim(proc::shell("readlink /hammer/active 2>/dev/null"))
+    d = check_item(d, "/hammer/active symlink valid", tgt != "" && fs::exists(tgt), "run `hammer _activate` or `hammer relink`")
+    let bins: int = count_active_bins()
+    if bins > 1 is
+        write("  " + ui::bright_green("✔") + "  " + ui::cyan(to_string(bins)) + " binaries linked to PATH")
+    else is
+        write("  " + ui::red_bold("✗") + "  Only " + to_string(bins) + " binary in PATH — run " + ui::cyan("hammer relink"))
+        d = Doctor { issues: d.issues + 1 }
+    end
+    d = check_item(d, "sources-list.hk exists", fs::exists(repo::sources_hk()), "run `hammer init`")
+    d = check_item(d, "Package index populated", dir_nonempty(cache::lists_dir()), "run `hammer sync`")
+    d = check_item(d, "hammer-activate.service installed", fs::exists("/etc/systemd/system/hammer-activate.service"), "run `hammer init`")
+    d = check_item(d, "/usr/bin in PATH", compat::str_index_of(env::get("PATH"), "/usr/bin") >= 0, "add to /etc/environment")
+    d = check_item(d, "hammer database accessible", fs::exists(build_mode::db_dir()), "run `hammer init`")
+    if profile::read_pending_gen() != nil is
+        write("  " + ui::cyan_bold("ℹ") + "  Pending changes staged — reboot to activate")
+    else is
+        write("  " + ui::bright_green("✔") + "  No pending changes")
+    end
+    d = check_item(d, "GRUB generator installed", fs::exists(grub::grub_generator()), "run `hammer init`")
+    d = check_item(d, "Running on installed system", livecheck::live_reason() == nil, "hammer cannot run in a live system")
+    warn_item("Immutable filesystem enabled", immutable::is_immutable_enabled(), "run `hammer immutable enable`")
+    warn_item("Trusted GPG keys configured", dir_nonempty(gpg_verify::keyring_dir()), "add keys: `hammer key add <url>`")
+    warn_item("gpgv available", sh_ok("command -v gpgv"), "hammer install gnupg")
+    ;; sekcja "HackerOS tools: N/M installed" pominieta (patrz odejscie 3)
+
+    write("")
+    write(rule(65))
+    if d.issues == 0 is
+        write("  " + ui::bright_green_bold("✔") + "  All checks passed.")
+    else is
+        write("  " + ui::yellow_bold("!") + "  " + to_string(d.issues) + " issue" + count_str(d.issues, "", "s") + " found.")
+        if bins <= 1 is
+            write("")
+            write("  Quick fix: " + ui::bold(ui::cyan("hammer relink")))
+        end
+    end
+    write("")
+    return ""
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;;  Czesc 2: export / import / key / gc / clean / init / relink / store /
+;;  _activate / fsck / check / boot / why / why-not / daemon / db
+;; ═══════════════════════════════════════════════════════════════════════════
+;;
+;; Dodatkowe odejscia od oryginalu:
+;; 10. `cmd_export`/`cmd_import_pkg`: `tar` + `flate2` -> `tar -czhf` /
+;;     `tar -xz` z katalogu tymczasowego (manifest + dowiazania do wpisow
+;;     magazynu, `-h` dereferencja). Manifest: klucze alfabetycznie, jak
+;;     `serde_json::json!`. W imporcie liczone sa wszystkie wpisy `store/...`
+;;     (jak w Rust); `unpack(..).ok()` (ignorowanie bledow) -> `tar` bez `-k`.
+;; 11. `cmd_daemon` -> `hammerd/hd_daemon.h#` (inna architektura IPC).
+;; 12. ZACHOWANE: `cmd_gc` bierze `--keep` z `split('=').nth(1)`, wiec
+;;     `--keep=` bez liczby daje domyslne 3; `cands[keep..]` — przy `keep`
+;;     wiekszym niz liczba kandydatow lista do usuniecia jest pusta.
+;; 13. ZACHOWANE: `cmd_activate_internal` konczy proces kodem 1 po bledzie
+;;     `verify_boot_integrity` (`exit(1)`), bez zwalniania czegokolwiek.
+
+fn export_manifest(gdb: profile::GenerationsDb, gen: profile::Generation) -> string is
+    let mut pk: [string] = []
+    let mut i: int = 0
+    while i < gen.packages.len() is
+        pk.push(json_output::jobj([
+            json_output::jfield("name", json_output::jstr(gen.packages[i].name)),
+            json_output::jfield("version", json_output::jstr(gen.packages[i].version)),
+            json_output::jfield("store_hash", json_output::jstr(gen.packages[i].store_hash))]))
+        i += 1
+    end
+    return json_output::pretty(json_output::jobj([
+        json_output::jfield("generation", json_output::jint(gdb.current)),
+        json_output::jfield("hammer_version", json_output::jstr(build_mode::hammer_version())),
+        json_output::jfield("note", json_output::jstr_opt(gen.note)),
+        json_output::jfield("packages", json_output::jarr(pk))]))
+end
+
+pub fn cmd_export(args: [string]) -> string is
+    let output: string = if args.len() > 0 then args[0] else "hammer-export.tar.gz"
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let gdb: profile::GenerationsDb = lr.db
+    let go: profile::Generation? = profile::db_get(gdb, gdb.current)
+    if go == nil is return "No current generation" end
+    let gen: profile::Generation = go
+
+    let stage: string = str::trim(proc::shell("mktemp -d /tmp/hammer-export.XXXXXX"))
+    if stage == "" is return "Cannot create temp dir" end
+    proc::shell("mkdir -p " + shq(stage + "/store"))
+    if !fs::write(stage + "/hammer-manifest.json", export_manifest(gdb, gen)) is
+        proc::shell("rm -rf -- " + shq(stage))
+        return "Cannot write manifest"
+    end
+    let mut added: int = 0
+    let mut i: int = 0
+    while i < gen.packages.len() is
+        let pkg: profile::GenPackage = gen.packages[i]
+        let entry: string = pkg.name + "-" + pkg.version + "-" + pkg.store_hash
+        let sp: string = compat::path_join(store::store_dir(), entry)
+        if fs::exists(sp) is
+            proc::shell("ln -s -- " + shq(sp) + " " + shq(stage + "/store/" + entry))
+            added += 1
+        end
+        i += 1
+    end
+    let rc: string = str::trim(proc::shell("tar -czhf " + shq(output) + " -C " + shq(stage) + " hammer-manifest.json store >/dev/null 2>&1; echo $?"))
+    proc::shell("rm -rf -- " + shq(stage))
+    if rc != "0" is return "tar failed creating " + output + " (exit " + rc + ")" end
+    write("  " + ui::bright_green("✔") + " Exported " + to_string(added) + " packages to " + ui::bold(output))
+    return ""
+end
+
+;; Wartosc klucza z JSON-a manifestu (tekst) albo "".
+fn manifest_value(json: string, key: string) -> string is
+    let toks: [string] = jsonlite::tokenize(json)
+    let mut i: int = 0
+    while i + 2 < toks.len() is
+        if jsonlite::is_string_tok(toks[i]) && jsonlite::tok_text(toks[i]) == key && toks[i + 1] == ":" is
+            let v: string = toks[i + 2]
+            if jsonlite::is_string_tok(v) is return jsonlite::tok_text(v) end
+            return v
+        end
+        i += 1
+    end
+    return ""
+end
+
+pub fn cmd_import_pkg(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer import <file.tar.gz>" end
+    let input: string = args[0]
+    let lk: lock::LockResult = take_lock()
+    if lk.err != "" is return lk.err end
+    let e: string = import_inner(input)
+    lock::lock_release(lk.lock)
+    return e
+end
+
+fn import_inner(input: string) -> string is
+    if !fs::exists(input) is return "No such file: " + input end
+    let manifest: string = proc::shell("tar -xzOf " + shq(input) + " hammer-manifest.json 2>/dev/null")
+    proc::shell("mkdir -p " + shq(store::store_dir()))
+    let cnt: string = str::trim(proc::shell("tar -tzf " + shq(input) + " 2>/dev/null | grep -c '^store/'"))
+    let extracted: int = if str::is_numeric(cnt) then conv::str_to_int(cnt) else 0
+    ;; `store/<wpis>` -> STORE_DIR/<wpis> (bez `store/`); bledy pojedynczych wpisow ignorowane
+    proc::shell("tar -xzf " + shq(input) + " -C " + shq(store::store_dir()) + " --strip-components=1 --wildcards 'store/*' >/dev/null 2>&1")
+    if manifest == "" is return "No manifest found — not a hammer export?" end
+    let gen: string = manifest_value(manifest, "generation")
+    let ver: string = manifest_value(manifest, "hammer_version")
+    write("  " + ui::bright_green("✔") + " Imported from gen-" + (if gen == "" then "0" else gen) + " (hammer " + (if ver == "" then "?" else ver) + ")")
+    write("  " + ui::dim("·") + " " + to_string(extracted) + " store entries extracted.")
+    return ""
+end
+
+;; ── key ──────────────────────────────────────────────────────────────────
+
+pub fn cmd_key(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "list"
+    if sub == "list" || sub == "ls" is
+        let kl: gpg::KeyringLoad = gpg::db_load()
+        if kl.err != "" is return kl.err end
+        if kl.db.keys.len() == 0 is
+            write("  " + ui::dim("·") + " No trusted keys.")
+            write("  Add: " + ui::cyan("hammer key add https://ftp-master.debian.org/keys/archive-key-12.gpg"))
+            return ""
+        end
+        let mut i: int = 0
+        while i < kl.db.keys.len() is
+            let key: gpg::TrustedKey = kl.db.keys[i]
+            let fp: string = if string_len(key.fingerprint) >= 16 then str::slice(key.fingerprint, string_len(key.fingerprint) - 16, string_len(key.fingerprint)) else key.fingerprint
+            write("  " + ui::cyan_bold(fp) + " " + ui::bold(key.name))
+            i += 1
+        end
+        return ""
+    end
+    if sub == "add" is
+        if args.len() < 2 is return "Usage: hammer key add <url>" end
+        let r: gpg::ImportKeyResult = gpg::import_key(args[1], download::client_new())
+        if !r.ok is return r.err end
+        write("  " + ui::bright_green("✔") + " Imported: " + ui::bold(r.key.name))
+        return ""
+    end
+    if sub == "remove" || sub == "rm" is
+        if args.len() < 2 is return "Usage: hammer key remove <fp>" end
+        let kl2: gpg::KeyringLoad = gpg::db_load()
+        if kl2.err != "" is return kl2.err end
+        let rr: gpg::RemoveResult = gpg::db_remove(kl2.db, args[1])
+        if rr.removed is
+            let se: string = gpg::db_save(rr.db)
+            if se != "" is return se end
+            write("  " + ui::bright_green("✔") + " Key removed.")
+        else is
+            write("  " + ui::dim("·") + " Key not found.")
+        end
+        return ""
+    end
+    return "Unknown key subcommand: '" + sub + "'. Try: list, add, remove"
+end
+
+;; ── gc / clean ───────────────────────────────────────────────────────────
+
+pub fn cmd_gc(args: [string]) -> string is
+    ;; `split('=').nth(1)` (patrz odejscie 12)
+    let mut keep: int = 3
+    let mut i: int = 0
+    while i < args.len() is
+        if string_starts_with(args[i], "--keep") is
+            let parts: [string] = str::split(args[i], "=")
+            if parts.len() > 1 && str::is_numeric(parts[1]) is keep = conv::str_to_int(parts[1]) end
+            i = args.len()
+        else is
+            i += 1
+        end
+    end
+    let yes: bool = cli_types::has_flag(args, "-y")
+
+    let lk: lock::LockResult = take_lock()
+    if lk.err != "" is return lk.err end
+    let e: string = gc_inner(keep, yes)
+    lock::lock_release(lk.lock)
+    return e
+end
+
+fn gc_inner(keep: int, yes: bool) -> string is
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let mut gdb: profile::GenerationsDb = lr.db
+    let ao: int? = profile::read_active_gen()
+    let active: int = if ao == nil then gdb.current else ao
+    let pending: int? = profile::read_pending_gen()
+
+    ;; kandydaci: bez aktywnej i oczekujacej, malejaco po numerze
+    let mut cands: [profile::Generation] = []
+    let mut i: int = 0
+    while i < gdb.generations.len() is
+        let g: profile::Generation = gdb.generations[i]
+        let is_pending: bool = pending != nil && pending == g.number
+        if g.number != active && !is_pending is cands.push(g) end
+        i += 1
+    end
+    let mut sorted_c: [profile::Generation] = []
+    let mut used: [bool] = []
+    let mut u: int = 0
+    while u < cands.len() is
+        used.push(false)
+        u += 1
+    end
+    let mut n: int = 0
+    while n < cands.len() is
+        let mut best: int = -1
+        let mut k: int = 0
+        while k < cands.len() is
+            if !used[k] && (best < 0 || cands[k].number > cands[best].number) is best = k end
+            k += 1
+        end
+        used[best] = true
+        sorted_c.push(cands[best])
+        n += 1
+    end
+
+    let from: int = if keep < sorted_c.len() then keep else sorted_c.len()
+    let mut to_del: [profile::Generation] = []
+    let mut d: int = from
+    while d < sorted_c.len() is
+        to_del.push(sorted_c[d])
+        d += 1
+    end
+    if to_del.len() == 0 is
+        write("  " + ui::dim("·") + " Nothing to collect.")
+        return ""
+    end
+    let mut m: int = 0
+    while m < to_del.len() is
+        write("    gen-" + to_string(to_del[m].number))
+        m += 1
+    end
+    if !yes && !ui::confirm("Proceed?") is
+        write("  Aborted.")
+        return ""
+    end
+
+    let mut del_nums: [int] = []
+    let mut x: int = 0
+    while x < to_del.len() is
+        let de: string = profile::delete_profile(to_del[x])
+        if de != "" is return de end
+        del_nums.push(to_del[x].number)
+        x += 1
+    end
+    let mut kept: [profile::Generation] = []
+    let mut y: int = 0
+    while y < gdb.generations.len() is
+        let mut drop: bool = false
+        let mut z: int = 0
+        while z < del_nums.len() is
+            if del_nums[z] == gdb.generations[y].number is drop = true end
+            z += 1
+        end
+        if !drop is kept.push(gdb.generations[y]) end
+        y += 1
+    end
+    gdb.generations = kept
+
+    let mut referenced: [string] = []
+    let mut r: int = 0
+    while r < gdb.generations.len() is
+        let mut pi: int = 0
+        while pi < gdb.generations[r].packages.len() is
+            let p: profile::GenPackage = gdb.generations[r].packages[pi]
+            referenced.push(p.name + "-" + p.version + "-" + p.store_hash)
+            pi += 1
+        end
+        r += 1
+    end
+    let ge: string = store::gc_unreferenced_pkgs(referenced)
+    if ge != "" is return ge end
+    let se: string = profile::db_save(gdb)
+    if se != "" is return se end
+    grub::update_grub(gdb)
+    write("  " + ui::bright_green("✔") + " Garbage collection complete.")
+    return ""
+end
+
+pub fn cmd_clean() -> string is
+    let r: download::CacheResult = download::clean_cache()
+    if r.err != "" is return r.err end
+    write("  " + ui::bright_green("✔") + " Removed " + to_string(r.count) + " cached archive(s).")
+    return ""
+end
+
+;; ── init / relink / store / _activate ────────────────────────────────────
+
+pub fn cmd_init(args: [string]) -> string is
+    if cli_types::has_flag(args, "--user") is
+        let er: userenv::EnvResult = userenv::user_env_current()
+        if er.err != "" is return er.err end
+        let ie: string = userenv::user_env_init(er.env)
+        if ie != "" is return ie end
+        return cli_user::cmd_user_shell_init(er.env)
+    end
+    let sv: string? = cli_types::flag_value(args, "--suite=")
+    let suite: string = if sv == nil then "bookworm" else sv
+    write("  " + ui::bold(ui::cyan("::")) + " Initialising hammer " + build_mode::hammer_version() + " (suite: " + ui::bold(suite) + ")…")
+
+    let dirs: [string] = ["/hammer/store", "/hammer/profiles", "/hammer/db", "/hammer/db/postinst",
+        "/etc/hammer", "/etc/hammer/HackerOS", "/var/cache/hammer/archives",
+        "/var/lib/hammer/lists", "/usr/lib/hammer", "/usr/lib/HackerOS/hammer"]
+    let mut i: int = 0
+    while i < dirs.len() is
+        proc::shell("mkdir -p " + shq(dirs[i]))
+        if !fs::is_dir(dirs[i]) is return "Cannot create " + dirs[i] end
+        write("  " + ui::dim("·") + " " + ui::dim(dirs[i]))
+        i += 1
+    end
+    let arch: string = cache::detect_arch()
+    if !fs::exists(repo::sources_hk()) is
+        let we: string = repo::write_default(arch, suite)
+        if we != "" is return we end
+        write("  " + ui::green("✔") + " Wrote " + repo::sources_hk())
+    end
+    let ae: string = profile::install_activate_service()
+    if ae != "" is return ae end
+    let ie: string = immutable::install_immutable_service()
+    if ie != "" is return ie end
+    if !fs::exists(profile::generations_file()) is
+        let se: string = profile::db_save(profile::db_empty())
+        if se != "" is return se end
+    end
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let ge: string = grub::update_grub(lr.db)
+    if ge != "" is
+        write("  " + ui::yellow("·") + " GRUB: " + ui::dim(ge) + " (non-fatal)")
+    end
+    write("")
+    write("  " + ui::bright_green_bold("✔") + " hammer " + build_mode::hammer_version() + " initialised.")
+    write("    1. " + ui::cyan("hammer key add https://ftp-master.debian.org/keys/archive-key-12.gpg"))
+    write("    2. " + ui::cyan("hammer sync"))
+    write("    3. " + ui::cyan("hammer install <pkg>"))
+    return ""
+end
+
+pub fn cmd_relink() -> string is
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let gdb: profile::GenerationsDb = lr.db
+    let ao: int? = profile::read_active_gen()
+    let n: int = if ao == nil then gdb.current else ao
+    let go: profile::Generation? = profile::db_get(gdb, n)
+    if go == nil is return "Active generation " + to_string(n) + " not found" end
+    let gen: profile::Generation = go
+    let pp: string = profile::gen_profile_path(gen)
+    if !fs::exists(pp) is return "Profile missing: " + pp + "\n  Try: hammer _activate" end
+
+    write("  " + ui::accent_bold("⬡") + "  Relinking binaries for gen-" + to_string(n) + "…")
+    let rr: profile::RelinkResult = profile::relink_bins(pp)
+    if rr.err != "" is return "relink failed: " + rr.err end
+    write("  " + ui::bright_green_bold("✔") + " Linked: " + ui::bold(to_string(rr.linked)) + "  Removed: " + ui::dim(to_string(rr.removed)))
+    if rr.linked == 0 is
+        write("  " + ui::dim("·") + " No binaries to link.")
+    else is
+        write("  Packages in PATH. Run " + ui::cyan("hash -r") + " if shell can't find them.")
+    end
+    return ""
+end
+
+pub fn cmd_store() -> string is
+    let s: string = "/usr/share/hammer/store"
+    if !fs::exists(s) is
+        return "Hammer Store not installed. Run: " + ui::cyan("hammer install hammer-store")
+    end
+    if system(shq(s)) != 0 is return "hammer-store exited with error" end
+    return ""
+end
+
+pub fn cmd_activate_internal() -> string is
+    write("hammer: boot activation starting…")
+    let bg: int? = grub::read_boot_gen()
+    if bg != nil is
+        let n: int = bg
+        write("hammer: GRUB selected gen-" + to_string(n))
+        let lr: profile::LoadResult = profile::db_load()
+        if lr.err != "" is return lr.err end
+        let go: profile::Generation? = profile::db_get(lr.db, n)
+        if go != nil is
+            let g: profile::Generation = go
+            let se: string = profile::set_pending(g)
+            if se != "" is return se end
+        end
+    end
+    let pn: int? = profile::read_pending_gen()
+    if pn != nil is
+        let p: int = pn
+        let ve: string = gpg::verify_boot_integrity(p)
+        if ve != "" is
+            ui::eprint_line("hammer: BOOT INTEGRITY FAILED: " + ve)
+            exit(1)
+        end
+    end
+    let out: profile::ActivateOutcome = profile::activate_pending()
+    if !out.ok is return out.err end
+    ui::print_activation_result(out.result)
+    if out.result.scripts_failed.len() > 0 is
+        ui::eprint_line("hammer: WARNING: postinst failed for: " + str::join(out.result.scripts_failed, ", "))
+    end
+    return ""
+end
+
+;; ── fsck / check ─────────────────────────────────────────────────────────
+
+pub fn cmd_fsck(args: [string]) -> string is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Hammer store filesystem check")
+    write(rule(60))
+
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let all: [db::InstalledPackage] = idb.list_all()
+    let sdir: string = store::store_dir()
+    let mut ok: int = 0
+    let mut bad: int = 0
+    if !fs::exists(sdir) is
+        write("  " + ui::red_bold("!") + " Store directory not found: " + sdir)
+        return ""
+    end
+
+    let mut i: int = 0
+    while i < all.len() is
+        let pkg: db::InstalledPackage = all[i]
+        let entry_name: string = pkg.name + "-" + pkg.version + "-" + pkg.store_hash
+        if fs::exists(compat::path_join(sdir, entry_name)) is
+            write("  " + ui::bright_green("✔") + " " + ui::bold(pkg.name) + "  " + ui::dim(pkg.version))
+            ok += 1
+        else is
+            write("  " + ui::red_bold("✗") + " " + ui::red(pkg.name) + " — store entry missing! (" + entry_name + ")")
+            bad += 1
+        end
+        i += 1
+    end
+
+    write("")
+    if bad == 0 is
+        write("  " + ui::bright_green_bold("✔") + " Store OK: " + to_string(ok) + " entries verified.")
+    else is
+        write("  " + ui::red_bold("✗") + " " + to_string(bad) + " store entr" + count_str(bad, "y", "ies") + " missing. Run: " + ui::cyan("hammer fix-broken"))
+    end
+
+    if cli_types::has_flag(args, "--full") || cli_types::has_flag(args, "-f") is
+        let mut referenced: [string] = []
+        let mut r: int = 0
+        while r < all.len() is
+            referenced.push(all[r].name + "-" + all[r].version + "-" + all[r].store_hash)
+            r += 1
+        end
+        let mut orphans: int = 0
+        let names: [string] = fs::list_dir(sdir)
+        let mut k: int = 0
+        while k < names.len() is
+            if !contains_str(referenced, names[k]) is
+                write("  " + ui::yellow("·") + " orphan: " + ui::dim(names[k]))
+                orphans += 1
+            end
+            k += 1
+        end
+        if orphans > 0 is
+            write("  " + ui::yellow("·") + " " + to_string(orphans) + " orphaned store entr" + count_str(orphans, "y", "ies") + ". Run: " + ui::cyan("hammer gc"))
+        end
+    end
+    return ""
+end
+
+pub fn cmd_check(args: [string]) -> string is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Package integrity check")
+    write(rule(60))
+
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+    let all: [db::InstalledPackage] = idb.list_all()
+    let names: [string] = cli_types::non_flag_args(args)
+
+    let mut to_check: [db::InstalledPackage] = []
+    let mut i: int = 0
+    while i < all.len() is
+        if names.len() == 0 || contains_str(names, all[i].name) is to_check.push(all[i]) end
+        i += 1
+    end
+
+    let mut issues: int = 0
+    let mut k: int = 0
+    while k < to_check.len() is
+        let pkg: db::InstalledPackage = to_check[k]
+        let mut pkg_issues: [string] = []
+        let avail: package::Package? = cache::cache_get(c, pkg.name)
+        if avail == nil is pkg_issues.push("not in any configured repository (orphan)") end
+        let sd: string = compat::path_join(store::store_dir(), pkg.name + "-" + pkg.version + "-" + pkg.store_hash)
+        if !fs::exists(sd) is pkg_issues.push("store entry missing") end
+        if avail != nil is
+            let a: package::Package = avail
+            if version::compare(a.version, pkg.version) > 0 is pkg_issues.push("update available: " + a.version) end
+        end
+        if pkg_issues.len() == 0 is
+            if args.len() > 0 is
+                write("  " + ui::bright_green("✔") + " " + ui::bold(pkg.name) + "  " + ui::dim(pkg.version))
+            end
+        else is
+            issues += pkg_issues.len()
+            write("  " + ui::yellow_bold("!") + " " + ui::bold(pkg.name) + "  " + ui::dim(pkg.version))
+            let mut m: int = 0
+            while m < pkg_issues.len() is
+                write("      " + ui::dim("·") + " " + ui::yellow(pkg_issues[m]))
+                m += 1
+            end
+        end
+        k += 1
+    end
+
+    write("")
+    if issues == 0 is
+        write("  " + ui::bright_green_bold("✔") + " All " + to_string(to_check.len()) + " package(s) OK.")
+    else is
+        write("  " + ui::yellow_bold("!") + " " + to_string(issues) + " issue(s) found across " + to_string(to_check.len()) + " package(s).")
+        write("  Run " + ui::cyan("hammer fix-broken") + " to fix broken dependencies.")
+    end
+    return ""
+end
+
+;; ── boot ─────────────────────────────────────────────────────────────────
+
+pub fn cmd_boot(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "status"
+    if sub == "status" is
+        write("")
+        write("  " + ui::accent_bold("⬡") + "  Boot status")
+        write(rule(50))
+        let lr: profile::LoadResult = profile::db_load()
+        if lr.err != "" is return lr.err end
+        let active: int? = profile::read_active_gen()
+        let pending: int? = profile::read_pending_gen()
+        write("  " + ui::bold(fmt::pad_right("Current generation:", 28)) + " " + ui::cyan(if active == nil then "none" else "gen-" + to_string(active)))
+        write("  " + ui::bold(fmt::pad_right("Pending (next boot):", 28)) + " " + ui::yellow(if pending == nil then "none" else "gen-" + to_string(pending)))
+        write("  " + ui::bold(fmt::pad_right("GRUB status:", 28)) + " " + ui::dim(grub::grub_status()))
+        let bg: int? = grub::read_boot_gen()
+        if bg != nil is
+            let n: int = bg
+            write("  " + ui::bold(fmt::pad_right("GRUB selected:", 28)) + " gen-" + ui::cyan(to_string(n)))
+        end
+        write("")
+        return ""
+    end
+    if sub == "activate" is
+        write("  " + ui::accent_bold("⬡") + " Activating pending generation…")
+        let out: profile::ActivateOutcome = profile::activate_pending()
+        if !out.ok is return out.err end
+        ui::print_activation_result(out.result)
+        return ""
+    end
+    if sub == "fallback" is
+        write("  " + ui::bright_yellow_bold("⬡") + " Triggering boot fallback…")
+        return boot_fallback::apply_fallback()
+    end
+    if sub == "update-grub" is
+        let lr2: profile::LoadResult = profile::db_load()
+        if lr2.err != "" is return lr2.err end
+        let ge: string = grub::update_grub(lr2.db)
+        if ge != "" is return ge end
+        write("  " + ui::bright_green("✔") + " GRUB updated.")
+        return ""
+    end
+    return "Unknown boot subcommand: '" + sub + "'\n  Usage: hammer boot [status|activate|fallback|update-grub]"
+end
+
+;; ── why / why-not ────────────────────────────────────────────────────────
+
+pub fn cmd_why(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer why <package>" end
+    let name: string = args[0]
+    let c: cache::PackageCache = cache::cache_load()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let s: solver::Solver = solver::solver_new(c, idb)
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Why is '" + ui::bold(name) + "' installed?")
+    write(rule(60))
+    if !idb.is_installed(name) is
+        write("  " + ui::dim("·") + " '" + name + "' is not installed.")
+        return ""
+    end
+    let reasons: [string] = explain::why_installed(s, name)
+    if reasons.len() == 0 is
+        write("  " + ui::dim("·") + " No dependents found — possibly a manually installed package.")
+    else is
+        let mut i: int = 0
+        while i < reasons.len() is
+            write("  " + ui::dim("·") + " " + ui::cyan(reasons[i]))
+            i += 1
+        end
+    end
+    let io: db::InstalledPackage? = idb.get(name)
+    if io != nil is
+        let inst: db::InstalledPackage = io
+        write("")
+        let reason_str: string = if db::reason_to_str(inst.reason) == "user" then ui::green("manually installed") else ui::yellow("installed as dependency")
+        write("  " + ui::bold(fmt::pad_right("Install reason:", 28)) + " " + reason_str)
+        write("  " + ui::bold(fmt::pad_right("Version:", 28)) + " " + ui::cyan(inst.version))
+    end
+    return ""
+end
+
+pub fn cmd_why_not(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer why-not <package>" end
+    let name: string = args[0]
+    let c: cache::PackageCache = cache::cache_load()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let s: solver::Solver = solver::solver_new(c, idb)
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Why not installable: '" + ui::bold(name) + "'")
+    write(rule(60))
+    if idb.is_installed(name) is
+        let io: db::InstalledPackage? = idb.get(name)
+        let v: string = if io == nil then "" else io.version
+        write("  " + ui::cyan("ℹ") + " '" + name + "' is already installed (" + ui::dim(v) + ")")
+        return ""
+    end
+    write(explain::explain_failure(s, name))
+    return ""
+end
+
+;; ── daemon: patrz `hammerd/hd_daemon.h#` ────────────────────────────────
+
+pub fn cmd_daemon(args: [string]) -> string is
+    return hd_daemon::cmd_daemon(args)
+end
+
+;; ── db ───────────────────────────────────────────────────────────────────
+
+pub fn cmd_db(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "help"
+
+    if sub == "validate-json" || sub == "validate" is
+        let idb: db::InstalledDb = db::InstalledDb::open()
+        write("")
+        write("  " + ui::accent_bold("⬡") + "  DB Integrity check")
+        write(rule(40))
+        let r: db::JsonSyncResult = idb.validate_json_sync()
+        if r.err != "" is
+            write("  " + ui::red("✗") + " Could not validate: " + r.err)
+        elsif r.only_sqlite.len() == 0 && r.only_json.len() == 0 is
+            write("  " + ui::bright_green("✔") + " SQLite and JSON are in sync (" + ui::bold(to_string(idb.count())) + " packages).")
+        else is
+            if r.only_sqlite.len() > 0 is
+                write("  " + ui::yellow("⚠") + " Only in SQLite (" + to_string(r.only_sqlite.len()) + "):")
+                let mut i: int = 0
+                while i < r.only_sqlite.len() is
+                    write("       " + ui::yellow(r.only_sqlite[i]))
+                    i += 1
+                end
+            end
+            if r.only_json.len() > 0 is
+                write("  " + ui::yellow("⚠") + " Only in JSON (" + to_string(r.only_json.len()) + "):")
+                let mut j: int = 0
+                while j < r.only_json.len() is
+                    write("       " + ui::yellow(r.only_json[j]))
+                    j += 1
+                end
+            end
+            write("")
+            write("  Run " + ui::cyan("hammer db export-json") + " to fix.")
+        end
+        write("")
+        return ""
+    end
+
+    if sub == "export-json" || sub == "export" is
+        let idb2: db::InstalledDb = db::InstalledDb::open()
+        let e: string = idb2.export_json()
+        if e != "" is return e end
+        write("  " + ui::bright_green("✔") + " Exported " + ui::bold(to_string(idb2.count())) + " packages to " + ui::cyan(db::json_path()) + ".")
+        return ""
+    end
+
+    if sub == "import-json" || sub == "import" is
+        let path: string = if args.len() > 1 then args[1] else db::json_path()
+        let idb3: db::InstalledDb = db::InstalledDb::open()
+        let r2: db::ImportJsonResult = idb3.import_json(path)
+        if r2.err != "" is return r2.err end
+        write("  " + ui::bright_green("✔") + " Imported " + ui::bold(to_string(r2.count)) + " packages from " + ui::cyan(path) + ".")
+        return ""
+    end
+
+    if sub == "recover" is
+        let rec: db::OpenRecovery = db::recover_from_json()
+        if rec.err != "" is return rec.err end
+        if rec.recovered == 0 is
+            write("  " + ui::bright_green("✔") + " SQLite is healthy — no recovery needed.")
+        else is
+            write("  " + ui::bright_green("✔") + " Recovered " + ui::bold(to_string(rec.recovered)) + " packages from JSON snapshot.")
+        end
+        return ""
+    end
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  hammer db — database utilities")
+    write("")
+    write("  " + ui::cyan("validate-json") + "  Validate SQLite↔JSON sync")
+    write("  " + ui::cyan("export-json") + "    Export SQLite → JSON snapshot")
+    write("  " + ui::cyan("import-json [path]") + "    Import JSON snapshot → SQLite")
+    write("  " + ui::cyan("recover") + "         Recover SQLite from JSON backup")
+    write("")
+    return ""
+end
