@@ -1,0 +1,256 @@
+use "std -> fs"   from "fs"
+use "std -> env"  from "env"
+use "std -> fmt"  from "fmt"
+use "bit -> colors"
+
+;; hammer -> internal::build_mode
+;;
+;; Port of source-code/internal/build_mode.rs (Rust) to H#.
+;; Tryb budowy (atomic / normal), sciezki stanu hammera i dostepnosc funkcji.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;;
+;; 1. BRAK `cfg!(feature = ...)`. W Rust tryb `normal-mode` i `oci-mode`
+;;    to cechy Cargo wybierane w czasie kompilacji. H# nie ma kompilacji
+;;    warunkowej, wiec tryb jest ustalany tak:
+;;      a) zmienna srodowiskowa `HAMMER_MODE` = `normal` | `atomic`
+;;         (i `HAMMER_OCI` = `1`/`0`) — ma pierwszenstwo, przydatna w
+;;         kontenerach/chroot bez przebudowy;
+;;      b) w przeciwnym razie wartosc "wkompilowana" z `compiled_mode()` /
+;;         `compiled_oci()` ponizej. Komendy `bit build-normal` i
+;;         `bit build-oci` z `Bit.hk` podmieniaja te dwie linie (sed) przed
+;;         budowa — to najblizszy odpowiednik `--features` bez cfg.
+;; 2. `NORMAL_MODE`, `MODE_LABEL`, `BINARY_DESCRIPTION` to funkcje (nie
+;;    stale), bo zaleza od trybu ustalanego jak wyzej.
+;; 3. `PathBuf` -> `string`, `.join()` -> `path::join`.
+;; 4. `anyhow::Result<()>` -> `string`: "" = Ok, niepusty tekst = Err(msg).
+;;    (Ta sama konwencja bedzie uzywana w kolejnych portach `internal/`
+;;    i `pkg/`, dopoki nie ma wspolnego typu wyniku.)
+;; 5. Kolory `owo_colors` -> lokalne pomocniki (`bright_cyan`,
+;;    `bright_green`) nad ANSI; `ui.rs` nie jest jeszcze przepisany.
+
+;; ── Wkompilowane domyslne (patrz odejscie 1b) ────────────────────────────
+;; BUILD-MODE-DEFAULT: nie zmieniaj formatu tych dwoch linii recznie —
+;; `bit build-normal` / `bit build-oci` je przepisuja sedem.
+
+fn compiled_mode() -> string is return "normal" end
+
+fn compiled_oci() -> bool is return false end
+
+;; ── Tryb ─────────────────────────────────────────────────────────────────
+
+;; `true` -> normal-mode (atomowosc wylaczona), `false` -> atomic (domyslnie).
+;; Wersja hammera (Rust: `env!("CARGO_PKG_VERSION")`); trzymac zgodnie z Bit.hk.
+pub fn hammer_version() -> string is return "0.5.0" end
+
+pub fn normal_mode() -> bool is
+    let m: string = env::get_or("HAMMER_MODE", compiled_mode())
+    return m == "normal"
+end
+
+pub fn oci_mode() -> bool is
+    let v: string = env::get_or("HAMMER_OCI", "")
+    if v == "1" is return true end
+    if v == "0" is return false end
+    return compiled_oci()
+end
+
+pub fn mode_label() -> string is
+    if normal_mode() is return "normal" end
+    return "atomic"
+end
+
+pub fn binary_description() -> string is
+    if normal_mode() is return "hammer (normal-mode) — HackerOS package manager" end
+    return "hammer (atomic)      — HackerOS atomic package manager"
+end
+
+;; `true` gdy funkcje atomowe (immutable FS, magazyn generacji) sa aktywne.
+pub fn atomic_enabled() -> bool is
+    return !normal_mode()
+end
+
+;; ── Kolory (lokalne, patrz odejscie 5) ───────────────────────────────────
+
+fn bright_cyan(s: string) -> string is return colors::bright_cyan(s) end
+
+fn bright_green(s: string) -> string is return colors::bright_green(s) end
+
+fn bold_cyan(s: string) -> string is return colors::bold(colors::bright_cyan(s)) end
+
+fn bold_yellow(s: string) -> string is return colors::bold(colors::yellow(s)) end
+
+;; Jednolinijkowy baner trybu (uzywany w `hammer version`).
+pub fn print_mode_banner() is
+    if normal_mode() is
+        write("  " + colors::dim("·") + " Build mode : " + bold_yellow("normal") +
+              "  (atomicity and immutable FS disabled)")
+    else is
+        write("  " + colors::dim("·") + " Build mode : " + bold_cyan("atomic") +
+              "  (immutable FS + generation rollback active)")
+    end
+end
+
+;; Straznik komend majacych sens tylko z backendem atomowym (`hammer gen`,
+;; `rollback`, `pending`, `undo`) — wolac PRZED dotknieciem stanu generacji.
+;; Zwraca "" gdy mozna isc dalej, w przeciwnym razie tekst bledu.
+pub fn require_atomic(op: string) -> string is
+    if normal_mode() is
+        return op + " is only available in the atomic build of hammer (generations " +
+            "+ immutable store).\n  This binary was built in normal-mode, " +
+            "which has no generation history to roll back to or pending state to track.\n  " +
+            "For classic apt-style installs, use 'hammer history' to see what changed " +
+            "and reinstall the previous version manually if needed."
+    end
+    if !fs::exists("/hammer/store") is
+        return op + " requires the hammer store to be initialised.\n  Run: hammer init"
+    end
+    return ""
+end
+
+;; ── Sciezki (centralny resolver) ─────────────────────────────────────────
+;;
+;; Wszystkie sciezki `/hammer/...` MUSZA isc przez ten resolver, zeby
+;; normal-mode dzialal na zywym systemie bez zamontowanego `/hammer/`.
+;;   atomic  -> /hammer/...          (zainstalowany HackerOS)
+;;   normal  -> /var/lib/hammer/...  (FHS, bez wymagan wobec root FS)
+;; `HAMMER_ROOT` przesłania baze (np. z chroot-a):
+;;   HAMMER_ROOT=/mnt/target hammer install curl
+
+pub fn base_dir() -> string is
+    let root: string = env::get_or("HAMMER_ROOT", "")
+    if root != "" is return root end
+    if normal_mode() is return "/var/lib/hammer" end
+    return "/hammer"
+end
+
+;; Rust: `staging_dir()` — atomic: /hammer/tmp, normal: /tmp/hammer.
+pub fn staging_dir() -> string is
+    if normal_mode() is return "/tmp/hammer" end
+    return "/hammer/tmp"
+end
+
+;; Rust: `db_path()` — atomic: /hammer/db/packages.sqlite,
+;; normal: /var/lib/hammer/db.sqlite.
+pub fn db_path() -> string is
+    if normal_mode() is return "/var/lib/hammer/db.sqlite" end
+    return "/hammer/db/packages.sqlite"
+end
+
+;; Plik statusu dpkg (zgodnosc w normal-mode).
+pub fn dpkg_status_path() -> string is
+    return "/var/lib/dpkg/status"
+end
+
+pub fn db_dir() -> string is return compat::path_join(base_dir(), "db") end
+
+pub fn store_dir() -> string is return compat::path_join(base_dir(), "store") end
+
+pub fn profiles_dir() -> string is return compat::path_join(base_dir(), "profiles") end
+
+pub fn conffiles_dir() -> string is return compat::path_join(db_dir(), "conffiles") end
+
+pub fn generations_file() -> string is return compat::path_join(db_dir(), "generations.json") end
+
+pub fn boot_hash_file() -> string is return compat::path_join(db_dir(), "boot-hashes.json") end
+
+pub fn boot_attempts_file() -> string is return compat::path_join(db_dir(), "boot-attempts.json") end
+
+pub fn sources_file() -> string is return compat::path_join(db_dir(), "sources-list.hk") end
+
+;; Tworzy cala hierarchie katalogow hammera (`hammer init` albo leniwie).
+;; "" = Ok, inaczej komunikat bledu jak w Rust ("Cannot create <dir>: ...").
+pub fn ensure_dirs() -> string is
+    let dirs: [string] = [
+        base_dir(),
+        db_dir(),
+        store_dir(),
+        profiles_dir(),
+        conffiles_dir(),
+        compat::path_join(base_dir(), "cache"),
+        compat::path_join(base_dir(), "tmp"),
+        compat::path_join(base_dir(), "hk_store")
+    ]
+    let mut i: int = 0
+    while i < dirs.len() is
+        let d: string = dirs[i]
+        if !fs::exists(d) is
+            ;; fs::mkdir tworzy takze katalogi posrednie (create_dir_all)
+            fs::mkdir(d)
+            if !fs::is_dir(d) is
+                return "Cannot create " + d + ": mkdir failed"
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; ── Dostepnosc funkcji (w czasie dzialania, nie kompilacji) ──────────────
+
+pub struct Features is
+    pub atomicity:    bool
+    pub immutable_fs: bool
+    pub generations:  bool
+    pub ro_store:     bool
+    pub snapshots:    bool
+    pub sat_solver:   bool
+    pub gpg_verify:   bool
+    pub multi_arch:   bool
+    pub pinning:      bool
+    pub services:     bool
+    pub sandbox:      bool
+    pub doctor:       bool
+    pub oci_mode:     bool
+end
+
+pub fn features_current() -> Features is
+    let atomic: bool = !normal_mode()
+    return Features {
+        atomicity:    atomic,
+        immutable_fs: atomic,
+        generations:  atomic,
+        ro_store:     atomic,
+        snapshots:    atomic,
+        sat_solver:   true,
+        gpg_verify:   true,
+        multi_arch:   true,
+        pinning:      true,
+        services:     true,
+        sandbox:      true,
+        doctor:       true,
+        oci_mode:     oci_mode()
+    }
+end
+
+fn mark(b: bool) -> string is
+    if b is return bright_green("✔") end
+    return colors::dim("✘")
+end
+
+pub fn features_print(f: Features) is
+    let mode_name: string = if normal_mode() then "normal-mode" else "atomic (default)"
+    write("  " + colors::bold("Build mode:") + " " + bold_cyan(mode_name))
+    if normal_mode() is
+        write("    Classic apt-style installs — works on any system, including containers.")
+    else is
+        write("    Generations + immutable store — requires HackerOS installed to disk;")
+        write("    will refuse to run in a live/container environment. For containers, use")
+        write("    HAMMER_MODE=normal or a binary built with 'bit build-normal'.")
+    end
+    write("")
+
+    write("  " + colors::bold("Feature flags:"))
+    write("    " + mark(f.atomicity)    + " Atomicity & generation rollback")
+    write("    " + mark(f.immutable_fs) + " Immutable filesystem (btrfs/zfs/remount)")
+    write("    " + mark(f.ro_store)     + " Read-only hammer store")
+    write("    " + mark(f.snapshots)    + " Btrfs/ZFS snapshots")
+    write("    " + mark(f.sat_solver)   + " CDCL SAT dependency solver")
+    write("    " + mark(f.gpg_verify)   + " GPG/Ed25519 signature verification")
+    write("    " + mark(f.multi_arch)   + " Multi-arch (amd64/arm64/…)")
+    write("    " + mark(f.pinning)      + " Package pinning")
+    write("    " + mark(f.services)     + " Service management (systemd)")
+    write("    " + mark(f.sandbox)      + " Namespace sandbox (seccomp + namespaces)")
+    write("    " + mark(f.doctor)       + " System doctor & self-repair")
+    write("    " + mark(f.oci_mode)     + " 'hammer oci' — OSTree+OCI image-based deployments")
+end
