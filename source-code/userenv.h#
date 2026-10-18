@@ -1,0 +1,312 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> env"     from "env"
+
+mod pkg
+mod internal
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+;; [mod deb pominiete: source-code/pkg/deb.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania deb::fn dzialaja bez zmian]
+;; [mod store pominiete: source-code/pkg/store.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania store::fn dzialaja bez zmian]
+
+;; hammer -> userenv   (CZESCIOWY port source-code/userenv.rs)
+;;
+;; Przepisane TYLKO funkcje architektur, potrzebne przez `pkg/multi_arch`:
+;; `DEBIAN_ARCHES`, `normalise_arch`, `is_native_arch`.
+;; Reszta (runda 5): `UserEnv` (current/for_home/init/active_path/bin_dirs/
+;; store_entry_path/apply_pending), `UserStore::install_deb`,
+;; `compose_user_profile`, `install_shell_rc`, `dirs_home`.
+;;
+;; `Result<String>` -> `ArchResult { ok, arch, err }`.
+;;
+;; ── Odejscia od oryginalu (czesc userenv z rundy 5) ─────────────────────
+;; 1. `PathBuf` -> `string`; `Result<T>` -> `string` ("" = OK) lub struktura z `err`.
+;; 2. `libc::getpwuid` (fallback gdy brak `$HOME`) -> `getent passwd $(id -u)`.
+;; 3. `UserStore<'a>` (referencja do `UserEnv`) -> funkcje `user_install_deb(env, ..)`.
+;; 4. Skrot wpisu magazynu: Rust brał `sha256(deb.data_bytes)[..4]` (pierwsze 8
+;;    znakow hex); tu `sha256sum` pliku `deb.data_tar` (CZLON `data.tar*` z
+;;    `ar`, czyli bajty jak w .deb) — ten sam zakres danych.
+;; 5. `walkdir` w `compose_entry` -> jedno `find` + petla `sh` (katalogi: `mkdir -p`;
+;;    reszta: `rm -f` + `ln -s`). Nazwy plikow z nowa linia nie sa obslugiwane.
+;; 6. `write_shell_integration`: szablon `format!(r#"..."#)` przeniesiony 1:1
+;;    (`{active}` to zmienna; `${{XDG_DATA_DIRS:-...}}` -> `${XDG_DATA_DIRS:-...}`).
+
+pub fn debian_arches() -> [string] is
+    return ["amd64", "arm64", "armhf", "i386", "riscv64", "ppc64el", "s390x", "mipsel"]
+end
+
+pub struct ArchResult is
+    pub ok:   bool
+    pub arch: string
+    pub err:  string
+end
+
+fn in_list(list: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < list.len() is
+        if list[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Waliduje i normalizuje nazwe architektury (aliasy: x86_64, aarch64, armv7l, i686).
+pub fn normalise_arch(input: string) -> ArchResult is
+    let a0: string = str::to_lower(str::trim(input))
+    let mut a: string = a0
+    if a0 == "x86_64" is a = "amd64" end
+    if a0 == "aarch64" || a0 == "arm64" is a = "arm64" end
+    if a0 == "armv7l" || a0 == "armhf" is a = "armhf" end
+    if a0 == "i686" || a0 == "i386" is a = "i386" end
+
+    if !in_list(debian_arches(), a) is
+        return ArchResult {
+            ok: false, arch: "",
+            err: "Unknown architecture '" + a + "'. Supported: " + str::join(debian_arches(), ", ")
+        }
+    end
+    return ArchResult { ok: true, arch: a, err: "" }
+end
+
+;; Czy biezacy CPU uruchomi `target` bez emulacji.
+pub fn is_native_arch(target: string) -> bool is
+    let native: string = cache::detect_arch()
+    if native == "amd64" && target == "i386" is return true end
+    if native == "arm64" && target == "armhf" is return true end
+    return native == target
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;;  UserEnv — sciezki srodowiska uzytkownika
+;; ═══════════════════════════════════════════════════════════════════════════
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+fn join2(a: string, b: string) -> string is
+    if a == "" is return b end
+    if b == "" is return a end
+    if string_ends_with(a, "/") is return a + b end
+    return a + "/" + b
+end
+
+pub struct UserEnv is
+    pub home:         string
+    pub hammer_dir:   string
+    pub store_dir:    string
+    pub profiles_dir: string
+    pub active_link:  string
+    pub pending_link: string
+    pub db_dir:       string
+    pub db_path:      string
+    pub gens_file:    string
+    pub postinst_dir: string
+end
+
+pub fn user_env_for_home(home: string) -> UserEnv is
+    let hd: string = join2(home, ".hammer")
+    return UserEnv { home: home, hammer_dir: hd, store_dir: join2(hd, "store"), profiles_dir: join2(hd, "profiles"),
+        active_link: join2(hd, "active"), pending_link: join2(hd, "pending"), db_dir: join2(hd, "db"),
+        db_path: join2(join2(hd, "db"), "hammer.db"), gens_file: join2(join2(hd, "db"), "generations.json"),
+        postinst_dir: join2(join2(hd, "db"), "postinst") }
+end
+
+;; Katalog domowy: `$HOME`, potem `getent passwd` (patrz odejscie 2); "" gdy brak.
+pub fn dirs_home() -> string is
+    let h: string = env::get("HOME")
+    if h != "" is return h end
+    let line: string = str::trim(proc::shell("getent passwd $(id -u) 2>/dev/null"))
+    if line == "" is return "" end
+    let parts: [string] = str::split(line, ":")
+    if parts.len() >= 6 is return parts[5] end
+    return ""
+end
+
+pub struct EnvResult is
+    pub env: UserEnv
+    pub err: string
+end
+
+pub fn user_env_current() -> EnvResult is
+    let home: string = dirs_home()
+    if home == "" is return EnvResult { env: user_env_for_home("/"), err: "Cannot determine home directory" } end
+    return EnvResult { env: user_env_for_home(home), err: "" }
+end
+
+pub fn user_active_path(e: UserEnv) -> string is
+    let t: string = str::trim(proc::shell("readlink -- " + shq(e.active_link) + " 2>/dev/null"))
+    if t == "" is return join2(e.profiles_dir, "gen-0") end
+    return t
+end
+
+pub fn user_bin_dirs(e: UserEnv) -> [string] is
+    let a: string = user_active_path(e)
+    return [join2(a, "usr/bin"), join2(a, "usr/sbin"), join2(a, "bin")]
+end
+
+pub fn user_store_entry_path(e: UserEnv, name: string, version: string, hash: string) -> string is
+    return join2(e.store_dir, name + "-" + version + "-" + hash)
+end
+
+fn mkdir_p(p: string) -> bool is
+    proc::shell("mkdir -p " + shq(p))
+    return fs::is_dir(p)
+end
+
+;; Tworzy katalogi, gen-0, dowiazanie `active`, integracje z powloka.
+pub fn user_env_init(e: UserEnv) -> string is
+    let dirs: [string] = [e.store_dir, e.profiles_dir, e.db_dir, e.postinst_dir]
+    let mut i: int = 0
+    while i < dirs.len() is
+        if !mkdir_p(dirs[i]) is return "Creating " + dirs[i] end
+        i += 1
+    end
+    let gen0: string = join2(e.profiles_dir, "gen-0")
+    if !fs::exists(gen0) is
+        let subs: [string] = ["usr/bin", "usr/lib", "usr/share"]
+        let mut k: int = 0
+        while k < subs.len() is
+            if !mkdir_p(join2(gen0, subs[k])) is return "Creating " + join2(gen0, subs[k]) end
+            k += 1
+        end
+    end
+    if !sh_ok("[ -e " + shq(e.active_link) + " ] || [ -L " + shq(e.active_link) + " ]") is
+        if !sh_ok("ln -s " + shq(gen0) + " " + shq(e.active_link)) is return "Cannot link " + e.active_link end
+    end
+    let se: string = write_shell_integration(e)
+    if se != "" is return se end
+    log::info("userenv: initialised at " + e.hammer_dir)
+    return ""
+end
+
+fn write_shell_integration(e: UserEnv) -> string is
+    let active: string = e.active_link
+    let snippet: string = "\n        # hammer user environment — added by `hammer init --user`\n        # Source this file or add to your .bashrc/.zshrc\n        if [ -L \"{{active}}\" ]; then\n            export HAMMER_USER_ACTIVE=\"{{active}}\"\n            export PATH=\"{{active}}/usr/bin:{{active}}/usr/sbin:{{active}}/bin:$PATH\"\n            export LD_LIBRARY_PATH=\"{{active}}/usr/lib:{{active}}/lib:$LD_LIBRARY_PATH\"\n            export XDG_DATA_DIRS=\"{{active}}/usr/share:${{{{XDG_DATA_DIRS:-/usr/local/share:/usr/share}}}}\"\n            fi\n            "
+    let path: string = join2(e.hammer_dir, "env.sh")
+    if !fs::write(path, snippet) is return "Cannot write " + path end
+    log::info("userenv: shell integration at " + path)
+    return ""
+end
+
+;; Aktywuje oczekujaca generacje natychmiast (bez restartu): atomowa podmiana.
+pub fn user_apply_pending(e: UserEnv) -> string is
+    if !sh_ok("[ -L " + shq(e.pending_link) + " ]") is return "" end
+    let target: string = str::trim(proc::shell("readlink -- " + shq(e.pending_link) + " 2>/dev/null"))
+    if target == "" is return "Cannot read " + e.pending_link end
+    let tmp: string = join2(e.hammer_dir, ".active.tmp")
+    proc::shell("rm -f -- " + shq(tmp))
+    if !sh_ok("ln -s " + shq(target) + " " + shq(tmp)) is return "Cannot link " + tmp end
+    if !sh_ok("mv -Tf " + shq(tmp) + " " + shq(e.active_link)) is return "Cannot replace " + e.active_link end
+    proc::shell("rm -f -- " + shq(e.pending_link))
+    log::info("userenv: activated " + target + " immediately")
+    return ""
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;;  Magazyn uzytkownika
+;; ═══════════════════════════════════════════════════════════════════════════
+
+pub struct UserStoreResult is
+    pub entry: store::StoreEntry
+    pub err:   string
+end
+
+fn file_hash8(path: string) -> string is
+    let out: string = str::trim(proc::shell("sha256sum -- " + shq(path) + " 2>/dev/null"))
+    if out == "" is return "" end
+    return str::slice(out, 0, 8)
+end
+
+;; Instaluje rozpakowany .deb do ~/.hammer/store (patrz odejscie 4).
+pub fn user_install_deb(e: UserEnv, pkg: package::Package, d: deb::DebPackage) -> UserStoreResult is
+    let blank: store::StoreEntry = store::StoreEntry { name: pkg.name, version: pkg.version, hash: "", path: "", backend: store::StoreBackend::Hardlink }
+    if !mkdir_p(e.store_dir) is return UserStoreResult { entry: blank, err: "Cannot create " + e.store_dir } end
+
+    let hash: string = file_hash8(d.data_tar)
+    if hash == "" is return UserStoreResult { entry: blank, err: "Cannot hash " + d.data_tar } end
+    let entry_path: string = user_store_entry_path(e, pkg.name, pkg.version, hash)
+    let entry: store::StoreEntry = store::StoreEntry { name: pkg.name, version: pkg.version, hash: hash,
+        path: entry_path, backend: store::StoreBackend::Hardlink }
+
+    if fs::exists(entry_path) is
+        log::info("userstore: " + pkg.name + " already present")
+        return UserStoreResult { entry: entry, err: "" }
+    end
+
+    let tmp_path: string = join2(e.store_dir, ".tmp-" + pkg.name + "-" + pkg.version + "-" + hash)
+    if !mkdir_p(tmp_path) is return UserStoreResult { entry: entry, err: "Cannot create " + tmp_path } end
+    let xr: deb::ExtractResult = deb::extract_data(d, tmp_path)
+    if xr.err != "" is return UserStoreResult { entry: entry, err: xr.err } end
+    if !sh_ok("mv -T " + shq(tmp_path) + " " + shq(entry_path)) is
+        return UserStoreResult { entry: entry, err: "Renaming " + tmp_path + " → " + entry_path }
+    end
+    log::info("userstore: installed " + pkg.name)
+    return UserStoreResult { entry: entry, err: "" }
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;;  Profil uzytkownika
+;; ═══════════════════════════════════════════════════════════════════════════
+
+pub struct ProfileResult is
+    pub path: string
+    pub err:  string
+end
+
+;; Skladanie wpisu: katalogi tworzone, reszta jako dowiazania do magazynu.
+fn compose_entry(profile: string, entry: store::StoreEntry) -> string is
+    let script: string = "cd \"$1\" && find . -mindepth 1 \\( -type d -printf 'd\\t%P\\n' -o -printf 'f\\t%P\\n' \\) | while IFS=\"$(printf '\\t')\" read -r t p; do if [ \"$t\" = d ]; then mkdir -p -- \"$2/$p\"; else mkdir -p -- \"$(dirname -- \"$2/$p\")\"; rm -f -- \"$2/$p\"; ln -s -- \"$1/$p\" \"$2/$p\"; fi; done"
+    if !sh_ok("sh -c " + shq(script) + " sh " + shq(entry.path) + " " + shq(profile)) is
+        return "Composing " + entry.name
+    end
+    return ""
+end
+
+pub fn compose_user_profile(e: UserEnv, gen_number: int, entries: [store::StoreEntry]) -> ProfileResult is
+    let profile_path: string = join2(e.profiles_dir, "gen-" + to_string(gen_number))
+    if !mkdir_p(profile_path) is return ProfileResult { path: profile_path, err: "Cannot create " + profile_path } end
+    let mut i: int = 0
+    while i < entries.len() is
+        let ce: string = compose_entry(profile_path, entries[i])
+        if ce != "" is return ProfileResult { path: profile_path, err: ce + " into user gen-" + to_string(gen_number) } end
+        i += 1
+    end
+    return ProfileResult { path: profile_path, err: "" }
+end
+
+;; ═══════════════════════════════════════════════════════════════════════════
+;;  Pliki rc powloki
+;; ═══════════════════════════════════════════════════════════════════════════
+
+pub struct RcResult is
+    pub modified: [string]
+    pub err:      string
+end
+
+;; Dopisuje linie `source` do .bashrc/.zshrc/.profile (pomija juz zainstalowane).
+pub fn install_shell_rc(e: UserEnv) -> RcResult is
+    let snippet_path: string = join2(e.hammer_dir, "env.sh")
+    let source_line: string = "[ -f \"" + snippet_path + "\" ] && . \"" + snippet_path + "\""
+    let mut modified: [string] = []
+    let rcs: [string] = [".bashrc", ".zshrc", ".profile"]
+    let mut i: int = 0
+    while i < rcs.len() is
+        let rc_path: string = join2(e.home, rcs[i])
+        if fs::exists(rc_path) is
+            let content: string = fs::read(rc_path)
+            if compat::str_index_of(content, "hammer user environment") < 0 is
+                if !fs::write(rc_path, content + "\n" + source_line + "\n") is
+                    return RcResult { modified: modified, err: "Cannot write " + rc_path }
+                end
+                modified.push(rc_path)
+            end
+        end
+        i += 1
+    end
+    return RcResult { modified: modified, err: "" }
+end
