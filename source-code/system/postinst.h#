@@ -1,0 +1,643 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+mod internal
+
+;; hammer -> postinst
+;;
+;; Port of source-code/system/postinst.rs (Rust) to H#: tlumaczenie
+;; skryptow maintainera Debiana (postinst/preinst/postrm) na liste
+;; bezpiecznych `Action` i ich wykonanie.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `enum Action` z danymi (15 wariantow) -> `struct Action` z polem
+;;    `kind` ("create-user", "create-group", "enable-unit", "start-unit",
+;;    "stop-unit", "disable-unit", "daemon-reload", "register-alternative",
+;;    "run-ldconfig", "create-symlink", "create-dir", "set-owner",
+;;    "set-mode", "install-file", "skipped") i wspolnymi polami; kazdy
+;;    `kind` uzywa tylko tych, ktore mial wariant w Rust (patrz `act_*`).
+;;    `Option<String>` -> `string?`, `Option<u32>` -> `int?`.
+;; 2. `PostinstTranslator` (struct z `pkg_name`) -> wolne funkcje; Rust i tak
+;;    nigdzie nie uzywa `pkg_name` poza konstruktorem.
+;; 3. `Command::new(..).args(..).status()` -> `system("<polecenie>")`
+;;    z cytowaniem kazdego argumentu (`shq`); `ok` = kod wyjscia 0.
+;;    `std::os::unix::fs::symlink` -> `ln -s -- src dest`; `fs::copy` ->
+;;    `fs::copy`; `create_dir_all` -> `fs::mkdir` + `fs::is_dir`.
+;; 4. `(Vec<ActionResult>, PostinstResult)` -> `RunOutcome { results, summary }`.
+;; 5. `script.lines()` -> `lines_of` (odrzuca koncowy pusty element i '\r').
+;; 6. ZACHOWANE ZE ZLOGO ZACHOWANIA ORYGINALU (nie "naprawiane" w porcie):
+;;    a) `systemctl daemon-reload` bez dodatkowych argumentow NIE daje
+;;       `DaemonReload` — szukanie `unit` zawodzi (`?`) zanim dojdzie do
+;;       `match`, wiec linia laduje jako `Skipped`. `daemon-reload` z
+;;       argumentem (np. `--user`) tez wpada w `None` (nie ma galezi);
+;;    b) `-r` w `parse_adduser/addgroup` to dopasowanie PODCIAGU w calej
+;;       linii (np. "/var/run" tez da `system = true`);
+;;    c) `update-alternatives --install` z priorytetem nie bedacym liczba
+;;       dostaje 50, ale brak ktoregokolwiek z czterech argumentow = None;
+;;    d) `Action::CreateSymlink/CreateDir/InstallFile` zawsze dopisuja cel do
+;;       `conffiles_created` (CreateDir tylko gdy `ok`).
+
+pub struct Action is
+    pub kind:     string
+    pub name:     string     ;; user/group/unit/alternative name
+    pub flag:     bool       ;; system (user/group) | force (symlink)
+    pub home:     string?
+    pub shell:    string?
+    pub group:    string?
+    pub gid:      int?
+    pub link:     string
+    pub path:     string
+    pub src:      string
+    pub dest:     string
+    pub mode:     string?
+    pub owner:    string?
+    pub priority: int
+    pub line:     string     ;; skipped: original_line
+    pub reason:   string
+end
+
+pub struct ActionResult is
+    pub action:  string
+    pub success: bool
+    pub message: string
+end
+
+;; Wynik uruchomienia postinst — uzywany przez podsumowanie UX.
+pub struct PostinstResult is
+    pub services_enabled:  [string]
+    pub services_started:  [string]
+    pub users_created:     [string]
+    pub conffiles_created: [string]
+    pub warnings:          [string]
+    pub skipped:           int
+end
+
+pub struct RunOutcome is
+    pub results: [ActionResult]
+    pub summary: PostinstResult
+end
+
+pub fn result_default() -> PostinstResult is
+    let a: [string] = []
+    let b: [string] = []
+    let c: [string] = []
+    let d: [string] = []
+    let e: [string] = []
+    return PostinstResult { services_enabled: a, services_started: b, users_created: c,
+        conffiles_created: d, warnings: e, skipped: 0 }
+end
+
+;; ── Konstruktory Action ──────────────────────────────────────────────────
+
+fn act_base(kind: string) -> Action is
+    return Action {
+        kind: kind, name: "", flag: false, home: nil, shell: nil, group: nil, gid: nil,
+        link: "", path: "", src: "", dest: "", mode: nil, owner: nil, priority: 0,
+        line: "", reason: ""
+    }
+end
+
+fn act_name(kind: string, name: string) -> Action is
+    let mut a: Action = act_base(kind)
+    a.name = name
+    return a
+end
+
+fn act_skipped(line: string, reason: string) -> Action is
+    let mut a: Action = act_base("skipped")
+    a.line = line
+    a.reason = reason
+    return a
+end
+
+;; ── Pomocnicze tekstowe ──────────────────────────────────────────────────
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn lines_of(s: string) -> [string] is
+    let parts: [string] = str::split(s, "\n")
+    let mut out: [string] = []
+    let n: int = if parts.len() > 0 && parts[parts.len() - 1] == "" then parts.len() - 1 else parts.len()
+    let mut i: int = 0
+    while i < n is
+        let l: string = parts[i]
+        let ln: int = string_len(l)
+        if ln > 0 && string_at(l, ln - 1) == "\r" is
+            out.push(str::slice(l, 0, ln - 1))
+        else is
+            out.push(l)
+        end
+        i += 1
+    end
+    return out
+end
+
+;; `split_whitespace()`: dowolne biale znaki, bez pustych elementow.
+fn split_ws(s: string) -> [string] is
+    let norm: string = str::replace_all(str::replace_all(s, "\t", " "), "\r", " ")
+    let raw: [string] = str::split(norm, " ")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < raw.len() is
+        if raw[i] != "" is out.push(raw[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn trim_start_matches(s: string, pat: string) -> string is
+    let mut r: string = s
+    let pl: int = string_len(pat)
+    while pl > 0 && r.starts_with(pat) is
+        r = str::slice(r, pl, string_len(r))
+    end
+    return r
+end
+
+fn trim_end_matches(s: string, pat: string) -> string is
+    let mut r: string = s
+    let pl: int = string_len(pat)
+    while pl > 0 && r.ends_with(pat) is
+        r = str::slice(r, 0, string_len(r) - pl)
+    end
+    return r
+end
+
+fn contains(s: string, sub: string) -> bool is
+    return compat::str_index_of(s, sub) >= 0
+end
+
+fn parts_contains(parts: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < parts.len() is
+        if parts[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+fn last_or(parts: [string], default: string) -> string is
+    if parts.len() == 0 is return default end
+    return parts[parts.len() - 1]
+end
+
+fn get_or(parts: [string], i: int, default: string) -> string is
+    if i >= 0 && i < parts.len() is return parts[i] end
+    return default
+end
+
+;; `s.parse::<u32>()` — same cyfry; inaczej `default` (Rust: `unwrap_or`/`.ok()`).
+fn parse_u32_or(s: string, default: int) -> int is
+    if s != "" && str::is_numeric(s) is return conv::str_to_int(s) end
+    return default
+end
+
+;; `extract_flag_from_parts`: `--flag value` albo `--flag=value`.
+;; UWAGA (jak w Rust): flaga jako OSTATNI element => zwraca nil od razu.
+fn extract_flag_from_parts(parts: [string], flag: string) -> string? is
+    let mut i: int = 0
+    while i < parts.len() is
+        let p: string = parts[i]
+        if p == flag is
+            if i + 1 < parts.len() is return parts[i + 1] end
+            return nil
+        end
+        if p.starts_with(flag + "=") is
+            return str::slice(p, string_len(flag) + 1, string_len(p))
+        end
+        i += 1
+    end
+    return nil
+end
+
+fn extract_flag(line: string, flag: string) -> string? is
+    return extract_flag_from_parts(split_ws(line), flag)
+end
+
+;; ── Warunki if ───────────────────────────────────────────────────────────
+
+fn condition_matches_configure(condition: string) -> bool is
+    let c: string = str::trim(condition)
+    if contains(c, "\"configure\"") is return true end
+    if contains(c, "'configure'") is return true end
+    if contains(c, "= configure") is return true end
+    if contains(c, "\"upgrade\"") is return true end
+    if contains(c, "-n \"$2\"") is return true end
+    if contains(c, "-n '$2'") is return true end
+    ;; ogolny `if` bez warunkow specyficznych dla dpkg -> uruchom
+    return !contains(c, "dpkg") && !contains(c, "\"abort") && !contains(c, "remove") && !contains(c, "purge")
+end
+
+;; ── Parsery linii ────────────────────────────────────────────────────────
+
+fn should_skip(line: string) -> bool is
+    return line.starts_with("set ") || line.starts_with("export ") || line.starts_with("then") ||
+        line.starts_with("case ") || line.starts_with("esac") || line.starts_with("for ") ||
+        line.starts_with("done") || line.starts_with("while ") || line.starts_with("do ") ||
+        line.starts_with("local ") || line.starts_with("return ") || line.starts_with("echo ") ||
+        line.starts_with("printf ") || line.starts_with("exit ") || line == "true" ||
+        line == "false" || line.starts_with(":") || line.starts_with("function ") ||
+        line.starts_with("source ") || line.starts_with(". ") || line.starts_with("read ")
+end
+
+fn parse_adduser(line: string) -> Action is
+    let mut a: Action = act_base("create-user")
+    a.flag = contains(line, "--system") || contains(line, "-r")
+    a.home = extract_flag(line, "--home")
+    a.shell = extract_flag(line, "--shell")
+    let g: string? = extract_flag(line, "--ingroup")
+    a.group = if g != nil then g else extract_flag(line, "--gid")
+    a.name = last_or(split_ws(line), "")
+    return a
+end
+
+fn parse_addgroup(line: string) -> Action is
+    let mut a: Action = act_base("create-group")
+    a.flag = contains(line, "--system") || contains(line, "-r")
+    let gid_str: string? = extract_flag(line, "--gid")
+    if gid_str != nil is
+        let gs: string = gid_str
+        if gs != "" && str::is_numeric(gs) is a.gid = conv::str_to_int(gs) end
+    end
+    a.name = last_or(split_ws(line), "")
+    return a
+end
+
+fn ends_with_invoker(p: string) -> bool is
+    return p.ends_with("deb-systemd-invoke") || p.ends_with("invoke-rc.d")
+end
+
+fn parse_systemctl(line: string) -> Action? is
+    let parts: [string] = split_ws(line)
+    let mut start: int = -1
+    let mut i: int = 0
+    while i < parts.len() && start < 0 is
+        if parts[i] == "systemctl" || ends_with_invoker(parts[i]) is start = i end
+        i += 1
+    end
+    if start < 0 is return nil end
+    if start + 1 >= parts.len() is return nil end
+    let subcmd: string = parts[start + 1]
+
+    ;; ostatni argument spelniajacy warunki (iteracja od konca)
+    let mut found: bool = false
+    let mut unit: string = ""
+    let mut k: int = parts.len() - 1
+    while k >= 0 && !found is
+        let p: string = parts[k]
+        if !p.starts_with("-") && p != "systemctl" && !ends_with_invoker(p) && subcmd != p is
+            found = true
+            unit = p
+        end
+        k -= 1
+    end
+    if !found is return nil end
+
+    if subcmd == "enable" is return act_name("enable-unit", unit) end
+    if subcmd == "start" is return act_name("start-unit", unit) end
+    if subcmd == "stop" is return act_name("stop-unit", unit) end
+    if subcmd == "disable" is return act_name("disable-unit", unit) end
+    if subcmd == "daemon-reload" is return act_base("daemon-reload") end
+    return nil
+end
+
+fn parse_alternatives(line: string) -> Action? is
+    if !contains(line, "--install") is return nil end
+    let parts: [string] = split_ws(line)
+    let mut pos: int = -1
+    let mut i: int = 0
+    while i < parts.len() && pos < 0 is
+        if parts[i] == "--install" is pos = i end
+        i += 1
+    end
+    if pos < 0 is return nil end
+    if pos + 4 >= parts.len() is return nil end
+    let mut a: Action = act_base("register-alternative")
+    a.link = parts[pos + 1]
+    a.name = parts[pos + 2]
+    a.path = parts[pos + 3]
+    a.priority = parse_u32_or(parts[pos + 4], 50)
+    return a
+end
+
+fn parse_mkdir(line: string) -> Action is
+    let parts: [string] = split_ws(line)
+    let mut a: Action = act_base("create-dir")
+    let m: string? = extract_flag_from_parts(parts, "-m")
+    a.mode = if m != nil then m else extract_flag_from_parts(parts, "--mode")
+    a.path = last_or(parts, "/")
+    return a
+end
+
+;; Indeks pierwszego elementu nie zaczynajacego sie od '-' i != `cmd`; `fallback` gdy brak.
+fn first_non_flag_idx(parts: [string], cmd: string, fallback: int) -> int is
+    let mut i: int = 0
+    while i < parts.len() is
+        if !parts[i].starts_with("-") && parts[i] != cmd is return i end
+        i += 1
+    end
+    return fallback
+end
+
+fn parse_chown(line: string) -> Action is
+    let parts: [string] = split_ws(line)
+    let mut a: Action = act_base("set-owner")
+    let idx: int = first_non_flag_idx(parts, "chown", 1)
+    a.owner = get_or(parts, idx, "root")
+    a.path = last_or(parts, "/")
+    return a
+end
+
+fn parse_chmod(line: string) -> Action is
+    let parts: [string] = split_ws(line)
+    let mut a: Action = act_base("set-mode")
+    let idx: int = first_non_flag_idx(parts, "chmod", 1)
+    a.mode = get_or(parts, idx, "755")
+    a.path = last_or(parts, "/")
+    return a
+end
+
+fn non_flags(parts: [string], cmd: string) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < parts.len() is
+        if !parts[i].starts_with("-") && parts[i] != cmd is out.push(parts[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn parse_ln(line: string) -> Action is
+    let parts: [string] = split_ws(line)
+    let mut a: Action = act_base("create-symlink")
+    a.flag = parts_contains(parts, "-f") || parts_contains(parts, "--force")
+    let nf: [string] = non_flags(parts, "ln")
+    a.src = get_or(nf, 0, "")
+    a.dest = get_or(nf, 1, "")
+    return a
+end
+
+fn parse_install_cmd(line: string) -> Action is
+    let parts: [string] = split_ws(line)
+    let mut a: Action = act_base("install-file")
+    a.mode = extract_flag_from_parts(parts, "-m")
+    a.owner = extract_flag_from_parts(parts, "-o")
+    let nf: [string] = non_flags(parts, "install")
+    ;; `get(len.saturating_sub(2))`
+    let src_idx: int = if nf.len() >= 2 then nf.len() - 2 else 0
+    a.src = get_or(nf, src_idx, "")
+    a.dest = last_or(nf, "")
+    return a
+end
+
+fn translate_line(line: string) -> Action? is
+    if contains(line, "useradd") || contains(line, "adduser") is return parse_adduser(line) end
+    if contains(line, "groupadd") || contains(line, "addgroup") is return parse_addgroup(line) end
+    if line.starts_with("systemctl") || contains(line, "deb-systemd-invoke") is
+        return parse_systemctl(line)
+    end
+    if line.starts_with("update-alternatives") is return parse_alternatives(line) end
+    if line.starts_with("ldconfig") is return act_base("run-ldconfig") end
+    if line.starts_with("mkdir") is return parse_mkdir(line) end
+    if line.starts_with("chown") is return parse_chown(line) end
+    if line.starts_with("chmod") is return parse_chmod(line) end
+    if line.starts_with("ln ") is return parse_ln(line) end
+    if line.starts_with("install ") is return parse_install_cmd(line) end
+    if line.starts_with("dpkg") || line.starts_with("apt-get") || line.starts_with("apt ") is
+        return act_skipped(line, "polecenie dpkg/apt — pominięte")
+    end
+    return nil
+end
+
+;; ── translate ────────────────────────────────────────────────────────────
+
+;; Tlumaczy skrypt na Actions, obslugujac bloki warunkowe if/else/fi.
+pub fn translate(script: string) -> [Action] is
+    let mut actions: [Action] = []
+    ;; stos blokow: true = Active, false = Skip
+    let mut stack: [bool] = []
+
+    let lines: [string] = lines_of(script)
+    let mut i: int = 0
+    while i < lines.len() is
+        let trimmed: string = str::trim(lines[i])
+        i += 1
+        if trimmed == "" || trimmed.starts_with("#") is
+            ;; pomijamy
+        elsif trimmed.starts_with("if ") || trimmed.starts_with("if\t") is
+            let c1: string = trim_start_matches(trimmed, "if ")
+            let c2: string = trim_start_matches(c1, "if\t")
+            let c3: string = trim_end_matches(c2, "then")
+            let c4: string = trim_end_matches(c3, ";")
+            let condition: string = str::trim(c4)
+            stack.push(condition_matches_configure(condition))
+        elsif trimmed == "else" is
+            if stack.len() > 0 is
+                stack[stack.len() - 1] = !stack[stack.len() - 1]
+            end
+        elsif trimmed == "fi" is
+            if stack.len() > 0 is
+                let mut shrunk: [bool] = []
+                let mut k: int = 0
+                while k < stack.len() - 1 is
+                    shrunk.push(stack[k])
+                    k += 1
+                end
+                stack = shrunk
+            end
+        elsif stack.len() > 0 && !stack[stack.len() - 1] is
+            ;; wewnatrz nieaktywnego bloku
+        elsif should_skip(trimmed) is
+            ;; zawsze pomijane
+        else is
+            let a: Action? = translate_line(trimmed)
+            if a != nil is
+                let act: Action = a
+                actions.push(act)
+            else is
+                actions.push(act_skipped(trimmed, "nieznana komenda"))
+            end
+        end
+    end
+    return actions
+end
+
+;; ── Wykonywanie ──────────────────────────────────────────────────────────
+
+fn sys_ok(cmd: string) -> bool is
+    return system(cmd) == 0
+end
+
+fn user_exists(name: string) -> bool is
+    return sys_ok("id " + shq(name) + " >/dev/null 2>&1")
+end
+
+fn group_exists(name: string) -> bool is
+    if !fs::exists("/etc/group") is return false end
+    let lines: [string] = lines_of(fs::read("/etc/group"))
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i].starts_with(name + ":") is return true end
+        i += 1
+    end
+    return false
+end
+
+fn res(action: string, success: bool, message: string) -> ActionResult is
+    return ActionResult { action: action, success: success, message: message }
+end
+
+fn opt(v: string?) -> string is
+    if v == nil is return "" end
+    let s: string = v
+    return s
+end
+
+fn execute_action(a: Action, summary: PostinstResult) -> ExecOut is
+    let mut sm: PostinstResult = summary
+
+    if a.kind == "create-user" is
+        let mut cmd: string = "adduser"
+        if a.flag is cmd = cmd + " --system" end
+        cmd = cmd + " --no-create-home"
+        if a.home != nil is cmd = cmd + " --home " + shq(opt(a.home)) end
+        if a.shell != nil is cmd = cmd + " --shell " + shq(opt(a.shell)) end
+        if a.group != nil is cmd = cmd + " --ingroup " + shq(opt(a.group)) end
+        cmd = cmd + " " + shq(a.name)
+        let ok: bool = sys_ok(cmd)
+        if ok is sm.users_created.push(a.name) end
+        let msg: string = if ok then "Stworzono użytkownika " + a.name else "Użytkownik " + a.name + " już istnieje lub błąd"
+        return ExecOut { result: res("adduser " + a.name, ok || user_exists(a.name), msg), summary: sm }
+    end
+
+    if a.kind == "create-group" is
+        let mut cmd: string = "addgroup"
+        if a.flag is cmd = cmd + " --system" end
+        if a.gid != nil is
+            let g: int = a.gid
+            cmd = cmd + " --gid " + to_string(g)
+        end
+        cmd = cmd + " " + shq(a.name)
+        let ok: bool = sys_ok(cmd)
+        return ExecOut { result: res("addgroup " + a.name, ok || group_exists(a.name), "Grupa " + a.name), summary: sm }
+    end
+
+    if a.kind == "enable-unit" is
+        let ok: bool = sys_ok("systemctl enable --no-reload " + shq(a.name))
+        if ok is sm.services_enabled.push(a.name) end
+        let msg: string = if ok then "Włączono " + a.name else "Nie udało się włączyć " + a.name
+        return ExecOut { result: res("systemctl enable " + a.name, ok, msg), summary: sm }
+    end
+
+    if a.kind == "start-unit" is
+        let ok: bool = sys_ok("systemctl start " + shq(a.name))
+        if ok is sm.services_started.push(a.name) end
+        let msg: string = if ok then "Uruchomiono " + a.name else "Nie udało się uruchomić " + a.name
+        return ExecOut { result: res("systemctl start " + a.name, ok, msg), summary: sm }
+    end
+
+    if a.kind == "stop-unit" is
+        return ExecOut { result: res("systemctl stop " + a.name, sys_ok("systemctl stop " + shq(a.name)), ""), summary: sm }
+    end
+
+    if a.kind == "disable-unit" is
+        return ExecOut { result: res("systemctl disable " + a.name, sys_ok("systemctl disable " + shq(a.name)), ""), summary: sm }
+    end
+
+    if a.kind == "daemon-reload" is
+        return ExecOut { result: res("daemon-reload", sys_ok("systemctl daemon-reload"), ""), summary: sm }
+    end
+
+    if a.kind == "register-alternative" is
+        let ok: bool = sys_ok("update-alternatives --install " + shq(a.link) + " " + shq(a.name) + " " +
+            shq(a.path) + " " + shq(to_string(a.priority)))
+        return ExecOut { result: res("update-alternatives --install " + a.name, ok, ""), summary: sm }
+    end
+
+    if a.kind == "run-ldconfig" is
+        return ExecOut { result: res("ldconfig", sys_ok("ldconfig"), ""), summary: sm }
+    end
+
+    if a.kind == "create-symlink" is
+        if a.flag is system("rm -f -- " + shq(a.dest)) end
+        let ok: bool = sys_ok("ln -s -- " + shq(a.src) + " " + shq(a.dest) + " 2>/dev/null")
+        sm.conffiles_created.push(a.dest)
+        return ExecOut { result: res("ln -s " + a.src + " " + a.dest, ok, ""), summary: sm }
+    end
+
+    if a.kind == "create-dir" is
+        fs::mkdir(a.path)
+        let ok: bool = fs::is_dir(a.path)
+        if ok is
+            if a.mode != nil is system("chmod " + shq(opt(a.mode)) + " " + shq(a.path)) end
+            sm.conffiles_created.push(a.path)
+        end
+        return ExecOut { result: res("mkdir -p " + a.path, ok, ""), summary: sm }
+    end
+
+    if a.kind == "set-owner" is
+        let ok: bool = sys_ok("chown -R " + shq(opt(a.owner)) + " " + shq(a.path))
+        return ExecOut { result: res("chown " + opt(a.owner) + " " + a.path, ok, ""), summary: sm }
+    end
+
+    if a.kind == "set-mode" is
+        let ok: bool = sys_ok("chmod " + shq(opt(a.mode)) + " " + shq(a.path))
+        return ExecOut { result: res("chmod " + opt(a.mode) + " " + a.path, ok, ""), summary: sm }
+    end
+
+    if a.kind == "install-file" is
+        system("cp -- " + shq(a.src) + " " + shq(a.dest) + " 2>/dev/null")
+        if a.mode != nil is system("chmod " + shq(opt(a.mode)) + " " + shq(a.dest)) end
+        if a.owner != nil is system("chown " + shq(opt(a.owner)) + " " + shq(a.dest)) end
+        sm.conffiles_created.push(a.dest)
+        return ExecOut { result: res("install → " + a.dest, true, ""), summary: sm }
+    end
+
+    ;; skipped
+    sm.skipped += 1
+    log::debug("postinst skip [" + a.reason + "]: " + a.line)
+    return ExecOut { result: res("pominięto: " + a.line, true, "(" + a.reason + ")"), summary: sm }
+end
+
+struct ExecOut is
+    pub result:  ActionResult
+    pub summary: PostinstResult
+end
+
+pub fn run(actions: [Action]) -> RunOutcome is
+    let mut results: [ActionResult] = []
+    let mut summary: PostinstResult = result_default()
+    let mut i: int = 0
+    while i < actions.len() is
+        let out: ExecOut = execute_action(actions[i], summary)
+        results.push(out.result)
+        summary = out.summary
+        i += 1
+    end
+    return RunOutcome { results: results, summary: summary }
+end
+
+;; ── Pomocnicze — preinst / postrm ────────────────────────────────────────
+
+;; Uruchom preinst (przed rozpakowaniem paczki).
+pub fn run_preinst(pkg_name: string, script: string) -> PostinstResult is
+    return run(translate(script)).summary
+end
+
+;; Uruchom postrm (po usunieciu paczki): tylko stop/disable serwisow i ldconfig.
+pub fn run_postrm(pkg_name: string, script: string) -> PostinstResult is
+    let lines: [string] = lines_of(script)
+    let mut kept: [string] = []
+    let mut i: int = 0
+    while i < lines.len() is
+        let t: string = str::trim(lines[i])
+        if t.starts_with("systemctl stop") || t.starts_with("systemctl disable") || t.starts_with("ldconfig") is
+            kept.push(lines[i])
+        end
+        i += 1
+    end
+    return run(translate(str::join(kept, "\n"))).summary
+end
