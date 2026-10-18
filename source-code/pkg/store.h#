@@ -1,0 +1,555 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod package
+mod deb
+mod cache
+;; [mod profile pominiete: source-code/system/profile.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania profile::fn dzialaja bez zmian]
+
+;; hammer -> pkg::store
+;;
+;; Port of source-code/pkg/store.rs (Rust) to H#: magazyn pakietow
+;; (/hammer/store/<name>-<version>-<hash>), trzy backendy (btrfs /
+;; hardlink / symlink), skladanie profili generacji, aktywacja, GC.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `pub const STORE_DIR/PROFILES_DIR/ACTIVE_LINK` -> funkcje nad
+;;    `build_mode::` (tryb w czasie dzialania); `StoreV2.store_dir: PathBuf`
+;;    -> `string`.
+;; 2. `Result<T>` -> struktury z polem `err` ("" = Ok) — `InstallResult`,
+;;    `HlResult`, `ActGenResult`, `GcResult`.
+;; 3. **BLAD W ORYGINALE, NAPRAWIONY:** `install_symlink` wolal
+;;    `StoreV2::new().install_deb(..)`, a `new()` ponownie wykrywa backend
+;;    — na systemie, gdzie wykryty zostal `Symlink`, to nieskonczona
+;;    rekurencja (przepelnienie stosu). Tu backend `Symlink` instaluje
+;;    tym samym kodem co `Hardlink` (ekstrakcja do magazynu), tylko
+;;    z etykieta `Symlink` w `StoreEntry` — to jedyne sensowne
+;;    znaczenie komentarza "delegate to old store".
+;; 4. **BLAD W ORYGINALE, NAPRAWIONY:** `copy_tree_cow` wolal
+;;    `cp -a --reflink=auto SRC DEST` przy istniejacym DEST, co kopiuje
+;;    SRC *do srodka* (`DEST/<nazwa-src>/...`) zamiast scalic zawartosc
+;;    (sprawdzone). Profil generacji musi miec `usr/...` na szczycie,
+;;    wiec uzywam `SRC/.` -> `DEST/`.
+;; 5. `hardlink_tree` (walkdir + hard_link + copy fallback + zachowanie
+;;    dowiazan) -> `cp -alnT` z awaryjnym `cp -anT` (kopia, gdy hardlink
+;;    nie przejdzie, np. EXDEV). `-n` = nie nadpisuj istniejacych (jak
+;;    `symlink_metadata().is_ok() => continue`); symlinki zachowane
+;;    (`-a`); katalog docelowy rozwiazywany przez `readlink -m`, bo `cp -T`
+;;    odmawia, gdy DEST jest dowiazaniem do katalogu (np. /bin -> usr/bin).
+;;    Zwracana liczba = liczba zwyklych plikow, ktorych w DEST jeszcze nie
+;;    bylo (liczona PRZED kopiowaniem) — jak `count` w Rust.
+;; 6. `compute_hash`: `sha256(name|version|arch)[..4]` w hex == pierwsze 8
+;;    znakow `crypto::sha256` (hex calosci).
+;; 7. `detect_best_backend` (w Rust martwy kod, nigdzie nie wolany) —
+;;    przepisany dla kompletnosci.
+;; 8. `crate::StoreEntry/StoreBackend` w `to_old_entries` to TE SAME
+;;    typy co w tym module (ten plik jest `crate::store`); konwersja
+;;    sprowadza sie do wymuszenia backendu `Hardlink` — zachowane.
+;; 9. Btrfs: narzedzie `btrfs` wolane przez `system()`; jak w Rust, status
+;;    `property set`/`subvolume delete` jest ignorowany, a nieudane
+;;    `subvolume create` -> `mkdir -p`.
+
+pub fn store_dir() -> string is return build_mode::store_dir() end
+
+pub fn profiles_dir() -> string is return build_mode::profiles_dir() end
+
+pub fn active_link() -> string is return compat::path_join(build_mode::base_dir(), "active") end
+
+pub enum StoreBackend is
+    BtrfsSnapshot   ;; btrfs — natywne subvolumes + snapshoty
+    Hardlink        ;; ext4/xfs/ten sam FS — twarde dowiazania (bez duplikacji danych)
+    Symlink         ;; fallback — dowiazania symboliczne (dziala na kazdym FS, znane problemy)
+end
+
+impl StoreBackend is
+    pub fn name(self) -> string is
+        match self is
+            StoreBackend::BtrfsSnapshot => is return "btrfs-snapshot" end
+            StoreBackend::Hardlink      => is return "hardlink" end
+            StoreBackend::Symlink       => is return "symlink" end
+        end
+    end
+end
+
+fn backend_name(b: StoreBackend) -> string is
+    match b is
+        StoreBackend::BtrfsSnapshot => is return "btrfs-snapshot" end
+        StoreBackend::Hardlink      => is return "hardlink" end
+        StoreBackend::Symlink       => is return "symlink" end
+    end
+    return "symlink"
+end
+
+fn is_btrfs_backend(b: StoreBackend) -> bool is
+    match b is
+        StoreBackend::BtrfsSnapshot => is return true end
+        _ => is return false end
+    end
+end
+
+fn is_symlink_backend(b: StoreBackend) -> bool is
+    match b is
+        StoreBackend::Symlink => is return true end
+        _ => is return false end
+    end
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sys_ok(cmd: string) -> bool is
+    return system(cmd) == 0
+end
+
+fn is_btrfs(p: string) -> bool is
+    return str::trim(proc::shell("stat -f -c %T " + shq(p) + " 2>/dev/null")) == "btrfs"
+end
+
+;; Numer urzadzenia albo "" (Rust: `Option<u64>`).
+fn get_dev_id(p: string) -> string is
+    return str::trim(proc::shell("stat -c %d " + shq(p) + " 2>/dev/null"))
+end
+
+fn same_filesystem(a: string, b: string) -> bool is
+    let da: string = get_dev_id(a)
+    let db: string = get_dev_id(b)
+    return da != "" && da == db
+end
+
+pub fn backend_detect() -> StoreBackend is
+    let sd: string = store_dir()
+    if is_btrfs(sd) && is_btrfs("/usr") is return StoreBackend::BtrfsSnapshot end
+    if same_filesystem(sd, "/usr") is return StoreBackend::Hardlink end
+    return StoreBackend::Symlink
+end
+
+;; Martwy kod w Rust (patrz odejscie 7).
+pub fn detect_best_backend() -> StoreBackend is
+    if fs::exists("/hammer/store") is
+        if str::trim(proc::shell("stat --file-system --format=%T /hammer/store 2>/dev/null")) == "btrfs" is
+            return StoreBackend::BtrfsSnapshot
+        end
+    end
+    return StoreBackend::Hardlink
+end
+
+pub struct StoreEntry is
+    pub name:    string
+    pub version: string
+    pub hash:    string
+    pub path:    string
+    pub backend: StoreBackend
+end
+
+pub struct StoreV2 is
+    pub backend:   StoreBackend
+    pub store_dir: string
+end
+
+pub struct InstallResult is
+    pub ok:    bool
+    pub err:   string
+    pub entry: StoreEntry
+end
+
+pub struct HlResult is
+    pub count: int
+    pub err:   string
+end
+
+pub struct ActGenResult is
+    pub count: int
+    pub err:   string
+end
+
+pub struct GcResult is
+    pub removed: int
+    pub err:     string
+end
+
+;; ── validate_arch / compute_hash ─────────────────────────────────────────
+
+;; "" = Ok, inaczej komunikat bledu.
+pub fn validate_arch(pkg_name: string, pkg_arch: string, sys_arch: string) -> string is
+    if pkg_arch == "all" || pkg_arch == "any" || pkg_arch == "" is return "" end
+    if pkg_arch == sys_arch is return "" end
+    return "Package '" + pkg_name + "' is for architecture '" + pkg_arch + "' but system is '" + sys_arch + "'."
+end
+
+pub fn compute_hash(name: string, version: string, arch: string) -> string is
+    return str::slice(compat::crypto_sha256(name + "|" + version + "|" + arch), 0, 8)
+end
+
+fn entry_name(name: string, version: string, hash: string) -> string is
+    return name + "-" + version + "-" + hash
+end
+
+fn failed_install(err: string) -> InstallResult is
+    return InstallResult {
+        ok: false, err: err,
+        entry: StoreEntry { name: "", version: "", hash: "", path: "", backend: StoreBackend::Hardlink }
+    }
+end
+
+fn done_install(pkg: package::Package, hash: string, p: string, b: StoreBackend) -> InstallResult is
+    return InstallResult {
+        ok: true, err: "",
+        entry: StoreEntry { name: pkg.name, version: pkg.version, hash: hash, path: p, backend: b }
+    }
+end
+
+;; ── Hardlink helpers ─────────────────────────────────────────────────────
+
+;; Liczba zwyklych plikow z `src`, ktorych jeszcze nie ma w `dst`.
+fn count_new_files(src: string, dst: string) -> int is
+    let script: string = "d=$(readlink -m -- " + shq(dst) + "); n=0; " +
+        "while IFS= read -r f; do " +
+        "  if [ ! -e \"$d/$f\" ] && [ ! -L \"$d/$f\" ]; then n=$((n+1)); fi; " +
+        "done <<EOF_LIST\n$(cd " + shq(src) + " 2>/dev/null && find . -type f 2>/dev/null)\nEOF_LIST\necho $n"
+    let out: string = str::trim(proc::shell("sh -c " + shq(script)))
+    if out != "" && str::is_numeric(out) is return conv::str_to_int(out) end
+    return 0
+end
+
+;; `hardlink_tree`: odtwarza strukture `src` w `dst` twardymi dowiazaniami
+;; (kopia, gdy hardlink niemozliwy). Blad: pusty `count` + niepusty `err`.
+pub fn hardlink_tree(src: string, dst: string) -> HlResult is
+    if !fs::exists(src) is return HlResult { count: 0, err: "Hardlinking: source missing: " + src } end
+    let count: int = count_new_files(src, dst)
+    let cmd: string = "d=$(readlink -m -- " + shq(dst) + ") && " +
+        "{ cp -alnT -- " + shq(src) + " \"$d\" 2>/dev/null || cp -anT -- " + shq(src) + " \"$d\" 2>/dev/null; }"
+    if !sys_ok("sh -c " + shq(cmd)) is
+        return HlResult { count: 0, err: "Hardlinking " + src + " into " + dst + " failed" }
+    end
+    return HlResult { count: count, err: "" }
+end
+
+;; Atomowy krok aktywacji: odtwarza pliki z profilu w katalogach systemowych.
+fn apply_hardlinks_to_system(profile_path: string) -> HlResult is
+    let dirs: [string] = ["usr", "bin", "sbin", "lib", "lib64", "opt"]
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < dirs.len() is
+        let src: string = compat::path_join(profile_path, dirs[i])
+        let dst: string = "/" + dirs[i]
+        i += 1
+        if fs::exists(src) is
+            let r: HlResult = hardlink_tree(src, dst)
+            if r.err != "" is
+                return HlResult { count: 0, err: "Applying hardlinks for /" + dirs[i - 1] + ": " + r.err }
+            end
+            count += r.count
+        end
+    end
+    return HlResult { count: count, err: "" }
+end
+
+;; ── Btrfs helpers ────────────────────────────────────────────────────────
+
+fn btrfs_create_subvolume(p: string) -> string is
+    if !sys_ok("btrfs subvolume create " + shq(p) + " >/dev/null 2>&1") is
+        ;; fallback: zwykly mkdir (gdy brak narzedzi btrfs)
+        fs::mkdir(p)
+        if !fs::is_dir(p) is return "Cannot create " + p end
+    end
+    return ""
+end
+
+;; `cp -a --reflink=auto SRC/. DEST/` (CoW na btrfs, zwykla kopia gdzie indziej).
+fn copy_tree_cow(src: string, dst: string) -> string is
+    fs::mkdir(dst)
+    if sys_ok("cp -a --reflink=auto -- " + shq(src + "/.") + " " + shq(dst + "/") + " 2>/dev/null") is return "" end
+    ;; cp --reflink niedostepne — kopia przez hardlink_tree (jak w Rust)
+    return hardlink_tree(src, dst).err
+end
+
+fn btrfs_snapshot(src: string, dst: string) -> string is
+    if sys_ok("btrfs subvolume snapshot " + shq(src) + " " + shq(dst) + " >/dev/null 2>&1") is return "" end
+    log::warn("btrfs snapshot failed, falling back to copy")
+    return copy_tree_cow(src, dst)
+end
+
+fn btrfs_set_readonly(p: string, ro: bool) is
+    let val: string = if ro then "true" else "false"
+    system("btrfs property set -ts " + shq(p) + " ro " + val + " >/dev/null 2>&1")
+end
+
+fn btrfs_delete_subvolume(p: string) is
+    system("btrfs subvolume delete " + shq(p) + " >/dev/null 2>&1")
+end
+
+fn btrfs_set_default_subvolume(p: string) is
+    let text: string = proc::shell("btrfs subvolume show " + shq(p) + " 2>/dev/null")
+    let lines: [string] = str::split(text, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let l: string = str::trim(lines[i])
+        i += 1
+        if l.starts_with("Subvolume ID:") is
+            let parts: [string] = str::split(l, ":")
+            if parts.len() > 1 is
+                let id: string = str::trim(parts[1])
+                system("btrfs subvolume set-default " + shq(id) + " / >/dev/null 2>&1")
+                log::info("btrfs: set-default subvolume " + id)
+            end
+            return
+        end
+    end
+end
+
+;; ── StoreV2 ──────────────────────────────────────────────────────────────
+
+pub fn store_new() -> StoreV2 is
+    let b: StoreBackend = backend_detect()
+    log::info("store_v2: using backend '" + backend_name(b) + "'")
+    return StoreV2 { backend: b, store_dir: store_dir() }
+end
+
+pub fn store_with_backend(b: StoreBackend) -> StoreV2 is
+    return StoreV2 { backend: b, store_dir: store_dir() }
+end
+
+;; Ekstrakcja do magazynu (hardlink i symlink — patrz odejscie 3).
+fn install_extract(s: StoreV2, pkg: package::Package, d: deb::DebPackage, b: StoreBackend, tag: string) -> InstallResult is
+    let verr: string = validate_arch(pkg.name, pkg.architecture, cache::detect_arch())
+    if verr != "" is return failed_install(verr) end
+
+    let hash: string = compute_hash(pkg.name, pkg.version, pkg.architecture)
+    let store_path: string = compat::path_join(s.store_dir, entry_name(pkg.name, pkg.version, hash))
+    if fs::exists(store_path) is return done_install(pkg, hash, store_path, b) end
+
+    ;; ekstrakcja do tmp, potem atomowy rename
+    let tmp_path: string = compat::path_join(s.store_dir, entry_name(pkg.name, pkg.version, hash) + ".tmp")
+    if fs::exists(tmp_path) is
+        if !sys_ok("rm -rf -- " + shq(tmp_path)) is return failed_install("Removing " + tmp_path) end
+    end
+    fs::mkdir(tmp_path)
+    if !fs::is_dir(tmp_path) is return failed_install("Cannot create " + tmp_path) end
+
+    let ex: deb::ExtractResult = deb::extract_data(d, tmp_path)
+    if ex.err != "" is return failed_install("Extracting " + pkg.name + ": " + ex.err) end
+
+    if !sys_ok("mv -T -- " + shq(tmp_path) + " " + shq(store_path) + " 2>/dev/null") is
+        return failed_install("Committing " + pkg.name + " to store")
+    end
+    log::info("store_v2(" + tag + "): installed " + pkg.name + " " + pkg.version + " (" + hash + ")")
+    return done_install(pkg, hash, store_path, b)
+end
+
+fn install_btrfs(s: StoreV2, pkg: package::Package, d: deb::DebPackage) -> InstallResult is
+    let verr: string = validate_arch(pkg.name, pkg.architecture, cache::detect_arch())
+    if verr != "" is return failed_install(verr) end
+
+    let hash: string = compute_hash(pkg.name, pkg.version, pkg.architecture)
+    let store_path: string = compat::path_join(s.store_dir, entry_name(pkg.name, pkg.version, hash))
+    if fs::exists(store_path) is return done_install(pkg, hash, store_path, StoreBackend::BtrfsSnapshot) end
+
+    let cerr: string = btrfs_create_subvolume(store_path)
+    if cerr != "" is return failed_install("Creating btrfs subvolume for " + pkg.name + ": " + cerr) end
+
+    let ex: deb::ExtractResult = deb::extract_data(d, store_path)
+    if ex.err != "" is return failed_install("Extracting " + pkg.name + " to btrfs subvolume: " + ex.err) end
+
+    ;; subwolumen tylko do odczytu (niezmienny magazyn)
+    btrfs_set_readonly(store_path, true)
+    log::info("store_v2(btrfs): installed " + pkg.name + " " + pkg.version + " (" + hash + ")")
+    return done_install(pkg, hash, store_path, StoreBackend::BtrfsSnapshot)
+end
+
+pub fn install_deb(s: StoreV2, pkg: package::Package, d: deb::DebPackage) -> InstallResult is
+    fs::mkdir(s.store_dir)
+    if !fs::is_dir(s.store_dir) is return failed_install("Cannot create " + s.store_dir) end
+    if is_btrfs_backend(s.backend) is return install_btrfs(s, pkg, d) end
+    if is_symlink_backend(s.backend) is
+        return install_extract(s, pkg, d, StoreBackend::Symlink, "symlink")
+    end
+    return install_extract(s, pkg, d, StoreBackend::Hardlink, "hardlink")
+end
+
+;; ── Skladanie profilu generacji ──────────────────────────────────────────
+
+;; Kopia wpisow z backendem wymuszonym na Hardlink (odejscie 8).
+fn to_old_entries(entries: [StoreEntry]) -> [StoreEntry] is
+    let mut out: [StoreEntry] = []
+    let mut i: int = 0
+    while i < entries.len() is
+        let e: StoreEntry = entries[i]
+        out.push(StoreEntry { name: e.name, version: e.version, hash: e.hash, path: e.path, backend: StoreBackend::Hardlink })
+        i += 1
+    end
+    return out
+end
+
+fn compose_failed(num: int, note: string?, err: string) -> profile::ComposeResult is
+    let none: [profile::GenPackage] = []
+    return profile::ComposeResult {
+        generation: profile::Generation { number: num, timestamp: "", packages: none, note: note, state: nil },
+        err: err
+    }
+end
+
+fn compose_done(num: int, pkgs: [profile::GenPackage], note: string?) -> profile::ComposeResult is
+    return profile::ComposeResult {
+        generation: profile::Generation { number: num, timestamp: profile::now_rfc3339(), packages: pkgs, note: note, state: "Pending" },
+        err: ""
+    }
+end
+
+fn compose_hardlink(gen_num: int, entries: [StoreEntry], note: string?) -> profile::ComposeResult is
+    let profile_dir: string = compat::path_join(profiles_dir(), "gen-" + to_string(gen_num))
+    fs::mkdir(profile_dir)
+    if !fs::is_dir(profile_dir) is return compose_failed(gen_num, note, "Cannot create " + profile_dir) end
+
+    let mut pkgs: [profile::GenPackage] = []
+    let mut i: int = 0
+    while i < entries.len() is
+        let e: StoreEntry = entries[i]
+        i += 1
+        if fs::exists(e.path) is
+            let r: HlResult = hardlink_tree(e.path, profile_dir)
+            if r.err != "" is
+                return compose_failed(gen_num, note, "Hardlinking " + e.name + " into gen-" + to_string(gen_num) + ": " + r.err)
+            end
+            pkgs.push(profile::GenPackage { name: e.name, version: e.version, store_hash: e.hash })
+        end
+    end
+    log::info("store_v2(hardlink): composed gen-" + to_string(gen_num) + " (" + to_string(pkgs.len()) + " packages)")
+    return compose_done(gen_num, pkgs, note)
+end
+
+fn compose_btrfs(gen_num: int, entries: [StoreEntry], prev_gen: int?, note: string?) -> profile::ComposeResult is
+    let profile_dir: string = compat::path_join(profiles_dir(), "gen-" + to_string(gen_num))
+
+    let mut made: bool = false
+    if prev_gen != nil is
+        let prev: int = prev_gen
+        let prev_dir: string = compat::path_join(profiles_dir(), "gen-" + to_string(prev))
+        if fs::exists(prev_dir) is
+            ;; snapshot poprzedniej generacji — natychmiastowy (CoW)
+            let serr: string = btrfs_snapshot(prev_dir, profile_dir)
+            if serr != "" is
+                return compose_failed(gen_num, note, "Snapshot gen-" + to_string(prev) + " → gen-" + to_string(gen_num) + ": " + serr)
+            end
+            log::info("store_v2(btrfs): snapshotted gen-" + to_string(prev) + " → gen-" + to_string(gen_num))
+            made = true
+        end
+    end
+    if !made is
+        let cerr: string = btrfs_create_subvolume(profile_dir)
+        if cerr != "" is return compose_failed(gen_num, note, cerr) end
+    end
+
+    ;; nowe pakiety do snapshotu (wspolne bloki dzieki CoW)
+    let mut pkgs: [profile::GenPackage] = []
+    let mut i: int = 0
+    while i < entries.len() is
+        let e: StoreEntry = entries[i]
+        i += 1
+        if fs::exists(e.path) is
+            let aerr: string = copy_tree_cow(e.path, profile_dir)
+            if aerr != "" is
+                return compose_failed(gen_num, note, "Applying " + e.name + " to gen-" + to_string(gen_num) + ": " + aerr)
+            end
+        end
+        ;; Rust: `pkg_entries` obejmuje WSZYSTKIE wpisy (takze nieistniejace sciezki)
+        pkgs.push(profile::GenPackage { name: e.name, version: e.version, store_hash: e.hash })
+    end
+    log::info("store_v2(btrfs): composed gen-" + to_string(gen_num) + " (" + to_string(pkgs.len()) + " packages)")
+    return compose_done(gen_num, pkgs, note)
+end
+
+pub fn compose_profile(s: StoreV2, gen_num: int, entries: [StoreEntry], prev_gen: int?, note: string?) -> profile::ComposeResult is
+    if is_btrfs_backend(s.backend) is return compose_btrfs(gen_num, entries, prev_gen, note) end
+    if is_symlink_backend(s.backend) is
+        return profile::compose_profile(gen_num, to_old_entries(entries), note)
+    end
+    return compose_hardlink(gen_num, entries, note)
+end
+
+;; ── Aktywacja generacji ──────────────────────────────────────────────────
+
+;; Zwraca liczbe dotknietych plikow/binarek; btrfs = 0 (uklad plikow robi FS).
+pub fn activate_generation(s: StoreV2, g: profile::Generation) -> ActGenResult is
+    let profile_path: string = profile::gen_profile_path(g)
+    if !fs::exists(profile_path) is return ActGenResult { count: 0, err: "Profile path missing: " + profile_path } end
+
+    if is_btrfs_backend(s.backend) is
+        ;; set-default: subwolumen aktywny po restarcie + /hammer/active dla runtime
+        btrfs_set_default_subvolume(profile_path)
+        log::info("store_v2(btrfs): set-default gen-" + to_string(g.number))
+        let sw: string = profile::switch_active(g)
+        if sw != "" is return ActGenResult { count: 0, err: sw } end
+        return ActGenResult { count: 0, err: "" }
+    end
+
+    if is_symlink_backend(s.backend) is
+        ;; legacy: dowiazania przez relink_bins
+        let sw: string = profile::switch_active(g)
+        if sw != "" is return ActGenResult { count: 0, err: sw } end
+        let rl: profile::RelinkResult = profile::relink_bins(profile_path)
+        if rl.err != "" is return ActGenResult { count: 0, err: rl.err } end
+        return ActGenResult { count: rl.linked, err: "" }
+    end
+
+    ;; hardlink: atomowa podmiana plikow systemowych dowiazaniami z profilu
+    let ap: HlResult = apply_hardlinks_to_system(profile_path)
+    if ap.err != "" is return ActGenResult { count: 0, err: ap.err } end
+    let sw: string = profile::switch_active(g)
+    if sw != "" is return ActGenResult { count: 0, err: sw } end
+    log::info("store_v2(hardlink): activated gen-" + to_string(g.number) + ", " + to_string(ap.count) + " files")
+    return ActGenResult { count: ap.count, err: "" }
+end
+
+;; ── GC ───────────────────────────────────────────────────────────────────
+
+fn in_list(list: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < list.len() is
+        if list[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn gc_unreferenced(s: StoreV2, referenced: [string]) -> GcResult is
+    if !fs::exists(s.store_dir) is return GcResult { removed: 0, err: "" } end
+    let names: [string] = fs::list_dir(s.store_dir)
+    let mut removed: int = 0
+    let mut i: int = 0
+    while i < names.len() is
+        let name: string = names[i]
+        i += 1
+        if name != "" && !in_list(referenced, name) is
+            let p: string = compat::path_join(s.store_dir, name)
+            if is_btrfs_backend(s.backend) is
+                ;; subwolumen musi byc rw przed usunieciem
+                btrfs_set_readonly(p, false)
+                btrfs_delete_subvolume(p)
+            else is
+                system("rm -rf -- " + shq(p) + " 2>/dev/null")
+            end
+            log::info("store_v2: gc removed " + name)
+            removed += 1
+        end
+    end
+    return GcResult { removed: removed, err: "" }
+end
+
+;; ── Funkcje wolne (uzywane przez transaction, setup, cli/sys) ────────────
+
+pub fn store_install_deb(pkg: package::Package, d: deb::DebPackage) -> InstallResult is
+    return install_deb(store_new(), pkg, d)
+end
+
+pub fn install_deb_pkg(pkg: package::Package, d: deb::DebPackage) -> InstallResult is
+    return install_deb(store_new(), pkg, d)
+end
+
+;; "" = Ok.
+pub fn gc_unreferenced_pkgs(referenced: [string]) -> string is
+    return gc_unreferenced(store_new(), referenced).err
+end
