@@ -1,0 +1,110 @@
+use "std -> collections" from "col"
+
+;; hammer -> internal::sorting
+;;
+;; Wspolne sortowanie dla portu (nie ma odpowiednika w Rust — tam `sort()` /
+;; `sort_by()` sa w bibliotece standardowej).
+;;
+;; Dlaczego wlasne: `std -> sort`::`sort_strings` NIE sortuje — wrapper w
+;; `std/sort.h#` wola builtin `__builtin_sort_strings`, ktory zwraca NOWA
+;; tablice, i odrzuca wynik. (To samo dotyczy `sort_ints`.) Tu: scalanie od
+;; dolu, stabilne, O(n log n), porzadek bajtowy jak `Vec<String>::sort()`.
+
+;; Zwraca NOWA posortowana tablice (wejscie nie jest zmieniane).
+pub fn sorted(items: [string]) -> [string] is
+    let n: int = items.len()
+    if n < 2 is return items end
+    let mut src: [string] = items
+    let mut width: int = 1
+    while width < n is
+        let mut dst: [string] = []
+        let mut i: int = 0
+        while i < n is
+            let mid: int = if i + width < n then i + width else n
+            let hi: int = if i + 2 * width < n then i + 2 * width else n
+            let mut l: int = i
+            let mut r: int = mid
+            while l < mid && r < hi is
+                if src[r] < src[l] is
+                    dst.push(src[r])
+                    r += 1
+                else is
+                    dst.push(src[l])
+                    l += 1
+                end
+            end
+            while l < mid is
+                dst.push(src[l])
+                l += 1
+            end
+            while r < hi is
+                dst.push(src[r])
+                r += 1
+            end
+            i += 2 * width
+        end
+        src = dst
+        width = width * 2
+    end
+    return src
+end
+
+;; Unikalne elementy (pierwsze wystapienie), kolejnosc wejscia zachowana.
+;; Mapa-zbior zamiast O(n^2).
+pub fn unique(items: [string], seen: any) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < items.len() is
+        if !col::hashmap_contains(seen, items[i]) is
+            col::hashmap_insert(seen, items[i], "1")
+            out.push(items[i])
+        end
+        i += 1
+    end
+    return out
+end
+
+;; Sklejenie dwoch tablic (H# nie ma pewnego operatora `+` dla tablic).
+pub fn concat(a: [string], b: [string]) -> [string] is
+    let mut out: [string] = a
+    let mut i: int = 0
+    while i < b.len() is
+        out.push(b[i])
+        i += 1
+    end
+    return out
+end
+
+;; ── Testy ────────────────────────────────────────────────────────────────
+
+;; Zwraca liczbe niezdanych przypadkow (testuje tylko `sorted`/`concat`; `unique`
+;; uzywa map, ktore ma tylko backend LLVM).
+pub fn self_test() -> int is
+    let mut f: int = 0
+    let a: [string] = ["pear", "apple", "fig", "apple", "banana"]
+    let s: [string] = sorted(a)
+    let want: [string] = ["apple", "apple", "banana", "fig", "pear"]
+    let mut i: int = 0
+    while i < want.len() is
+        if s[i] != want[i] is
+            write("sorting::self_test FAIL: pos " + to_string(i) + " got " + s[i] + " want " + want[i])
+            f += 1
+        end
+        i += 1
+    end
+    if a[0] != "pear" is
+        write("sorting::self_test FAIL: sorted() zmienilo wejscie")
+        f += 1
+    end
+    let c: [string] = concat(["x"], ["y", "z"])
+    if c.len() != 3 || c[2] != "z" is
+        write("sorting::self_test FAIL: concat")
+        f += 1
+    end
+    let e: [string] = sorted([])
+    if e.len() != 0 is
+        write("sorting::self_test FAIL: empty")
+        f += 1
+    end
+    return f
+end
