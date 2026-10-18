@@ -1,0 +1,548 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> fmt"     from "fmt"
+use "std -> conv"    from "conv"
+
+mod internal
+mod ui
+mod profile
+mod grub
+mod tools
+
+;; hammer -> system::boot_fallback
+;;
+;; Port of source-code/system/boot_fallback.rs (Rust) to H#: licznik prob
+;; bootu, automatyczny fallback do ostatniej znanej dobrej generacji oraz
+;; komendy `boot-success`, `boot-check`, `boot-reset`.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `serde` + `HashMap<u32,u32>` -> `BootDb` z rownoleglymi tablicami
+;;    (`att_gens/att_counts`, `succ_gens/succ_ts`, `known_good`) i reczny
+;;    zapis/odczyt JSON-a (`jsonlite`). Uklad pliku jak `to_string_pretty`:
+;;    klucze map to napisy liczb. Kolejnosc kluczy: kolejnosc wstawiania
+;;    (w Rust — losowa, `HashMap`). Uszkodzony plik => pusta baza
+;;    (`unwrap_or_default`), jak w Rust.
+;; 2. Stala sciezka `/hammer/db/boot-attempts.json` ->
+;;    `build_mode::boot_attempts_file()` (zalezy od trybu, jak reszta portu).
+;; 3. `anyhow::Result<T>` -> `string` / struktury z polem `err`.
+;; 4. `chrono::Utc::now().to_rfc3339()` -> `profile::now_rfc3339()`
+;;    (`2026-10-06T12:00:00Z`; Rust daje `+00:00` i ulamki sekund).
+;; 5. `std::fs::rename` zapisu atomowego -> `fs::rename` (jak `profile::db_save`).
+;; 6. Uzycia powloki: `grub-mkconfig`, `bootctl update`, `systemctl enable`
+;;    przez `system()` (deklaracja w `internal/compat.h#`); wynik ignorowany
+;;    jak `let _ =`.
+;; 7. ZACHOWANY BLAD ORYGINALU w `apply_fallback`: wolane jest
+;;    `trigger_fallback(last_good, ..)`, gdzie `last_good` to NAJWYZSZA znana
+;;    dobra generacja, a `trigger_fallback` szuka znanej dobrej STARSZEJ niz
+;;    podany numer. Efekt: reczny `hammer boot fallback` cofa do przedostatniej
+;;    znanej dobrej generacji (albo konczy bledem "No known-good generation",
+;;    gdy jest tylko jedna). Prawdopodobnie zamierzone: cofniecie do
+;;    `last_good` albo fallback od aktualnej generacji. Nie zmieniam bez
+;;    Twojej decyzji.
+;; 8. ZACHOWANE: `mark_success` zeruje licznik prob, ale `increment` w
+;;    `on_boot_attempt` zapisuje baze PRZED sprawdzeniem limitu, wiec limit 3
+;;    oznacza: dozwolone sa 3 proby, 4. wyzwala fallback (`attempts > MAX`).
+
+pub fn max_boot_attempts() -> int is return 3 end
+pub fn boot_success_timeout() -> int is return 300 end
+
+fn attempts_file() -> string is
+    return build_mode::boot_attempts_file()
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+;; ── BootDb ───────────────────────────────────────────────────────────────
+
+pub struct BootDb is
+    pub att_gens:   [int]
+    pub att_counts: [int]
+    pub known_good: [int]
+    pub succ_gens:  [int]
+    pub succ_ts:    [string]
+end
+
+pub fn bootdb_new() -> BootDb is
+    let a: [int] = []
+    let b: [int] = []
+    let c: [int] = []
+    let d: [int] = []
+    let e: [string] = []
+    return BootDb { att_gens: a, att_counts: b, known_good: c, succ_gens: d, succ_ts: e }
+end
+
+fn append_int(a: [int], x: int) -> [int] is
+    let mut o: [int] = a
+    o.push(x)
+    return o
+end
+
+fn append_str(a: [string], x: string) -> [string] is
+    let mut o: [string] = a
+    o.push(x)
+    return o
+end
+
+fn index_of_int(xs: [int], x: int) -> int is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == x is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; Najwyzsza znana dobra generacja (Rust: `known_good.iter().max()`); -1 gdy brak.
+pub fn last_good_gen(d: BootDb) -> int is
+    let mut best: int = -1
+    let mut i: int = 0
+    while i < d.known_good.len() is
+        if d.known_good[i] > best is best = d.known_good[i] end
+        i += 1
+    end
+    return best
+end
+
+pub fn attempts_for(d: BootDb, gen: int) -> int is
+    let i: int = index_of_int(d.att_gens, gen)
+    if i < 0 is return 0 end
+    return d.att_counts[i]
+end
+
+pub fn is_known_good(d: BootDb, gen: int) -> bool is
+    return index_of_int(d.known_good, gen) >= 0
+end
+
+;; Najwyzsza znana dobra generacja ostro mniejsza niz `current`; -1 gdy brak.
+pub fn last_known_good(d: BootDb, current: int) -> int is
+    let mut best: int = -1
+    let mut i: int = 0
+    while i < d.known_good.len() is
+        if d.known_good[i] < current && d.known_good[i] > best is best = d.known_good[i] end
+        i += 1
+    end
+    return best
+end
+
+fn set_attempts(d: BootDb, gen: int, count: int) -> BootDb is
+    let mut out: BootDb = d
+    let i: int = index_of_int(out.att_gens, gen)
+    if i < 0 is
+        out.att_gens = append_int(out.att_gens, gen)
+        out.att_counts = append_int(out.att_counts, count)
+    else is
+        let mut c: [int] = out.att_counts
+        c[i] = count
+        out.att_counts = c
+    end
+    return out
+end
+
+;; Zwieksza licznik; zwraca nowa baze (nowa wartosc: `attempts_for`).
+pub fn bootdb_increment(d: BootDb, gen: int) -> BootDb is
+    return set_attempts(d, gen, attempts_for(d, gen) + 1)
+end
+
+pub fn bootdb_mark_success(d: BootDb, gen: int) -> BootDb is
+    let mut out: BootDb = set_attempts(d, gen, 0)
+    if !is_known_good(out, gen) is out.known_good = append_int(out.known_good, gen) end
+    let ts: string = profile::now_rfc3339()
+    let i: int = index_of_int(out.succ_gens, gen)
+    if i < 0 is
+        out.succ_gens = append_int(out.succ_gens, gen)
+        out.succ_ts = append_str(out.succ_ts, ts)
+    else is
+        let mut t: [string] = out.succ_ts
+        t[i] = ts
+        out.succ_ts = t
+    end
+    return out
+end
+
+;; `attempts.remove(&gen)`.
+pub fn bootdb_reset(d: BootDb, gen: int) -> BootDb is
+    let i: int = index_of_int(d.att_gens, gen)
+    if i < 0 is return d end
+    let mut gens: [int] = []
+    let mut counts: [int] = []
+    let mut k: int = 0
+    while k < d.att_gens.len() is
+        if k != i is
+            gens.push(d.att_gens[k])
+            counts.push(d.att_counts[k])
+        end
+        k += 1
+    end
+    let mut out: BootDb = d
+    out.att_gens = gens
+    out.att_counts = counts
+    return out
+end
+
+;; ── JSON ─────────────────────────────────────────────────────────────────
+
+fn num_of(tok: string) -> int is
+    if !jsonlite::is_word_tok(tok) is return 0 end
+    let t: string = jsonlite::tok_text(tok)
+    if t != "" && str::is_numeric(t) is return conv::str_to_int(t) end
+    return 0
+end
+
+;; Parsuje zawartosc; bledy => pusta baza (jak `unwrap_or_default`).
+pub fn bootdb_parse(text: string) -> BootDb is
+    let toks: [string] = jsonlite::tokenize(text)
+    let mut d: BootDb = bootdb_new()
+    if toks.len() == 0 || toks[0] != "{" is return d end
+    let mut pos: int = 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is return bootdb_new() end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        let v: string = toks[vpos]
+        if key == "attempts" && v == "{" is
+            let mut p: int = vpos + 1
+            while p < toks.len() && toks[p] != "}" is
+                if !jsonlite::is_string_tok(toks[p]) || p + 2 >= toks.len() is return bootdb_new() end
+                let k: string = jsonlite::tok_text(toks[p])
+                if str::is_numeric(k) is d = set_attempts(d, conv::str_to_int(k), num_of(toks[p + 2])) end
+                p = p + 3
+                if p < toks.len() && toks[p] == "," is p += 1 end
+            end
+        elsif key == "known_good" && v == "[" is
+            let mut p2: int = vpos + 1
+            while p2 < toks.len() && toks[p2] != "]" is
+                d.known_good = append_int(d.known_good, num_of(toks[p2]))
+                p2 += 1
+                if p2 < toks.len() && toks[p2] == "," is p2 += 1 end
+            end
+        elsif key == "last_success" && v == "{" is
+            let mut p3: int = vpos + 1
+            while p3 < toks.len() && toks[p3] != "}" is
+                if !jsonlite::is_string_tok(toks[p3]) || p3 + 2 >= toks.len() is return bootdb_new() end
+                let k3: string = jsonlite::tok_text(toks[p3])
+                if str::is_numeric(k3) && jsonlite::is_string_tok(toks[p3 + 2]) is
+                    d.succ_gens = append_int(d.succ_gens, conv::str_to_int(k3))
+                    d.succ_ts = append_str(d.succ_ts, jsonlite::tok_text(toks[p3 + 2]))
+                end
+                p3 = p3 + 3
+                if p3 < toks.len() && toks[p3] == "," is p3 += 1 end
+            end
+        end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return bootdb_new() end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    return d
+end
+
+;; Uklad `serde_json::to_string_pretty`.
+pub fn bootdb_to_json(d: BootDb) -> string is
+    let mut out: string = "{\n"
+    if d.att_gens.len() == 0 is
+        out = out + "  \"attempts\": {{}},\n"
+    else is
+        out = out + "  \"attempts\": {\n"
+        let mut i: int = 0
+        while i < d.att_gens.len() is
+            out = out + "    \"" + to_string(d.att_gens[i]) + "\": " + to_string(d.att_counts[i])
+            if i + 1 < d.att_gens.len() is out = out + "," end
+            out = out + "\n"
+            i += 1
+        end
+        out = out + "  },\n"
+    end
+    if d.known_good.len() == 0 is
+        out = out + "  \"known_good\": [],\n"
+    else is
+        out = out + "  \"known_good\": [\n"
+        let mut j: int = 0
+        while j < d.known_good.len() is
+            out = out + "    " + to_string(d.known_good[j])
+            if j + 1 < d.known_good.len() is out = out + "," end
+            out = out + "\n"
+            j += 1
+        end
+        out = out + "  ],\n"
+    end
+    if d.succ_gens.len() == 0 is
+        out = out + "  \"last_success\": {{}}\n"
+    else is
+        out = out + "  \"last_success\": {\n"
+        let mut k: int = 0
+        while k < d.succ_gens.len() is
+            out = out + "    \"" + to_string(d.succ_gens[k]) + "\": \"" + jsonlite::escape(d.succ_ts[k]) + "\""
+            if k + 1 < d.succ_gens.len() is out = out + "," end
+            out = out + "\n"
+            k += 1
+        end
+        out = out + "  }\n"
+    end
+    out = out + "}"
+    return out
+end
+
+pub fn bootdb_load() -> BootDb is
+    if !fs::exists(attempts_file()) is return bootdb_new() end
+    return bootdb_parse(fs::read(attempts_file()))
+end
+
+;; Zapis atomowy (tmp + rename). "" = OK.
+pub fn bootdb_save(d: BootDb) -> string is
+    let file: string = attempts_file()
+    let dir: string = compat::path_parent(file)
+    if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+    let tmp: string = file + ".tmp"
+    if !fs::write(tmp, bootdb_to_json(d)) is return "Cannot write " + tmp end
+    fs::rename(tmp, file)
+    return ""
+end
+
+;; ── Logika bootu ─────────────────────────────────────────────────────────
+
+pub struct BootDecision is
+    pub allow: bool
+    pub err:   string
+end
+
+;; Wolane na poczatku kazdego bootu (z `hammer _activate`). `allow == false`:
+;; przekroczono limit i wykonano fallback.
+pub fn on_boot_attempt(gen_num: int) -> BootDecision is
+    let mut db: BootDb = bootdb_load()
+
+    if is_known_good(db, gen_num) is
+        log::info("boot-fallback: gen-" + to_string(gen_num) + " is known-good, no limit check")
+        return BootDecision { allow: true, err: "" }
+    end
+
+    db = bootdb_increment(db, gen_num)
+    let attempts: int = attempts_for(db, gen_num)
+    let e: string = bootdb_save(db)
+    if e != "" is return BootDecision { allow: false, err: e } end
+
+    log::info("boot-fallback: gen-" + to_string(gen_num) + " attempt " + to_string(attempts) + "/" + to_string(max_boot_attempts()))
+
+    if attempts > max_boot_attempts() is
+        log::warn("boot-fallback: gen-" + to_string(gen_num) + " exceeded " + to_string(max_boot_attempts()) + " attempts — triggering fallback")
+        let fe: string = trigger_fallback(gen_num, db)
+        if fe != "" is return BootDecision { allow: false, err: fe } end
+        return BootDecision { allow: false, err: "" }
+    end
+    return BootDecision { allow: true, err: "" }
+end
+
+;; Przelacza aktywna generacje na ostatnia znana dobra (starsza niz `failed_gen`).
+fn trigger_fallback(failed_gen: int, db: BootDb) -> string is
+    let fallback: int = last_known_good(db, failed_gen)
+    if fallback < 0 is
+        return "No known-good generation to fall back to. System may be unbootable."
+    end
+
+    ui::eprint_line("hammer: boot-fallback: gen-" + to_string(failed_gen) + " failed " + to_string(max_boot_attempts()) + " times — falling back to gen-" + to_string(fallback))
+
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let go: profile::Generation? = profile::db_get(lr.db, fallback)
+    if go == nil is return "Fallback gen-" + to_string(fallback) + " not in DB" end
+    let gen: profile::Generation = go
+
+    let se: string = profile::switch_active(gen)
+    if se != "" is return se end
+    let rr: profile::RelinkResult = profile::relink_bins(profile::gen_profile_path(gen))
+    if rr.err != "" is return rr.err end
+
+    let lr2: profile::LoadResult = profile::db_load()
+    if lr2.err != "" is return lr2.err end
+    let mut gdb2: profile::GenerationsDb = lr2.db
+    gdb2.current = fallback
+    gdb2.pending = nil
+    let sv: string = profile::db_save(gdb2)
+    if sv != "" is return sv end
+    profile::clear_pending()
+
+    let ge: string = grub::update_grub(gdb2)
+    if ge != "" is log::warn("boot-fallback: grub update failed: " + ge) end
+
+    log::info("boot-fallback: fell back from gen-" + to_string(failed_gen) + " to gen-" + to_string(fallback))
+
+    notify::send_notification("hammer: Boot fallback triggered",
+        "Generation " + to_string(failed_gen) + " failed to boot " + to_string(max_boot_attempts()) + " times.\nFell back to generation " + to_string(fallback) + ".",
+        notify::Urgency::Critical, "dialog-warning")
+    return ""
+end
+
+;; ── hammer boot-success ──────────────────────────────────────────────────
+
+pub fn cmd_boot_success() -> string is
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let gen: int = lr.db.current
+    let db: BootDb = bootdb_mark_success(bootdb_load(), gen)
+    let e: string = bootdb_save(db)
+    if e != "" is return e end
+    log::info("boot-fallback: gen-" + to_string(gen) + " marked as known-good")
+    write("  " + ui::bright_green("✔") + " gen-" + to_string(gen) + " marked as successfully booted.")
+    return ""
+end
+
+;; ── hammer boot-check ────────────────────────────────────────────────────
+
+pub fn cmd_boot_check() -> string is
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let db: BootDb = bootdb_load()
+    let cur: int = lr.db.current
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Boot health check")
+    write("  " + ui::dim(str::repeat("─", 60)))
+
+    let attempts: int = attempts_for(db, cur)
+    let good: bool = is_known_good(db, cur)
+
+    write("  " + ui::bold(fmt::pad_right("Current generation:", 28)) + " gen-" + ui::bright_green(to_string(cur)))
+    write("  " + ui::bold(fmt::pad_right("Boot attempts:", 28)) + " " + ui::cyan(to_string(attempts)))
+    write("  " + ui::bold(fmt::pad_right("Known-good:", 28)) + " " + (if good then ui::bright_green("yes") else ui::yellow("no (not yet confirmed)")))
+
+    if attempts > 0 && !good is
+        write("")
+        write("  " + ui::yellow_bold("!") + " gen-" + to_string(cur) + " has not been confirmed as good yet.")
+        let remaining: int = if max_boot_attempts() > attempts then max_boot_attempts() - attempts else 0
+        write("  Remaining attempts before fallback: " + ui::yellow(to_string(remaining)))
+        write("  Confirm: " + ui::cyan("hammer boot-success"))
+    elsif good is
+        write("")
+        write("  " + ui::bright_green_bold("✔") + " gen-" + to_string(cur) + " is healthy.")
+    end
+
+    let kg: int = last_known_good(db, cur)
+    if kg >= 0 is
+        write("  " + ui::bold(fmt::pad_right("Last known-good backup:", 28)) + " gen-" + ui::cyan(to_string(kg)))
+        let ti: int = index_of_int(db.succ_gens, kg)
+        if ti >= 0 is
+            write("  " + ui::bold(fmt::pad_right("Last confirmed at:", 28)) + " " + ui::dim(db.succ_ts[ti]))
+        end
+    end
+    write("")
+    return ""
+end
+
+;; ── hammer boot-reset [gen] ──────────────────────────────────────────────
+
+pub fn cmd_boot_reset(args: [string]) -> string is
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let mut gen: int = lr.db.current
+    if args.len() > 0 && str::is_numeric(args[0]) is gen = conv::str_to_int(args[0]) end
+
+    let db: BootDb = bootdb_reset(bootdb_load(), gen)
+    let e: string = bootdb_save(db)
+    if e != "" is return e end
+    write("  " + ui::bright_green("✔") + " Boot attempt counter for gen-" + to_string(gen) + " reset.")
+    return ""
+end
+
+;; ── Usluga boot-success ──────────────────────────────────────────────────
+
+pub fn install_boot_success_service() -> string is
+    let mut hammer: string = str::trim(proc::shell("readlink -f /proc/self/exe 2>/dev/null"))
+    if hammer == "" is hammer = "/usr/bin/hammer" end
+
+    let service: string = "[Unit]\nDescription=Hammer Boot Success Confirmation\nAfter=multi-user.target network.target\nWants=multi-user.target\nConditionPathExists=/hammer/active\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStartPre=/bin/sleep 10\nExecStart=" + hammer + " boot-success\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=multi-user.target\n"
+    if !fs::write("/etc/systemd/system/hammer-boot-success.service", service) is
+        return "Cannot write /etc/systemd/system/hammer-boot-success.service"
+    end
+    system("systemctl enable hammer-boot-success.service --no-reload >/dev/null 2>&1")
+    log::info("boot-fallback: installed hammer-boot-success.service")
+    write("  " + ui::bright_green("✔") + " hammer-boot-success.service installed.")
+    return ""
+end
+
+;; ── Menu bootloadera ─────────────────────────────────────────────────────
+
+pub fn regenerate_bootloader_menu() -> string is
+    let kind: grub::BootloaderKind = grub::detect_bootloader()
+    let name: string = grub::kind_name(kind)
+    if name == "GRUB (BIOS)" || name == "GRUB (EFI)" is
+        let lr: profile::LoadResult = profile::db_load()
+        if lr.err != "" is return lr.err end
+        let ge: string = grub::update_grub(lr.db)
+        if ge != "" is return ge end
+        ;; zapasowo grub-mkconfig (wynik ignorowany)
+        system("grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1")
+    elsif name == "systemd-boot" is
+        system("bootctl update >/dev/null 2>&1")
+    else is
+        log::warn("boot_fallback: unknown bootloader — skipping menu regen")
+    end
+    return ""
+end
+
+;; Reczny fallback + regeneracja menu (`hammer boot fallback`,
+;; `livepatch::rollback_live()`). Patrz odejscie 7.
+pub fn apply_fallback() -> string is
+    log::info("boot_fallback: applying emergency fallback")
+    let db: BootDb = bootdb_load()
+
+    let last_good: int = last_good_gen(db)
+    if last_good < 0 is
+        return "No last-known-good generation found in boot database.\n  Run 'hammer gen list' to see available generations."
+    end
+    let fe: string = trigger_fallback(last_good, db)
+    if fe != "" is return fe end
+
+    let me: string = regenerate_bootloader_menu()
+    if me != "" is return me end
+    write("  " + ui::green_bold("✔") + "  Fallback applied. Reboot to activate.")
+    return ""
+end
+
+;; ── Testy (czysta logika bazy; bez dostepu do systemu plikow) ─────────────
+
+fn t_int(label: string, got: int, want: int) -> int is
+    if got == want is return 0 end
+    write("boot_fallback::self_test FAIL: " + label + " got " + to_string(got) + " want " + to_string(want))
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow.
+pub fn self_test() -> int is
+    let mut f: int = 0
+    let mut d: BootDb = bootdb_new()
+    d = bootdb_increment(d, 5)
+    d = bootdb_increment(d, 5)
+    d = bootdb_increment(d, 6)
+    f += t_int("attempts 5", attempts_for(d, 5), 2)
+    f += t_int("attempts 6", attempts_for(d, 6), 1)
+    f += t_int("attempts none", attempts_for(d, 9), 0)
+    d = bootdb_mark_success(d, 5)
+    d = bootdb_mark_success(d, 3)
+    f += t_int("reset by success", attempts_for(d, 5), 0)
+    f += t_int("known good 5", if is_known_good(d, 5) then 1 else 0, 1)
+    f += t_int("not known good 6", if is_known_good(d, 6) then 1 else 0, 0)
+    f += t_int("last_good_gen", last_good_gen(d), 5)
+    f += t_int("last_known_good < 5", last_known_good(d, 5), 3)
+    f += t_int("last_known_good < 3", last_known_good(d, 3), -1)
+    d = bootdb_reset(d, 6)
+    f += t_int("reset 6", attempts_for(d, 6), 0)
+
+    ;; round-trip JSON
+    let json: string = bootdb_to_json(d)
+    let back: BootDb = bootdb_parse(json)
+    f += t_int("roundtrip known_good len", back.known_good.len(), 2)
+    f += t_int("roundtrip last_good", last_good_gen(back), 5)
+    f += t_int("roundtrip succ len", back.succ_gens.len(), 2)
+    let mut one: BootDb = bootdb_new()
+    one = bootdb_increment(one, 7)
+    let one_json: string = bootdb_to_json(one)
+    let want: string = "{{\n  \"attempts\": {{\n    \"7\": 1\n  }},\n  \"known_good\": [],\n  \"last_success\": {{}}\n}}"
+    if one_json != want is
+        write("boot_fallback::self_test FAIL: json layout\n" + one_json)
+        f += 1
+    end
+    f += t_int("garbage => empty", bootdb_parse("not json").known_good.len(), 0)
+    return f
+end
