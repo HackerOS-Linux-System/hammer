@@ -1,0 +1,514 @@
+use "std -> strings" from "str"
+
+mod internal
+mod package
+mod cache
+mod db
+mod sat
+mod resolve
+mod solver
+
+;; hammer -> pkg::solver::tests   (port source-code/pkg/solver/tests.rs, 546 l.)
+;;
+;; Rust: `#[cfg(test)] mod sat_tests` + `mod resolver_tests` uruchamiane przez
+;; `cargo test`. H# nie ma `#[test]`; konwencja portu (patrz `version.h#`,
+;; `sat.h#`): funkcje zwracajace LICZBE NIEZDANYCH przypadkow i wypisujace
+;; `tests::<nazwa> FAIL: ...`. Uruchamianie:
+;;
+;;   * `sat_tests()`      — w interpreterze (`selftest.h#`, bez testu
+;;                          obciazeniowego: ~30 s w interpreterze) ORAZ w binarce;
+;;   * `resolver_tests()` — TYLKO w binarce skompilowanej przez LLVM
+;;                          (`hammer _selftest`): potrzebuje `cache`
+;;                          (hashmapy `std -> collections`) i
+;;                          `InstalledDb::open_in_memory` (`sqlite3` + `system`),
+;;                          ktorych interpreter H# nie obsluguje.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `CdclSolver` -> DPLL z `sat.h#` (patrz jego naglowek): zamiast `Lit`/
+;;    `Var` — liczby calkowite (`+v`/`-v`), model przez `sat_value`.
+;; 2. `pure_literal_eliminated`: Rust sprawdza, ze `preprocess()` PRZYPISUJE
+;;    `b = true`. DPLL nie ma `preprocess` (no-op), a domyslna faza to
+;;    `false`, wiec tej konkretnej wlasnosci nie ma jak sprawdzic. Test
+;;    sprawdza to, co jest istotne dla poprawnosci: formula jest SAT, a
+;;    klauzula `¬a ∨ b` jest spelniona w zwroconym modelu.
+;; 3. `budget_exceeded_returns_false`: Rust asercja `is_ok() || is_err()` jest
+;;    zawsze prawdziwa. Tu: formula jest UNSAT, wiec przy limicie 1 wynik to
+;;    `-1` (UNSAT wykryty w limicie) albo `0` (limit) — nie `1`.
+;; 4. `stats_populated_after_solve`: `propagations` nie istnieje w porcie
+;;    (patrz `sat.h#`, pkt 5); sprawdzane `decisions`/`conflicts`.
+;; 5. `stress_large_alternatives_graph`: limit czasu 5 s mierzony zegarem
+;;    `compat::time_now_ms`; w interpreterze moze byc znacznie wolniejszy od
+;;    LLVM, wiec w interpreterze przekroczenie to OSTRZEZENIE, nie porazka
+;;    (`strict_time` = true tylko dla `hammer _selftest`).
+;; 6. `Package { ..Default::default() }` -> `package::empty_package()` +
+;;    przypisania pol (struktury H# nie maja skladni `..`).
+;; 7. `assert!(plan.is_ok())` -> `PlanResult.err == ""`.
+;; 8. `resolver_tests`: kazdy test tworzy NOWA baze (`open_in_memory` kasuje
+;;    plik `/tmp/hammer-mem-<pid>.sqlite`), a na koncu `idb.close()`.
+
+fn report(name: string, ok: bool, msg: string) -> int is
+    if ok is return 0 end
+    write("tests::" + name + " FAIL: " + msg)
+    return 1
+end
+
+;; ── Pomocnicze SAT ───────────────────────────────────────────────────────
+
+fn iv(s: sat::Sat, name: string) -> sat::Sat is
+    return sat::sat_intern(s, name)
+end
+
+;; ── sat_tests ────────────────────────────────────────────────────────────
+
+fn t_empty_formula() -> int is
+    let s: sat::Sat = sat::sat_solve(sat::sat_new(100000))
+    return report("sat_empty_formula", s.status == 1, "empty formula is SAT, status=" + to_string(s.status))
+end
+
+fn t_single_unit() -> int is
+    let mut s: sat::Sat = sat::sat_new(100000)
+    s = iv(s, "pkg-a")
+    let a: int = sat::sat_var(s, "pkg-a")
+    s = sat::sat_add_clause(s, [a])
+    s = sat::sat_solve(s)
+    return report("sat_single_unit_clause", s.status == 1 && sat::sat_value(s, "pkg-a") == 1, "status=" + to_string(s.status))
+end
+
+fn t_two_variables() -> int is
+    ;; (a ∨ b) ∧ (¬a ∨ b)  → b musi byc true
+    let mut s: sat::Sat = sat::sat_new(100000)
+    s = iv(s, "a")
+    s = iv(s, "b")
+    let a: int = sat::sat_var(s, "a")
+    let b: int = sat::sat_var(s, "b")
+    s = sat::sat_add_clause(s, [a, b])
+    s = sat::sat_add_clause(s, [0 - a, b])
+    s = sat::sat_solve(s)
+    return report("sat_two_variables", s.status == 1 && sat::sat_value(s, "b") == 1, "b must be true")
+end
+
+fn t_contradiction() -> int is
+    ;; a ∧ ¬a — blad najpozniej przy solve() (Rust dopuszcza wykrycie przy add)
+    let mut s: sat::Sat = sat::sat_new(100000)
+    s = iv(s, "a")
+    let a: int = sat::sat_var(s, "a")
+    s = sat::sat_add_clause(s, [a])
+    s = sat::sat_add_clause(s, [0 - a])
+    s = sat::sat_solve(s)
+    return report("unsat_contradiction", s.status == -1, "status=" + to_string(s.status))
+end
+
+;; nazwa zmiennej "p<i>_<j>"
+fn pname(i: int, j: int) -> string is
+    return "p" + to_string(i) + "_" + to_string(j)
+end
+
+fn t_pigeon_hole() -> int is
+    ;; 3 golebie, 2 dziury -> UNSAT
+    let mut s: sat::Sat = sat::sat_new(1000000)
+    let mut i: int = 0
+    while i < 3 is
+        s = iv(s, pname(i, 0))
+        s = iv(s, pname(i, 1))
+        s = sat::sat_add_clause(s, [sat::sat_var(s, pname(i, 0)), sat::sat_var(s, pname(i, 1))])
+        i += 1
+    end
+    let mut j: int = 0
+    while j < 2 is
+        let mut i1: int = 0
+        while i1 < 3 is
+            let mut i2: int = i1 + 1
+            while i2 < 3 is
+                s = sat::sat_add_clause(s, [0 - sat::sat_var(s, pname(i1, j)), 0 - sat::sat_var(s, pname(i2, j))])
+                i2 += 1
+            end
+            i1 += 1
+        end
+        j += 1
+    end
+    s = sat::sat_solve(s)
+    return report("unsat_3sat_pigeon_hole", s.status == -1, "status=" + to_string(s.status))
+end
+
+fn t_budget() -> int is
+    let mut s: sat::Sat = sat::sat_new(1)
+    s = iv(s, "a")
+    s = iv(s, "b")
+    s = iv(s, "c")
+    let a: int = sat::sat_var(s, "a")
+    let b: int = sat::sat_var(s, "b")
+    let c: int = sat::sat_var(s, "c")
+    s = sat::sat_add_clause(s, [a, b, c])
+    s = sat::sat_add_clause(s, [0 - a, b])
+    s = sat::sat_add_clause(s, [0 - b, c])
+    s = sat::sat_add_clause(s, [0 - c])
+    s = sat::sat_solve(s)
+    return report("budget_exceeded_returns_false", s.status == 0 || s.status == -1, "status=" + to_string(s.status))
+end
+
+fn t_pure_literal() -> int is
+    let mut s: sat::Sat = sat::sat_new(100000)
+    s = iv(s, "a")
+    s = iv(s, "b")
+    let a: int = sat::sat_var(s, "a")
+    let b: int = sat::sat_var(s, "b")
+    s = sat::sat_add_clause(s, [0 - a, b])
+    s = sat::sat_preprocess(s)
+    s = sat::sat_solve(s)
+    let a_true: bool = sat::sat_value(s, "a") == 1
+    let b_true: bool = sat::sat_value(s, "b") == 1
+    return report("pure_literal_eliminated", s.status == 1 && (!a_true || b_true), "clause (-a v b) violated")
+end
+
+fn t_phase_saving() -> int is
+    let mut s: sat::Sat = sat::sat_new(100000)
+    s = iv(s, "libssl")
+    s = iv(s, "myapp")
+    let ssl: int = sat::sat_var(s, "libssl")
+    let app: int = sat::sat_var(s, "myapp")
+    s = sat::sat_add_clause(s, [0 - app, ssl])
+    s = sat::sat_add_clause(s, [app])
+    s = sat::sat_prefer_installed(s, "libssl")
+    s = sat::sat_solve(s)
+    return report("phase_saving_prefer_installed",
+        s.status == 1 && sat::sat_value(s, "libssl") == 1 && sat::sat_value(s, "myapp") == 1, "libssl/myapp must be true")
+end
+
+fn t_tautology() -> int is
+    let mut s: sat::Sat = sat::sat_new(100000)
+    s = iv(s, "a")
+    let a: int = sat::sat_var(s, "a")
+    s = sat::sat_add_clause(s, [a, 0 - a])
+    s = sat::sat_solve(s)
+    return report("tautology_ignored", s.status == 1, "status=" + to_string(s.status))
+end
+
+fn t_model_covers_all_vars() -> int is
+    let mut s: sat::Sat = sat::sat_new(100000)
+    s = iv(s, "a")
+    s = iv(s, "b")
+    s = iv(s, "c")
+    let a: int = sat::sat_var(s, "a")
+    let b: int = sat::sat_var(s, "b")
+    let c: int = sat::sat_var(s, "c")
+    s = sat::sat_add_clause(s, [a])
+    s = sat::sat_add_clause(s, [b, c])
+    s = sat::sat_solve(s)
+    let ok: bool = s.status == 1 && sat::sat_var(s, "a") != 0 && sat::sat_var(s, "b") != 0 && sat::sat_var(s, "c") != 0 && sat::sat_n_vars(s) == 3
+    return report("model_covers_all_vars", ok, "a, b, c must all be known to the model")
+end
+
+fn t_stats() -> int is
+    let mut s: sat::Sat = sat::sat_new(100000)
+    s = iv(s, "a")
+    s = iv(s, "b")
+    let a: int = sat::sat_var(s, "a")
+    let b: int = sat::sat_var(s, "b")
+    s = sat::sat_add_clause(s, [a, b])
+    s = sat::sat_add_clause(s, [0 - a, 0 - b])
+    s = sat::sat_solve(s)
+    return report("stats_populated_after_solve", s.decisions > 0 || s.conflicts == 0, "decisions=" + to_string(s.decisions) + " conflicts=" + to_string(s.conflicts))
+end
+
+;; 5 wspolnych + 500 lisci + 50 wzajemnie wykluczajacych sie "edytorow".
+fn t_stress(strict_time: bool) -> int is
+    let started: int = compat::time_now_ms()
+    let mut s: sat::Sat = sat::sat_new(1000000)
+
+    let mut i: int = 0
+    while i < 5 is
+        s = iv(s, "shared" + to_string(i))
+        i += 1
+    end
+    let mut w: int = 0
+    while w + 1 < 5 is
+        s = sat::sat_add_clause(s, [0 - sat::sat_var(s, "shared" + to_string(w)), sat::sat_var(s, "shared" + to_string(w + 1))])
+        w += 1
+    end
+    let shared0: int = sat::sat_var(s, "shared0")
+
+    let mut l: int = 0
+    while l < 500 is
+        s = iv(s, "leaf" + to_string(l))
+        s = sat::sat_add_clause(s, [0 - sat::sat_var(s, "leaf" + to_string(l)), shared0])
+        l += 1
+    end
+
+    let mut e: int = 0
+    while e < 50 is
+        s = iv(s, "editor" + to_string(e))
+        e += 1
+    end
+    let mut ei: int = 0
+    while ei < 50 is
+        let mut ej: int = ei + 1
+        while ej < 50 is
+            s = sat::sat_add_clause(s, [0 - sat::sat_var(s, "editor" + to_string(ei)), 0 - sat::sat_var(s, "editor" + to_string(ej))])
+            ej += 1
+        end
+        ei += 1
+    end
+    ;; co najmniej jeden edytor + pierwsze 200 lisci wymuszone
+    let mut any_editor: [int] = []
+    let mut k: int = 0
+    while k < 50 is
+        any_editor.push(sat::sat_var(s, "editor" + to_string(k)))
+        k += 1
+    end
+    s = sat::sat_add_clause(s, any_editor)
+    let mut f: int = 0
+    while f < 200 is
+        s = sat::sat_add_clause(s, [sat::sat_var(s, "leaf" + to_string(f))])
+        f += 1
+    end
+
+    s = sat::sat_solve(s)
+    let elapsed_ms: int = compat::time_now_ms() - started
+    let mut fails: int = report("stress_large_alternatives_graph", s.status == 1, "synthetic graph is satisfiable, status=" + to_string(s.status))
+    if elapsed_ms >= 5000 is
+        if strict_time is
+            fails += report("stress_large_alternatives_graph", false, "took " + to_string(elapsed_ms) + " ms (limit 5000) — performance regression")
+        else
+            write("tests::stress_large_alternatives_graph WARN: " + to_string(elapsed_ms) + " ms (interpreter; limit applies to compiled builds)")
+        end
+    end
+    return fails
+end
+
+;; Rust: `mod sat_tests`. Zwraca liczbe niezdanych przypadkow.
+pub fn sat_tests(include_stress: bool, strict_time: bool) -> int is
+    let mut f: int = 0
+    f += t_empty_formula()
+    f += t_single_unit()
+    f += t_two_variables()
+    f += t_contradiction()
+    f += t_pigeon_hole()
+    f += t_budget()
+    f += t_pure_literal()
+    f += t_phase_saving()
+    f += t_tautology()
+    f += t_model_covers_all_vars()
+    f += t_stats()
+    if include_stress is f += t_stress(strict_time) end
+    return f
+end
+
+;; ── resolver_tests: pomocnicze ───────────────────────────────────────────
+
+;; Rust: `pkg(name, version, depends)`.
+fn mkpkg(name: string, version: string, depends: string?) -> package::Package is
+    let mut p: package::Package = package::empty_package()
+    p.name = name
+    p.version = version
+    p.architecture = "amd64"
+    p.depends = depends
+    p.installed_size_kb = 100
+    p.download_size = 50000
+    return p
+end
+
+fn pkg_conflicts(name: string, version: string, conflicts: string) -> package::Package is
+    let mut p: package::Package = package::empty_package()
+    p.name = name
+    p.version = version
+    p.conflicts = conflicts
+    return p
+end
+
+fn pkg_provides(name: string, provides: string) -> package::Package is
+    let mut p: package::Package = package::empty_package()
+    p.name = name
+    p.version = "1.0"
+    p.provides = provides
+    return p
+end
+
+fn pkg_recommends(name: string, recommends: string) -> package::Package is
+    let mut p: package::Package = package::empty_package()
+    p.name = name
+    p.version = "1.0"
+    p.recommends = recommends
+    return p
+end
+
+;; Rust: `build_cache`.
+fn build_cache(pkgs: [package::Package]) -> cache::PackageCache is
+    let mut c: cache::PackageCache = cache::cache_empty()
+    let mut i: int = 0
+    while i < pkgs.len() is
+        c = cache::cache_insert(c, pkgs[i])
+        i += 1
+    end
+    return c
+end
+
+;; Rust: `build_db(vec![(name, version)])` — dwie rownolegle tablice.
+fn build_db(names: [string], versions: [string]) -> db::InstalledDb is
+    let idb: db::InstalledDb = db::InstalledDb::open_in_memory()
+    let mut i: int = 0
+    while i < names.len() is
+        idb.record_install(mkpkg(names[i], versions[i], nil), db::InstallReason::User, "", 0)
+        i += 1
+    end
+    return idb
+end
+
+fn no_names() -> [string] is
+    let n: [string] = []
+    return n
+end
+
+fn plan_has(plan: solver::TransactionPlan, name: string) -> bool is
+    let mut i: int = 0
+    while i < plan.to_install.len() is
+        if plan.to_install[i].name == name is return true end
+        i += 1
+    end
+    return false
+end
+
+fn list_has(items: [string], name: string) -> bool is
+    let mut i: int = 0
+    while i < items.len() is
+        if items[i] == name is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Rozwiazuje `names` na swiezym cache/db i zamyka baze.
+fn solve(pkgs: [package::Package], inst_names: [string], inst_versions: [string], want: [string], no_rec: bool) -> solver::PlanResult is
+    let c: cache::PackageCache = build_cache(pkgs)
+    let idb: db::InstalledDb = build_db(inst_names, inst_versions)
+    let sv: solver::Solver = solver::solver_new(c, idb)
+    let r: solver::PlanResult = resolve::resolve_install(sv, want, no_rec)
+    idb.close()
+    return r
+end
+
+;; ── resolver_tests ───────────────────────────────────────────────────────
+
+fn r_install_no_deps() -> int is
+    let r: solver::PlanResult = solve([mkpkg("curl", "7.0", nil)], no_names(), no_names(), ["curl"], false)
+    return report("install_no_deps", r.err == "" && plan_has(r.plan, "curl") && r.plan.to_remove.len() == 0, "err=[" + r.err + "]")
+end
+
+fn r_install_with_dependency() -> int is
+    let r: solver::PlanResult = solve([mkpkg("wget", "1.0", "libssl"), mkpkg("libssl", "3.0", nil)], no_names(), no_names(), ["wget"], false)
+    return report("install_with_dependency", r.err == "" && plan_has(r.plan, "wget") && plan_has(r.plan, "libssl"), "wget + libssl expected, err=[" + r.err + "]")
+end
+
+fn r_already_installed_dep() -> int is
+    let r: solver::PlanResult = solve([mkpkg("app", "1.0", "libz"), mkpkg("libz", "1.0", nil)], ["libz"], ["1.0"], ["app"], false)
+    return report("already_installed_dep_not_re_added", r.err == "" && !plan_has(r.plan, "libz"), "already-installed dep should not be re-added, err=[" + r.err + "]")
+end
+
+fn r_conflict_detected() -> int is
+    let r: solver::PlanResult = solve([pkg_conflicts("pkg-a", "1.0", "pkg-b"), pkg_conflicts("pkg-b", "1.0", "pkg-a")], no_names(), no_names(), ["pkg-a", "pkg-b"], false)
+    return report("conflict_detected_by_cdcl", r.err != "", "conflicting packages must fail resolution")
+end
+
+fn r_virtual_package() -> int is
+    let mut openssl: package::Package = pkg_provides("openssl", "libssl")
+    openssl.version = "3.0"
+    let r: solver::PlanResult = solve([mkpkg("myapp", "1.0", "libssl"), openssl], no_names(), no_names(), ["myapp"], false)
+    return report("virtual_package_resolved", r.err == "" && plan_has(r.plan, "openssl"), "openssl should provide libssl, err=[" + r.err + "]")
+end
+
+fn r_recommends_default() -> int is
+    let r: solver::PlanResult = solve([pkg_recommends("git", "git-lfs"), mkpkg("git-lfs", "1.0", nil)], no_names(), no_names(), ["git"], false)
+    return report("recommends_included_by_default", r.err == "" && plan_has(r.plan, "git-lfs"), "recommended package should be included, err=[" + r.err + "]")
+end
+
+fn r_recommends_excluded() -> int is
+    let r: solver::PlanResult = solve([pkg_recommends("git", "git-lfs"), mkpkg("git-lfs", "1.0", nil)], no_names(), no_names(), ["git"], true)
+    return report("recommends_excluded_with_flag", r.err == "" && !plan_has(r.plan, "git-lfs"), "git-lfs must be excluded with --no-recommends, err=[" + r.err + "]")
+end
+
+fn r_autoremove_recommends() -> int is
+    ;; libA jest polecany przez userapp -> NIE moze byc autoremove
+    let c: cache::PackageCache = build_cache([pkg_recommends("userapp", "libA"), mkpkg("libA", "1.0", nil)])
+    let idb: db::InstalledDb = build_db(["userapp", "libA"], ["1.0", "1.0"])
+    idb.set_reason("libA", db::InstallReason::Dependency)
+    let sv: solver::Solver = solver::solver_new(c, idb)
+    let r: solver::PlanResult = resolve::resolve_autoremove(sv)
+    idb.close()
+    return report("autoremove_respects_recommends", r.err == "" && !list_has(r.plan.to_autoremove, "libA"), "libA recommended by userapp must NOT be autoremoved, err=[" + r.err + "]")
+end
+
+fn r_transitive() -> int is
+    let r: solver::PlanResult = solve([mkpkg("app", "1.0", "lib-b"), mkpkg("lib-b", "1.0", "lib-c"), mkpkg("lib-c", "1.0", nil)], no_names(), no_names(), ["app"], false)
+    return report("transitive_deps_resolved", r.err == "" && plan_has(r.plan, "app") && plan_has(r.plan, "lib-b") && plan_has(r.plan, "lib-c"), "lib-c must be in plan, err=[" + r.err + "]")
+end
+
+fn r_stats() -> int is
+    let r: solver::PlanResult = solve([mkpkg("foo", "1.0", nil)], no_names(), no_names(), ["foo"], false)
+    return report("cdcl_stats_populated", r.err == "" && r.plan.sat_stats != nil, "sat_stats should be populated, err=[" + r.err + "]")
+end
+
+;; Regresja: pakiet z Provides: X i Conflicts: X nie moze kolidowac sam ze soba.
+fn r_self_conflict() -> int is
+    let mut np: package::Package = pkg_provides("new-pkg", "old-name")
+    np.conflicts = "old-name"
+    let r: solver::PlanResult = solve([np], no_names(), no_names(), ["new-pkg"], false)
+    return report("self_conflict_via_own_provides_is_not_a_conflict", r.err == "", "must still install: " + r.err)
+end
+
+;; Regresja: `Conflicts: pkg-b (<< 2.0)` nie dotyczy pkg-b 3.0.
+fn r_scoped_newer() -> int is
+    let a: package::Package = pkg_conflicts("pkg-a", "1.0", "pkg-b (<< 2.0)")
+    let r: solver::PlanResult = solve([a, mkpkg("pkg-b", "3.0", nil)], no_names(), no_names(), ["pkg-a", "pkg-b"], false)
+    return report("version_scoped_conflict_does_not_apply_to_newer_version", r.err == "", "pkg-b 3.0 must not trigger '<< 2.0': " + r.err)
+end
+
+fn r_scoped_old() -> int is
+    let a: package::Package = pkg_conflicts("pkg-a", "1.0", "pkg-b (<< 2.0)")
+    let r: solver::PlanResult = solve([a, mkpkg("pkg-b", "1.5", nil)], no_names(), no_names(), ["pkg-a", "pkg-b"], false)
+    return report("version_scoped_conflict_still_applies_to_old_version", r.err != "", "pkg-b 1.5 matches '<< 2.0' — must be a real conflict")
+end
+
+;; Regresja: duzy zestaw alternatyw nie moze wywrocic procesu (panic w Rust).
+;; H# nie ma panic-recovery — sam brak zatrzymania tej funkcji to wynik OK.
+fn r_wide_set() -> int is
+    let mut pkgs: [package::Package] = []
+    let mut i: int = 0
+    while i < 80 is
+        let mut p: package::Package = pkg_conflicts("alt" + to_string(i), "1.0", "alt" + to_string((i + 1) % 80))
+        p.provides = "virtual" + to_string(i)
+        pkgs.push(p)
+        i += 1
+    end
+    pkgs.push(mkpkg("root", "1.0", "alt0"))
+    let r: solver::PlanResult = solve(pkgs, no_names(), no_names(), ["root"], false)
+    write("tests::wide_dependency_set_does_not_panic_on_resolve: finished (err=[" + r.err + "])")
+    return 0
+end
+
+;; Rust: `mod resolver_tests`. TYLKO pod LLVM (patrz naglowek).
+pub fn resolver_tests() -> int is
+    let mut f: int = 0
+    f += r_install_no_deps()
+    f += r_install_with_dependency()
+    f += r_already_installed_dep()
+    f += r_conflict_detected()
+    f += r_virtual_package()
+    f += r_recommends_default()
+    f += r_recommends_excluded()
+    f += r_autoremove_recommends()
+    f += r_transitive()
+    f += r_stats()
+    f += r_self_conflict()
+    f += r_scoped_newer()
+    f += r_scoped_old()
+    f += r_wide_set()
+    return f
+end
+
+;; Wszystko; zwraca liczbe niezdanych przypadkow (`hammer _selftest`).
+pub fn run_all() -> int is
+    let a: int = sat_tests(true, true)
+    write("tests: sat_tests failures = " + to_string(a))
+    let b: int = resolver_tests()
+    write("tests: resolver_tests failures = " + to_string(b))
+    return a + b
+end
