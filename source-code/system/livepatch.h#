@@ -1,0 +1,196 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+;; [mod store pominiete: source-code/pkg/store.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania store::fn dzialaja bez zmian]
+
+;; hammer -> livepatch
+;;
+;; Port of source-code/system/livepatch.rs (Rust) to H#: klasyfikacja plikow
+;; nowych wpisow magazynu (da sie zastosowac "na zywo" czy trzeba restartu) i
+;; zastosowanie zmian w aktywnym profilu.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `walkdir` -> `find` przez powloke (`fs::walk` zwraca tylko zwykle pliki,
+;;    a potrzebne sa tez katalogi i symlinki). `collect_files` czyta
+;;    `find -printf '%P\n'`, wiec NAZWA PLIKU ZAWIERAJACA NOWA LINIE rozpadnie
+;;    sie na dwa wpisy (klasyfikacja to dopasowanie podciagow — praktycznie
+;;    bez skutku). `apply_live` uzywa `-print0` i takich nazw nie myli.
+;; 2. `apply_live`: cala petla w jednym skrypcie bash zamiast kilku wywolan
+;;    systemowych na plik; wynik = linie `U` (zaktualizowano) i `E:<opis>`.
+;;    `remove_file` na KATALOGU konczy sie bledem (jak w Rust: `rm -f` bez `-r`).
+;; 3. `PatchClass`/`HashSet` -> `bool` + lista powodow bez duplikatow.
+;; 4. `Result<..>` -> struktury z polem `err`.
+;;
+;; ── ZACHOWANE ZE ZLOGO ZACHOWANIA ORYGINALU (do Twojej decyzji) ──────────
+;; A. `apply_live` zmienia dowiazania WEWNATRZ aktywnego profilu
+;;    (`/hammer/active` -> `profiles/gen-N`), czyli modyfikuje juz istniejaca
+;;    generacje N: jej lista pakietow w `generations.json` nie obejmuje nowych
+;;    plikow, a `hash_generation(N)` (Trusted Boot) po takiej operacji sie
+;;    zmienia. Na backendzie `hardlink` aktywacja dziala na katalogach
+;;    systemowych (/usr, /bin, ...), wiec te dowiazania w profilu nie maja
+;;    wplywu na dzialajacy system.
+;; B. `rollback_live` to ATRAPA: czyta `/hammer/db/.live-rollback`, loguje
+;;    "rolled back" i kasuje plik — niczego nie cofa (komentarz w Rust mowi o
+;;    "stub StoreEntry slice").
+
+pub struct PatchAnalysis is
+    pub can_live_patch:  bool
+    pub live_files:      [string]
+    pub reboot_files:    [string]
+    pub reboot_reasons:  [string]
+end
+
+pub fn verdict(a: PatchAnalysis) -> string is
+    if a.can_live_patch is return "live" end
+    return "reboot required"
+end
+
+fn contains(s: string, sub: string) -> bool is
+    return compat::str_index_of(s, sub) >= 0
+end
+
+;; Ostatni segment sciezki (`rsplit('/').next()`).
+fn basename_of(p: string) -> string is
+    let mut i: int = string_len(p) - 1
+    while i >= 0 is
+        if string_at(p, i) == "/" is return str::slice(p, i + 1, string_len(p)) end
+        i -= 1
+    end
+    return p
+end
+
+;; libfoo.so, libfoo.so.1, libfoo.so.1.2.3 — nie `/usr/bin/python3.so-something`.
+pub fn is_shared_lib(p: string) -> bool is
+    if !contains(p, ".so") is return false end
+    let b: string = basename_of(p)
+    if !b.starts_with("lib") is return false end
+    return contains(b, ".so.") || b.ends_with(".so")
+end
+
+;; true = wymaga restartu.
+pub fn needs_reboot(p: string) -> bool is
+    if is_shared_lib(p) is return true end
+    if contains(p, "/systemd/system/") || contains(p, "/systemd/user/") is return true end
+    if contains(p, "/security/") && p.ends_with(".so") is return true end
+    if contains(p, "libnss_") && p.ends_with(".so") is return true end
+    if contains(p, "/lib/modules/") is return true end
+    if contains(p, "ld.so") || contains(p, "ld-linux") is return true end
+    if contains(p, "/dbus-1/system-services/") is return true end
+    if contains(p, "/udev/rules.d/") is return true end
+    if contains(p, "/glib-2.0/schemas/") is return true end
+    return false
+end
+
+pub fn reboot_reason(p: string) -> string is
+    if is_shared_lib(p) is return "shared libraries (.so)" end
+    if contains(p, "/systemd/") is return "systemd units" end
+    if contains(p, "/security/") is return "PAM modules" end
+    if contains(p, "libnss_") is return "NSS modules" end
+    if contains(p, "/lib/modules/") is return "kernel modules" end
+    if contains(p, "ld.so") is return "dynamic linker" end
+    if contains(p, "/udev/rules.d/") is return "udev rules" end
+    if contains(p, "/dbus-1/") is return "D-Bus services" end
+    return "system file"
+end
+
+fn list_has(list: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < list.len() is
+        if list[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn analyse(paths: [string]) -> PatchAnalysis is
+    let mut live: [string] = []
+    let mut reboot: [string] = []
+    let mut reasons: [string] = []
+    let mut i: int = 0
+    while i < paths.len() is
+        let p: string = paths[i]
+        i += 1
+        if needs_reboot(p) is
+            reboot.push(p)
+            let r: string = reboot_reason(p)
+            if !list_has(reasons, r) is reasons.push(r) end
+        else is
+            live.push(p)
+        end
+    end
+    return PatchAnalysis { can_live_patch: reboot.len() == 0, live_files: live, reboot_files: reboot, reboot_reasons: reasons }
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+;; Pliki i symlinki z wpisow magazynu jako sciezki "/usr/bin/..." (patrz 1).
+pub fn collect_files(entries: [store::StoreEntry]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < entries.len() is
+        let listing: string = proc::shell("find " + shq(entries[i].path) + " -mindepth 1 \\( -type f -o -type l \\) -printf '%P\\n' 2>/dev/null")
+        let lines: [string] = str::split(listing, "\n")
+        let mut k: int = 0
+        while k < lines.len() is
+            if lines[k] != "" is out.push("/" + lines[k]) end
+            k += 1
+        end
+        i += 1
+    end
+    return out
+end
+
+pub struct LivePatchResult is
+    pub updated_files: int
+    pub errors:        [string]
+end
+
+;; Skrypt dla jednego wpisu: argumenty `$1` = sciezka w magazynie, `$2` = aktywny profil.
+fn apply_script() -> string is
+    return "store=\"$1\"; active=\"$2\"\n" +
+        "find \"$store\" -mindepth 1 -print0 | while IFS= read -r -d '' p; do\n" +
+        "  rel=\"${{p#\"$store\"/}}\"; dest=\"$active/$rel\"\n" +
+        "  if [ -d \"$p\" ] && [ ! -L \"$p\" ]; then mkdir -p -- \"$dest\" 2>/dev/null; continue; fi\n" +
+        "  mkdir -p -- \"$(dirname -- \"$dest\")\" 2>/dev/null\n" +
+        "  if [ -e \"$dest\" ] || [ -L \"$dest\" ]; then\n" +
+        "    rm -f -- \"$dest\" 2>/dev/null || {{ printf 'E:remove %s\\n' \"$dest\"; continue; }}\n" +
+        "  fi\n" +
+        "  if ln -s -- \"$p\" \"$dest\" 2>/dev/null; then printf 'U\\n'; else printf 'E:symlink %s\\n' \"$dest\"; fi\n" +
+        "done\n"
+end
+
+pub fn apply_live(entries: [store::StoreEntry], active_path: string) -> LivePatchResult is
+    let mut updated: int = 0
+    let mut errors: [string] = []
+    let mut i: int = 0
+    while i < entries.len() is
+        let out: string = proc::shell("bash -c " + shq(apply_script()) + " _ " + shq(entries[i].path) + " " + shq(active_path))
+        let lines: [string] = str::split(out, "\n")
+        let mut k: int = 0
+        while k < lines.len() is
+            if lines[k] == "U" is
+                updated += 1
+            elsif lines[k].starts_with("E:") is
+                errors.push(str::slice(lines[k], 2, string_len(lines[k])))
+            end
+            k += 1
+        end
+        i += 1
+    end
+    log::info("livepatch: updated " + to_string(updated) + " symlinks in active profile")
+    return LivePatchResult { updated_files: updated, errors: errors }
+end
+
+;; Patrz B. "" = Ok, inaczej blad.
+pub fn rollback_live() -> string is
+    let rollback_file: string = compat::path_join(build_mode::db_dir(), ".live-rollback")
+    if !fs::exists(rollback_file) is return "No live-patch rollback target found." end
+    log::info("livepatch: rolled back to previous active profile")
+    system("rm -f -- " + shq(rollback_file))
+    return ""
+end
