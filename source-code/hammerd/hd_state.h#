@@ -1,0 +1,329 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod ui
+
+;; hammer -> hammerd::hd_state
+;;
+;; Port of source-code/hammerd/state.rs (Rust) to H#: trwaly stan demona
+;; (znaczniki czasu, licznik aktualizacji, kolejka zadan).
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `chrono::DateTime<Utc>` (RFC3339) -> sekundy unixowe (`int`); `None` ->
+;;    `-1`. FORMAT PLIKU `hammerd-state.json` JEST INNY niz w Rust (liczby
+;;    zamiast napisow RFC3339); stary plik zostanie zignorowany (stan domyslny).
+;; 2. `serde` -> reczny zapis/odczyt JSON (`json_output`, `jsonlite`); uklad
+;;    pretty jak `to_string_pretty` (klucze w kolejnosci deklaracji — to
+;;    `#[derive(Serialize)]`, nie `json!`).
+;; 3. `Arc<Mutex<DaemonState>>` -> wartosc przekazywana i zwracana (jeden
+;;    watek). Pola `#[serde(skip)]`: `started_at` (sekundy), `running`,
+;;    `config_gen` — zwykle pola, nie zapisywane do pliku.
+;; 4. Zapisy bledow (`let _ = self.save()`) ignorowane jak w Rust.
+;; 5. `DateTime::MIN_UTC` jako znacznik "jednorazowe, wykonane" -> `-2`.
+;; 6. ZACHOWANE: `secs_until_next` ignoruje zadania juz przeterminowane
+;;    (diff <= 0) — przy samych przeterminowanych zwraca 3600 (domyslnie),
+;;    wiec scheduler czeka `min(3600, 60)` = 60 s zanim je wykona.
+
+pub fn state_path() -> string is
+    return compat::path_join(build_mode::db_dir(), "hammerd-state.json")
+end
+
+pub struct ScheduledTask is
+    ;; unikalny, rosnacy
+    pub id:            int
+    ;; "sync" | "verify" | "upgrade-check" | "gc" | "notify"
+    pub kind:          string
+    ;; kiedy nastepny raz (sekundy unix); -2 = wykonane jednorazowe
+    pub next_run:      int
+    ;; odstep w sekundach (0 = jednorazowe)
+    pub interval_secs: int
+    pub run_count:     int
+    ;; "" = brak
+    pub last_error:    string
+end
+
+pub struct DaemonState is
+    pub last_sync:    int
+    pub last_check:   int
+    pub last_verify:  int
+    pub n_updates:    int
+    pub tasks:        [ScheduledTask]
+    pub next_task_id: int
+    ;; nie zapisywane
+    pub started_at:   int
+    pub running:      bool
+    pub config_gen:   int
+end
+
+pub fn state_blank() -> DaemonState is
+    let t: [ScheduledTask] = []
+    return DaemonState { last_sync: -1, last_check: -1, last_verify: -1, n_updates: 0, tasks: t,
+        next_task_id: 0, started_at: 0, running: false, config_gen: 0 }
+end
+
+fn append_task(a: [ScheduledTask], x: ScheduledTask) -> [ScheduledTask] is
+    let mut o: [ScheduledTask] = a
+    o.push(x)
+    return o
+end
+
+;; ── JSON ─────────────────────────────────────────────────────────────────
+
+pub fn state_to_json(s: DaemonState) -> string is
+    let mut ts: [string] = []
+    let mut i: int = 0
+    while i < s.tasks.len() is
+        let t: ScheduledTask = s.tasks[i]
+        ts.push(json_output::jobj([
+            json_output::jfield("id", json_output::jint(t.id)),
+            json_output::jfield("kind", json_output::jstr(t.kind)),
+            json_output::jfield("next_run", json_output::jint(t.next_run)),
+            json_output::jfield("interval_secs", json_output::jint(t.interval_secs)),
+            json_output::jfield("run_count", json_output::jint(t.run_count)),
+            json_output::jfield("last_error", if t.last_error == "" then "null" else json_output::jstr(t.last_error))]))
+        i += 1
+    end
+    return json_output::pretty(json_output::jobj([
+        json_output::jfield("last_sync", json_output::jint(s.last_sync)),
+        json_output::jfield("last_check", json_output::jint(s.last_check)),
+        json_output::jfield("last_verify", json_output::jint(s.last_verify)),
+        json_output::jfield("n_updates", json_output::jint(s.n_updates)),
+        json_output::jfield("tasks", json_output::jarr(ts)),
+        json_output::jfield("next_task_id", json_output::jint(s.next_task_id))]))
+end
+
+fn tok_int(tok: string) -> int is
+    if !jsonlite::is_word_tok(tok) is return -1 end
+    let t: string = jsonlite::tok_text(tok)
+    if t == "" is return -1 end
+    let neg: bool = string_starts_with(t, "-")
+    let digits: string = if neg then str::slice(t, 1, string_len(t)) else t
+    if !str::is_numeric(digits) is return -1 end
+    let n: int = conv::str_to_int(digits)
+    return if neg then 0 - n else n
+end
+
+;; Parsuje stan; uszkodzony/obcy format => stan domyslny.
+pub fn state_parse(text: string) -> DaemonState is
+    let toks: [string] = jsonlite::tokenize(text)
+    let mut s: DaemonState = state_blank()
+    if toks.len() == 0 || toks[0] != "{" is return state_blank() end
+    let mut pos: int = 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is return state_blank() end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        if key == "last_sync" is s.last_sync = tok_int(toks[vpos]) end
+        if key == "last_check" is s.last_check = tok_int(toks[vpos]) end
+        if key == "last_verify" is s.last_verify = tok_int(toks[vpos]) end
+        if key == "n_updates" is s.n_updates = tok_int(toks[vpos]) end
+        if key == "next_task_id" is s.next_task_id = tok_int(toks[vpos]) end
+        if key == "tasks" && toks[vpos] == "[" is
+            let mut p: int = vpos + 1
+            while p < toks.len() && toks[p] != "]" is
+                if toks[p] != "{" is return state_blank() end
+                let mut t: ScheduledTask = ScheduledTask { id: 0, kind: "", next_run: 0, interval_secs: 0, run_count: 0, last_error: "" }
+                p += 1
+                while p < toks.len() && toks[p] != "}" is
+                    if !jsonlite::is_string_tok(toks[p]) || p + 2 >= toks.len() is return state_blank() end
+                    let k: string = jsonlite::tok_text(toks[p])
+                    let v: string = toks[p + 2]
+                    if k == "id" is t.id = tok_int(v) end
+                    if k == "kind" && jsonlite::is_string_tok(v) is t.kind = jsonlite::tok_text(v) end
+                    if k == "next_run" is t.next_run = tok_int(v) end
+                    if k == "interval_secs" is t.interval_secs = tok_int(v) end
+                    if k == "run_count" is t.run_count = tok_int(v) end
+                    if k == "last_error" && jsonlite::is_string_tok(v) is t.last_error = jsonlite::tok_text(v) end
+                    p = p + 3
+                    if p < toks.len() && toks[p] == "," is p += 1 end
+                end
+                p += 1
+                s.tasks = append_task(s.tasks, t)
+                if p < toks.len() && toks[p] == "," is p += 1 end
+            end
+        end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return state_blank() end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    return s
+end
+
+;; ── Trwalosc ─────────────────────────────────────────────────────────────
+
+pub fn state_load() -> DaemonState is
+    if !fs::exists(state_path()) is return state_blank() end
+    return state_parse(fs::read(state_path()))
+end
+
+pub fn state_save(s: DaemonState) -> string is
+    let path: string = state_path()
+    proc::shell("mkdir -p '" + compat::path_parent(path) + "'")
+    let tmp: string = compat::path_with_extension(path, "json.tmp")
+    if !fs::write(tmp, state_to_json(s)) is return "Cannot write " + tmp end
+    fs::rename(tmp, path)
+    return ""
+end
+
+;; `DaemonState::new()`: wczytaj, oznacz jako dzialajacy, przesun przeterminowane.
+pub fn state_new(now: int) -> DaemonState is
+    let mut s: DaemonState = state_load()
+    s.running = true
+    s.config_gen = 0
+    s.started_at = now
+    let mut tasks: [ScheduledTask] = []
+    let mut i: int = 0
+    while i < s.tasks.len() is
+        let mut t: ScheduledTask = s.tasks[i]
+        if t.interval_secs > 0 && t.next_run < now is t.next_run = now + t.interval_secs end
+        tasks.push(t)
+        i += 1
+    end
+    s.tasks = tasks
+    return s
+end
+
+;; Dodaje zadanie cykliczne; zwraca nowy stan (id = `s.next_task_id - 1`).
+pub fn state_schedule(s0: DaemonState, kind: string, first_run: int, interval_secs: int) -> DaemonState is
+    let s: DaemonState = schedule_core(s0, kind, first_run, interval_secs)
+    state_save(s)
+    return s
+end
+
+fn schedule_core(s0: DaemonState, kind: string, first_run: int, interval_secs: int) -> DaemonState is
+    let mut s: DaemonState = s0
+    let t: ScheduledTask = ScheduledTask { id: s.next_task_id, kind: kind, next_run: first_run,
+        interval_secs: interval_secs, run_count: 0, last_error: "" }
+    s.next_task_id = s.next_task_id + 1
+    s.tasks = append_task(s.tasks, t)
+    return s
+end
+
+pub fn state_cancel_task(s0: DaemonState, id: int) -> DaemonState is
+    let mut s: DaemonState = s0
+    let mut kept: [ScheduledTask] = []
+    let mut i: int = 0
+    while i < s.tasks.len() is
+        if s.tasks[i].id != id is kept.push(s.tasks[i]) end
+        i += 1
+    end
+    if kept.len() < s.tasks.len() is
+        s.tasks = kept
+        state_save(s)
+    end
+    return s
+end
+
+;; Oznacza zadanie jako wykonane (przesuwa `next_run` albo usuwa jednorazowe).
+pub fn state_task_done(s0: DaemonState, id: int, error: string, now: int) -> DaemonState is
+    let s: DaemonState = task_done_core(s0, id, error, now)
+    state_save(s)
+    return s
+end
+
+fn task_done_core(s0: DaemonState, id: int, error: string, now: int) -> DaemonState is
+    let mut s: DaemonState = s0
+    let mut tasks: [ScheduledTask] = []
+    let mut i: int = 0
+    while i < s.tasks.len() is
+        let mut t: ScheduledTask = s.tasks[i]
+        if t.id == id is
+            t.run_count = t.run_count + 1
+            t.last_error = error
+            if t.interval_secs == 0 is
+                t.next_run = -2
+            else is
+                t.next_run = now + t.interval_secs
+            end
+        end
+        if t.next_run != -2 is tasks.push(t) end
+        i += 1
+    end
+    s.tasks = tasks
+    return s
+end
+
+;; Id najblizszego zadania, ktore jest juz wymagalne (next_run <= now); -1 gdy brak.
+pub fn state_next_due(s: DaemonState, now: int) -> int is
+    let mut best: int = -1
+    let mut best_run: int = 0
+    let mut i: int = 0
+    while i < s.tasks.len() is
+        let t: ScheduledTask = s.tasks[i]
+        if t.next_run <= now && (best < 0 || t.next_run < best_run) is
+            best = i
+            best_run = t.next_run
+        end
+        i += 1
+    end
+    if best < 0 is return -1 end
+    return s.tasks[best].id
+end
+
+;; Sekundy do najblizszego zadania (patrz odejscie 6).
+pub fn state_secs_until_next(s: DaemonState, now: int) -> int is
+    let mut best: int = -1
+    let mut i: int = 0
+    while i < s.tasks.len() is
+        let diff: int = s.tasks[i].next_run - now
+        if diff > 0 && (best < 0 || diff < best) is best = diff end
+        i += 1
+    end
+    if best < 0 is return 3600 end
+    return best
+end
+
+pub fn state_task_by_id(s: DaemonState, id: int) -> ScheduledTask? is
+    let mut i: int = 0
+    while i < s.tasks.len() is
+        if s.tasks[i].id == id is return s.tasks[i] end
+        i += 1
+    end
+    return nil
+end
+
+;; ── Testy ────────────────────────────────────────────────────────────────
+
+fn t_int(label: string, got: int, want: int) -> int is
+    if got == want is return 0 end
+    write("hd_state::self_test FAIL: " + label + " got " + to_string(got) + " want " + to_string(want))
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow (czysta logika; bez plikow).
+pub fn self_test() -> int is
+    let mut f: int = 0
+    let mut s: DaemonState = state_blank()
+    s.last_sync = 1000
+    s.n_updates = 3
+    s.next_task_id = 2
+    s.tasks = append_task(s.tasks, ScheduledTask { id: 0, kind: "sync", next_run: 2000, interval_secs: 3600, run_count: 1, last_error: "" })
+    s.tasks = append_task(s.tasks, ScheduledTask { id: 1, kind: "gc", next_run: 500, interval_secs: 0, run_count: 0, last_error: "boom \"x\"" })
+
+    let back: DaemonState = state_parse(state_to_json(s))
+    f += t_int("roundtrip last_sync", back.last_sync, 1000)
+    f += t_int("roundtrip last_check none", back.last_check, -1)
+    f += t_int("roundtrip n_updates", back.n_updates, 3)
+    f += t_int("roundtrip next_task_id", back.next_task_id, 2)
+    f += t_int("roundtrip tasks", back.tasks.len(), 2)
+    f += t_int("roundtrip task0 interval", back.tasks[0].interval_secs, 3600)
+    f += t_int("roundtrip task1 error", if back.tasks[1].last_error == "boom \"x\"" then 1 else 0, 1)
+    f += t_int("garbage => blank", state_parse("not json").tasks.len(), 0)
+
+    f += t_int("next_due none", state_next_due(s, 100), -1)
+    f += t_int("next_due picks earliest due", state_next_due(s, 2500), 1)
+    f += t_int("secs_until_next future only", state_secs_until_next(s, 1500), 500)
+    f += t_int("secs_until_next default", state_secs_until_next(s, 9999), 3600)
+
+    let after: DaemonState = task_done_core(s, 1, "", 3000)
+    f += t_int("one-shot removed", after.tasks.len(), 1)
+    let after2: DaemonState = task_done_core(after, 0, "oops", 3000)
+    f += t_int("recurring rescheduled", after2.tasks[0].next_run, 6600)
+    f += t_int("run_count incremented", after2.tasks[0].run_count, 2)
+    f += t_int("error recorded", if after2.tasks[0].last_error == "oops" then 1 else 0, 1)
+    return f
+end
