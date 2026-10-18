@@ -1,0 +1,176 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+mod internal
+mod db
+
+;; hammer -> pkg::dpkg_status
+;;
+;; Port of source-code/pkg/dpkg_status.rs (Rust) to H#.
+;; Czyta pakiety `Status: install ok installed` z /var/lib/dpkg/status
+;; (fallback dla normal-mode, gdzie czesc pakietow zainstalowal sam dpkg).
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `HashMap<String,String>` -> dwie rownolegle tablice (klucze/wartosci);
+;;    ta sama semantyka `insert` (pozniejszy duplikat nadpisuje).
+;; 2. `Path` -> `string`; `DateTime<Utc>::now()` -> lokalny `time::format`
+;;    (pole tylko do wyswietlania, jak w oryginale).
+;; 3. `get()` zwraca `InstalledPackage?`; `read_all_from` zwraca pusta
+;;    tablice gdy pliku brak — tak jak w Rust (to normalny przypadek).
+
+pub fn dpkg_status_path() -> string is return "/var/lib/dpkg/status" end
+
+;; Parsowanie pol RFC822 z zachowaniem "zwiniecia" (linie zaczynajace sie
+;; spacja dokleja do poprzedniego pola po "\n").
+struct Fields is
+    keys: [string]
+    vals: [string]
+end
+
+fn fields_index(f: Fields, key: string) -> int is
+    let mut i: int = 0
+    while i < f.keys.len() is
+        if f.keys[i] == key is return i end
+        i += 1
+    end
+    return -1
+end
+
+fn fields_has(f: Fields, key: string) -> bool is
+    return fields_index(f, key) >= 0
+end
+
+fn fields_get(f: Fields, key: string) -> string is
+    let i: int = fields_index(f, key)
+    if i < 0 is return "" end
+    return f.vals[i]
+end
+
+fn fields_opt(f: Fields, key: string) -> string? is
+    let i: int = fields_index(f, key)
+    if i < 0 is return nil end
+    return f.vals[i]
+end
+
+fn parse_rfc822_fields(block: string) -> Fields is
+    let mut keys: [string] = []
+    let mut vals: [string] = []
+    let mut current: int = -1
+    let lines: [string] = str::split(block, "\n")
+    let mut n: int = 0
+    while n < lines.len() is
+        let line: string = lines[n]
+        if line.starts_with(" ") is
+            if current >= 0 is
+                vals[current] = vals[current] + "\n" + str::slice(line, 1, string_len(line))
+            end
+        else is
+            let pos: int = compat::str_index_of(line, ":")
+            if pos >= 0 is
+                let k: string = str::trim(str::slice(line, 0, pos))
+                let v: string = str::trim(str::slice(line, pos + 1, string_len(line)))
+                let mut j: int = 0
+                let mut found: int = -1
+                while j < keys.len() is
+                    if keys[j] == k is found = j end
+                    j += 1
+                end
+                if found >= 0 is
+                    vals[found] = v
+                    current = found
+                else is
+                    keys.push(k)
+                    vals.push(v)
+                    current = keys.len() - 1
+                end
+            end
+        end
+        n += 1
+    end
+    return Fields { keys: keys, vals: vals }
+end
+
+fn first_line(s: string) -> string is
+    let pos: int = compat::str_index_of(s, "\n")
+    if pos < 0 is return s end
+    return str::slice(s, 0, pos)
+end
+
+fn parse_block(block: string) -> db::InstalledPackage? is
+    let f: Fields = parse_rfc822_fields(block)
+    if !fields_has(f, "Package") is return nil end
+    let name: string = fields_get(f, "Package")
+
+    ;; `Status:` ma trzy slowa (want, error, state), np. "install ok installed"
+    ;; albo "deinstall ok config-files" — na dysku jest tylko "installed".
+    let status: string = fields_get(f, "Status")
+    if !str::trim_end(status).ends_with("installed") is return nil end
+
+    let size_raw: string = str::trim(fields_get(f, "Installed-Size"))
+    let mut size: int = 0
+    if str::is_numeric(size_raw) is size = conv::str_to_int(size_raw) end
+
+    let mut desc: string? = nil
+    if fields_has(f, "Description") is
+        desc = first_line(fields_get(f, "Description"))
+    end
+
+    return db::InstalledPackage {
+        name:              name,
+        version:           fields_get(f, "Version"),
+        architecture:      fields_get(f, "Architecture"),
+        installed_size_kb: size,
+        section:           fields_opt(f, "Section"),
+        maintainer:        fields_opt(f, "Maintainer"),
+        description_short: desc,
+        installed_at:      compat::time_format(compat::time_now_unix(), "%Y-%m-%dT%H:%M:%S"),
+        ;; Pakiety dpkg-a sa dla hammera "po prostu tu": najblizszy powod to
+        ;; Dependency (nie oferuj autoremove jak dla pakietu z prosby usera).
+        reason:            db::InstallReason::Dependency,
+        store_hash:        "",
+        depends:           fields_opt(f, "Depends"),
+        recommends:        fields_opt(f, "Recommends"),
+        multi_arch:        fields_opt(f, "Multi-Arch")
+    }
+end
+
+;; Brak pliku to nie blad (system bez dpkg jest calkiem normalny).
+pub fn read_all_from(file: string) -> [db::InstalledPackage] is
+    let mut out: [db::InstalledPackage] = []
+    if !fs::exists(file) is return out end
+    let text: string = fs::read(file)
+    let blocks: [string] = str::split(text, "\n\n")
+    let mut i: int = 0
+    while i < blocks.len() is
+        let b: string = str::trim(blocks[i])
+        if b != "" is
+            let p: db::InstalledPackage? = parse_block(b)
+            if p != nil is
+                let pkg: db::InstalledPackage = p
+                out.push(pkg)
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn read_all() -> [db::InstalledPackage] is
+    return read_all_from(dpkg_status_path())
+end
+
+;; Liniowy skan (plik nie ma indeksu), jak w oryginale.
+pub fn get(name: string) -> db::InstalledPackage? is
+    let all: [db::InstalledPackage] = read_all()
+    let mut i: int = 0
+    while i < all.len() is
+        if all[i].name == name is return all[i] end
+        i += 1
+    end
+    return nil
+end
+
+pub fn is_installed(name: string) -> bool is
+    return get(name) != nil
+end
