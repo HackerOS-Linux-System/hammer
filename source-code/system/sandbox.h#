@@ -1,0 +1,395 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> env"     from "env"
+use "std -> conv"    from "conv"
+
+mod internal
+;; [mod store pominiete: source-code/pkg/store.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania store::fn dzialaja bez zmian]
+mod ui
+
+;; hammer -> sandbox
+;;
+;; Port of source-code/system/sandbox.rs (Rust) to H#: uruchamianie skryptow
+;; maintainera (postinst/prerm/postrm) i aplikacji w izolacji (bwrap /
+;; systemd-nspawn / bezposrednio), limity cgroup v2, lista dozwolonych
+;; wywolan systemowych.
+;;
+;; 0. NAZWA: `PostinstResult` z Rust (sandbox.rs) nazywa sie tu `ScriptResult`,
+;;    bo `PostinstResult` istnieje juz w postinst.h# (H# splaszcza nazwy typow
+;;    miedzy plikami — sprawdzone: kolizja daje blad typow).
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `Command::new(..).output()` -> `sh -c '<polecenie> >out 2>err; echo $?'`
+;;    (std nie zwraca stdout/stderr/kodu procesu naraz); kazdy argument jest
+;;    cytowany (`shq`), srodowisko ustawia `env VAR=...`.
+;; 2. `std::process::exit(code)` wewnatrz `cmd_sandbox` -> funkcja ZWRACA
+;;    `SandboxRun { err, code }`; wolajacy (main/cli) konczy proces
+;;    (`exit(code)` jest wbudowane w H#). Nie konczymy procesu z biblioteki.
+;;    Tak samo `unwrap_or_else(|_| process::exit(127))` w
+;;    `run_script_*` — zamiast zabijac caly `hammer` przy braku `bwrap`,
+;;    zwracamy kod 127.
+;; 3. `which` -> `command -v` (POSIX; `which` nie jest czescia coreutils).
+;; 4. `generate_seccomp_filter()` w Rust zwraca pusty `Vec<u8>` (placeholder —
+;;    bwrap uzywa wtedy swojego filtra domyslnego) — zachowane; lista
+;;    `ALLOWED_SYSCALLS` jest tylko dokumentacja i nigdzie nie jest uzywana.
+;;
+;; ── BLEDY ORYGINALU, KTORE NAPRAWIAM (sprawdzone na prawdziwym bwrap 0.9) ─
+;; A. `PostinstSandbox::run_bwrap`: skrypt zapisany w `/tmp/hammer_postinst_<pid>/`,
+;;    a bwrap dostaje `--tmpfs /tmp`, ktory ZASLANIA katalog ze skryptem —
+;;    `bwrap: execvp /tmp/...: No such file or directory`. Przy wykrytym
+;;    bwrap KAZDY postinst konczyl sie bledem. Tu: skrypt jest dowiazany
+;;    jawnie PO tmpfs (`--ro-bind <skrypt> /tmp/maintainer-script`).
+;; B. `run_script_in_bwrap` (prerm/postrm): `--ro-bind <active> /usr` montuje
+;;    KORZEN profilu (zawierajacy `usr/`, `etc/`, ...) jako `/usr`, wiec
+;;    `/usr/bin/sh` znika i przy ukladzie merged-usr (`/bin -> usr/bin`)
+;;    `bwrap: execvp /bin/sh: No such file or directory`. Tu: `<active>/usr`
+;;    (jak w `sandbox_bwrap`). Ten sam blad jest w galezi nspawn tylko tam,
+;;    gdzie `--directory=<active>` JEST poprawne, wiec bez zmian.
+;; C. Katalog tymczasowy `/tmp/hammer_<kind>_<pid>` byl przewidywalny i
+;;    tworzony `create_dir_all` (atak symlinkiem, gdy hammer dziala jako
+;;    root) -> `mktemp -d` (0700).
+;; D. `--bind / /` w `run_bwrap` (zapisywalny korzen) i brak filtra seccomp to
+;;    UDOKUMENTOWANA decyzja oryginalu (komentarz o `update-alternatives`) —
+;;    zachowana; izolacja = PID/IPC + tmpfs /tmp,/run.
+
+pub enum SandboxBackend is
+    Bwrap
+    Nspawn
+    Direct
+end
+
+fn is_bwrap(b: SandboxBackend) -> bool is
+    match b is
+        SandboxBackend::Bwrap => is return true end
+        _ => is return false end
+    end
+end
+
+fn is_nspawn(b: SandboxBackend) -> bool is
+    match b is
+        SandboxBackend::Nspawn => is return true end
+        _ => is return false end
+    end
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sys_ok(cmd: string) -> bool is
+    return system(cmd) == 0
+end
+
+fn which(cmd: string) -> bool is
+    return sys_ok("command -v " + shq(cmd) + " >/dev/null 2>&1")
+end
+
+pub fn backend_detect() -> SandboxBackend is
+    if which("bwrap") is return SandboxBackend::Bwrap end
+    if which("systemd-nspawn") is return SandboxBackend::Nspawn end
+    return SandboxBackend::Direct
+end
+
+pub fn backend_name(b: SandboxBackend) -> string is
+    if is_bwrap(b) is return "bwrap" end
+    if is_nspawn(b) is return "systemd-nspawn" end
+    return "direct (no isolation)"
+end
+
+pub struct ScriptResult is
+    pub success:   bool
+    pub stdout:    string
+    pub stderr:    string
+    pub exit_code: int
+end
+
+pub struct RunResult is
+    pub ok:     bool
+    pub err:    string
+    pub result: ScriptResult
+end
+
+pub struct PostinstSandbox is
+    pub backend:     SandboxBackend
+    pub active_path: string
+end
+
+pub fn sandbox_new() -> PostinstSandbox is
+    return PostinstSandbox { backend: backend_detect(), active_path: store::active_link() }
+end
+
+fn empty_result() -> ScriptResult is
+    return ScriptResult { success: false, stdout: "", stderr: "", exit_code: 0 }
+end
+
+fn run_failed(err: string) -> RunResult is
+    return RunResult { ok: false, err: err, result: empty_result() }
+end
+
+fn first_line(s: string) -> string is
+    let p: int = compat::str_index_of(s, "\n")
+    if p < 0 is return s end
+    return str::slice(s, 0, p)
+end
+
+;; Katalog roboczy 0700 (patrz C); "" przy bledzie.
+fn make_tmp_dir(kind: string) -> string is
+    return str::trim(proc::shell("umask 077; mktemp -d /tmp/hammer_" + kind + ".XXXXXX 2>/dev/null"))
+end
+
+fn rm_tmp_dir(dir: string) is
+    if dir.starts_with("/tmp/hammer_") is system("rm -rf -- " + shq(dir)) end
+end
+
+;; Uruchamia `argv` (gotowe, juz zacytowane) z `env_prefix` (np. "DEBIAN_FRONTEND=..."),
+;; zbierajac stdout/stderr/kod. `exit_code` -1 gdy nie udalo sie uruchomic.
+fn exec_and_collect(env_prefix: string, argv: string, pkg_name: string) -> RunResult is
+    let work: string = make_tmp_dir("exec")
+    if work == "" is return run_failed("Spawning postinst for " + pkg_name + ": cannot create temp dir") end
+    let outf: string = work + "/out"
+    let errf: string = work + "/err"
+    let rcf: string = work + "/rc"
+    let script: string = "env " + env_prefix + " " + argv + " >" + shq(outf) + " 2>" + shq(errf) + "; echo $? > " + shq(rcf)
+    system("sh -c " + shq(script))
+    let rc_raw: string = if fs::exists(rcf) then str::trim(fs::read(rcf)) else ""
+    let stdout: string = if fs::exists(outf) then fs::read(outf) else ""
+    let stderr: string = if fs::exists(errf) then fs::read(errf) else ""
+    rm_tmp_dir(work)
+    let code: int = if rc_raw != "" && str::is_numeric(rc_raw) then conv::str_to_int(rc_raw) else -1
+
+    if code == 0 is
+        log::info("sandbox: postinst " + pkg_name + " OK")
+        return RunResult { ok: true, err: "",
+            result: ScriptResult { success: true, stdout: stdout, stderr: stderr, exit_code: 0 } }
+    end
+    log::warn("sandbox: postinst " + pkg_name + " failed (exit " + to_string(code) + "): " + first_line(stderr))
+    return RunResult { ok: true, err: "",
+        result: ScriptResult { success: false, stdout: stdout, stderr: stderr, exit_code: code } }
+end
+
+fn deb_env() -> string is
+    return "DEBIAN_FRONTEND=noninteractive DEBCONF_NONINTERACTIVE_SEEN=true"
+end
+
+;; patrz A: skrypt jawnie dowiazany po tmpfs
+fn run_bwrap(script: string, pkg_name: string) -> RunResult is
+    let argv: string = "bwrap --bind / / --tmpfs /tmp --tmpfs /run --dev /dev --proc /proc --unshare-pid --unshare-ipc " +
+        "--ro-bind " + shq(script) + " /tmp/maintainer-script -- /tmp/maintainer-script configure ''"
+    return exec_and_collect(deb_env(), argv, pkg_name)
+end
+
+fn run_nspawn(script: string, pkg_name: string) -> RunResult is
+    let argv: string = "systemd-nspawn --quiet --register=no --directory=/ --bind-ro=/proc --bind-ro=/sys -- " +
+        shq(script) + " configure ''"
+    return exec_and_collect("DEBIAN_FRONTEND=noninteractive", argv, pkg_name)
+end
+
+fn run_direct(script: string, pkg_name: string) -> RunResult is
+    log::warn("sandbox: no isolation available for " + pkg_name + " — running directly")
+    return exec_and_collect(deb_env(), shq(script) + " configure ''", pkg_name)
+end
+
+;; Rust: `PostinstSandbox::run_postinst`.
+pub fn run_postinst(s: PostinstSandbox, pkg_name: string, script: string) -> RunResult is
+    log::info("sandbox: running postinst for " + pkg_name + " via " + backend_name(s.backend))
+
+    let dir: string = make_tmp_dir("postinst")
+    if dir == "" is return run_failed("Cannot create temp dir for postinst") end
+    let script_path: string = dir + "/postinst"
+    fs::write(script_path, script)
+    system("chmod 755 " + shq(script_path))
+
+    let mut r: RunResult = run_failed("")
+    if is_bwrap(s.backend) is
+        r = run_bwrap(script_path, pkg_name)
+    elsif is_nspawn(s.backend) is
+        r = run_nspawn(script_path, pkg_name)
+    else is
+        r = run_direct(script_path, pkg_name)
+    end
+    rm_tmp_dir(dir)
+    return r
+end
+
+;; ── hammer sandbox <cmd> [args] ──────────────────────────────────────────
+
+pub struct SandboxRun is
+    pub err:  string
+    pub code: int
+end
+
+fn args_tail(args: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 1
+    while i < args.len() is
+        out = out + " " + shq(args[i])
+        i += 1
+    end
+    return out
+end
+
+fn home_dir_or_root() -> string is
+    return env::get_or("HOME", "/root")
+end
+
+fn sandbox_bwrap(active: string, cmd_name: string, args: [string]) -> SandboxRun is
+    let home: string = home_dir_or_root()
+    let argv: string = "bwrap --ro-bind / / --ro-bind " + shq(active + "/usr") + " /usr " +
+        "--ro-bind-try " + shq(active + "/lib") + " /lib --ro-bind-try " + shq(active + "/lib64") + " /lib64 " +
+        "--ro-bind-try " + shq(active + "/bin") + " /bin --bind " + shq(home) + " " + shq(home) + " " +
+        "--tmpfs /tmp --proc /proc --dev /dev --unshare-pid --die-with-parent -- " + shq(cmd_name) + args_tail(args)
+    return SandboxRun { err: "", code: system(argv) }
+end
+
+fn sandbox_nspawn(active: string, cmd_name: string, args: [string]) -> SandboxRun is
+    let argv: string = "systemd-nspawn --quiet --register=no " + shq("--directory=" + active) +
+        " --bind-ro=/proc --bind-ro=/sys --bind=/dev -- " + shq(cmd_name) + args_tail(args)
+    return SandboxRun { err: "", code: system(argv) }
+end
+
+;; Rust nigdy nie wraca (`process::exit`); tu wolajacy robi `exit(run.code)` gdy `err == ""`.
+pub fn cmd_sandbox(args: [string]) -> SandboxRun is
+    if args.len() == 0 is
+        return SandboxRun { err: "Usage: hammer sandbox <command> [args...]\n       " +
+            "Runs <command> in an isolated view of the active hammer generation.", code: 1 }
+    end
+    let cmd_name: string = args[0]
+    let backend: SandboxBackend = backend_detect()
+    let active: string = store::active_link()
+    if !fs::exists(active) is
+        return SandboxRun { err: "No active generation found. Run `hammer _activate`.", code: 1 }
+    end
+
+    write("  " + ui::accent_bold("⬡") + "  Launching " + ui::bold(cmd_name) + " in sandbox (" + ui::dim(backend_name(backend)) + ")")
+
+    if is_bwrap(backend) is return sandbox_bwrap(active, cmd_name, args) end
+    if is_nspawn(backend) is return sandbox_nspawn(active, cmd_name, args) end
+    write("  " + ui::yellow_bold("!") + " No sandbox tool available — running directly.")
+    return SandboxRun { err: "", code: system(shq(cmd_name) + args_tail(args)) }
+end
+
+;; ── prerm / postrm ───────────────────────────────────────────────────────
+
+fn script_args(args: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < args.len() is
+        out = out + " " + shq(args[i])
+        i += 1
+    end
+    return out
+end
+
+fn run_script_in_bwrap(active: string, script: string, args: [string]) -> int is
+    ;; patrz B: `<active>/usr`, nie korzen profilu
+    return system("bwrap --ro-bind / / --ro-bind " + shq(active + "/usr") + " /usr --bind /var /var --bind /tmp /tmp " +
+        "--proc /proc --dev /dev --tmpfs /run --unshare-pid --die-with-parent " +
+        "--ro-bind " + shq(script) + " /tmp/maintainer-script -- /bin/sh /tmp/maintainer-script" + script_args(args))
+end
+
+fn run_script_in_nspawn(active: string, script: string, args: [string]) -> int is
+    return system("systemd-nspawn --quiet --register=no " + shq("--directory=" + active) + " --bind=/dev " +
+        shq("--bind=" + script + ":/tmp/maintainer-script") + " -- /bin/sh /tmp/maintainer-script" + script_args(args))
+end
+
+fn run_script_direct(script: string, args: [string]) -> int is
+    return system("/bin/sh " + shq(script) + script_args(args))
+end
+
+;; `system()` zwraca 127 gdy powloka nie znalazla polecenia — jak Rust (`exit(127)`),
+;; ale bez konczenia procesu (odejscie 2).
+fn run_maintainer_script(s: PostinstSandbox, kind: string, script: string, args: [string]) -> ScriptResult is
+    let dir: string = make_tmp_dir(kind)
+    if dir == "" is return ScriptResult { success: false, stdout: "", stderr: "", exit_code: 1 } end
+    let script_path: string = dir + "/" + kind
+    fs::write(script_path, script)
+    system("chmod 755 " + shq(script_path))
+
+    let mut code: int = 1
+    if is_bwrap(s.backend) is
+        code = run_script_in_bwrap(s.active_path, script_path, args)
+    elsif is_nspawn(s.backend) is
+        code = run_script_in_nspawn(s.active_path, script_path, args)
+    else is
+        code = run_script_direct(script_path, args)
+    end
+    rm_tmp_dir(dir)
+    return ScriptResult { success: code == 0, stdout: "", stderr: "", exit_code: code }
+end
+
+pub fn run_prerm_script(s: PostinstSandbox, pkg_name: string, script: string) -> ScriptResult is
+    log::info("sandbox: running prerm for " + pkg_name + " via " + backend_name(s.backend))
+    return run_maintainer_script(s, "prerm", script, ["remove"])
+end
+
+pub fn run_postrm_script(s: PostinstSandbox, pkg_name: string, script: string, action: string) -> ScriptResult is
+    log::info("sandbox: running postrm (" + action + ") for " + pkg_name + " via " + backend_name(s.backend))
+    return run_maintainer_script(s, "postrm", script, [action])
+end
+
+;; ── Limity zasobow (cgroup v2) ───────────────────────────────────────────
+
+pub struct ResourceLimits is
+    pub memory_bytes: int    ;; 0 = bez limitu
+    pub cpu_weight:   int    ;; 1–10000 (100 = domyslnie)
+    pub pids_max:     int
+end
+
+pub fn limits_default() -> ResourceLimits is
+    return ResourceLimits { memory_bytes: 512 * 1024 * 1024, cpu_weight: 100, pids_max: 256 }
+end
+
+;; `systemd-run --scope` z limitami; zwraca kod wyjscia (127 gdy brak systemd-run).
+pub fn apply_cgroup_limits(cmd: string, args: [string], limits: ResourceLimits) -> int is
+    let scope_name: string = "hammer-sandbox-" + str::trim(proc::shell("echo $$")) + ".scope"
+    let mut line: string = "systemd-run --scope " + shq("--unit=" + scope_name) +
+        " " + shq("--property=MemoryMax=" + to_string(limits.memory_bytes) + "B") +
+        " " + shq("--property=CPUWeight=" + to_string(limits.cpu_weight)) +
+        " " + shq("--property=TasksMax=" + to_string(limits.pids_max)) + " -- " + shq(cmd)
+    let mut i: int = 0
+    while i < args.len() is
+        line = line + " " + shq(args[i])
+        i += 1
+    end
+    return system(line)
+end
+
+;; ── Lista dozwolonych wywolan (dokumentacja — patrz odejscie 4) ──────────
+
+pub fn allowed_syscalls() -> [string] is
+    return [
+        "read", "write", "open", "close", "stat", "fstat", "lstat",
+        "poll", "lseek", "mmap", "mprotect", "munmap", "brk",
+        "rt_sigaction", "rt_sigprocmask", "ioctl", "pread64", "pwrite64",
+        "readv", "writev", "access", "pipe", "select", "sched_yield",
+        "mremap", "msync", "mincore", "madvise", "dup", "dup2", "nanosleep",
+        "getitimer", "alarm", "setitimer", "getpid", "sendfile", "socket",
+        "connect", "accept", "sendto", "recvfrom", "sendmsg", "recvmsg",
+        "shutdown", "bind", "listen", "getsockname", "getpeername",
+        "fork", "vfork", "execve", "exit", "wait4", "kill", "uname",
+        "fcntl", "flock", "fsync", "fdatasync", "truncate", "ftruncate",
+        "getdents", "getcwd", "chdir", "fchdir", "rename", "mkdir", "rmdir",
+        "creat", "link", "unlink", "symlink", "readlink", "chmod", "fchmod",
+        "chown", "fchown", "lchown", "umask", "gettimeofday", "getrlimit",
+        "getrusage", "sysinfo", "times", "getuid", "getgid", "geteuid",
+        "getegid", "setuid", "setgid", "getgroups", "setgroups",
+        "arch_prctl", "gettid", "set_tid_address", "futex", "getdents64",
+        "set_robust_list", "get_robust_list", "clock_gettime", "clock_getres",
+        "clock_nanosleep", "exit_group", "openat", "mkdirat", "newfstatat",
+        "unlinkat", "renameat", "linkat", "symlinkat", "readlinkat",
+        "fchmodat", "fchownat", "faccessat", "pselect6", "ppoll",
+        "splice", "tee", "sync_file_range", "vmsplice", "move_pages",
+        "epoll_pwait", "signalfd", "timerfd_create", "eventfd", "fallocate",
+        "timerfd_settime", "timerfd_gettime", "accept4", "signalfd4",
+        "eventfd2", "epoll_create1", "dup3", "pipe2", "inotify_init1",
+        "preadv", "pwritev", "rt_tgsigqueueinfo", "perf_event_open",
+        "recvmmsg", "fanotify_init", "fanotify_mark", "prlimit64",
+        "getrandom", "memfd_create", "copy_file_range", "preadv2", "pwritev2"
+    ]
+end
+
+;; Rust: pusty `Vec<u8>` (placeholder) — patrz odejscie 4.
+pub fn generate_seccomp_filter() -> string is
+    return ""
+end
