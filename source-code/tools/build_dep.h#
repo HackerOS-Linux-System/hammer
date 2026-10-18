@@ -1,0 +1,877 @@
+use "std -> fs"          from "fs"
+use "std -> strings"     from "str"
+use "std -> process"     from "proc"
+use "std -> collections" from "col"
+
+mod internal
+mod ui
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+;; [mod cache pominiete: source-code/pkg/cache.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania cache::fn dzialaja bez zmian]
+;; [mod db pominiete: source-code/pkg/db.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania db::fn dzialaja bez zmian]
+mod repo
+;; [mod solver pominiete: source-code/pkg/solver/mod.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania solver::fn dzialaja bez zmian]
+;; [mod transaction pominiete: source-code/pkg/transaction.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania transaction::fn dzialaja bez zmian]
+
+;; hammer -> tools::build_dep
+;;
+;; Port of source-code/tools/build_dep.rs (Rust) to H#: indeks `Sources`
+;; (`SourcesIndex`), `hammer build-dep`, `hammer source`, `hammer mock`,
+;; `hammer build`.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `async`/`HttpClient` -> `curl`; dekompresja `.xz/.gz/.bz2` przez
+;;    `lhdeb::decompress_file` (plikowo, bez `[u8]`).
+;; 2. `HashMap<String,SourcePackage>` -> tablica `sources` + mapy `by_source`
+;;    (nazwa -> pozycja) i `bin_to_src` (binarka -> nazwa zrodla) z
+;;    `std -> collections` (tylko LLVM). Kolejnosc `ingest_text`: pozniejsze
+;;    wpisy nadpisuja wczesniejsze, jak `HashMap::insert`.
+;; 3. `anyhow::Result<()>` -> `string` ("" = OK).
+;; 4. `url_to_cache_name`: Rust uzywa `char::is_alphanumeric` (Unicode) i
+;;    liczy ZNAKI (`take(120)`); port pracuje na BAJTACH ASCII — nazwy z
+;;    wielobajtowymi znakami daja inne nazwy plikow cache (nazwy URL Debiana
+;;    sa ASCII).
+;; 5. `find_for_binary` zwraca indeks (`int`, -1 = brak) zamiast `Option<&..>`.
+;; 6. `cmd_mock`/`cmd_build`: `Command::status()` -> `system()` (dziedziczy
+;;    terminal); `debootstrap`/`systemd-nspawn` sprawdzane `command -v`.
+;; 7. `cmd_source`: SHA-256 pobranych plikow liczone `sha256sum`; niezgodny
+;;    plik jest usuwany z dysku (Rust w ogole go nie zapisywal).
+;; 8. ZACHOWANE: `cmd_build` najpierw wola `cmd_build_dep` (z nazwa PAKIETU
+;;    ZRODLOWEGO z `debian/control`), ktore szuka go w cache pakietow
+;;    BINARNYCH — dla pakietow, ktorych zrodlo nazywa sie inaczej niz binarka,
+;;    konczy sie bledem "Package ... not found".
+;; 9. ZACHOWANE: `cmd_source --index` pobiera indeksy, ale nie wypisuje bledow
+;;    pojedynczych repozytoriow (tylko ostrzezenia w logu).
+
+fn sources_cache_dir() -> string is return "/var/lib/hammer/sources" end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+fn mkdir_p(p: string) -> bool is
+    proc::shell("mkdir -p " + shq(p))
+    return fs::is_dir(p)
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+fn append_str(a: [string], x: string) -> [string] is
+    let mut o: [string] = a
+    o.push(x)
+    return o
+end
+
+fn trim_end_char(s: string, c: string) -> string is
+    let mut n: int = string_len(s)
+    while n > 0 && string_at(s, n - 1) == c is
+        n -= 1
+    end
+    return str::slice(s, 0, n)
+end
+
+;; `trim_end_matches(".xz")` (powtarzane).
+fn trim_end_matches(s0: string, suffix: string) -> string is
+    let mut s: string = s0
+    while string_len(suffix) > 0 && string_ends_with(s, suffix) is
+        s = str::slice(s, 0, string_len(s) - string_len(suffix))
+    end
+    return s
+end
+
+fn dim_dot() -> string is return ui::dim("·") end
+
+;; ── SourcePackage ────────────────────────────────────────────────────────
+
+pub struct SourcePackage is
+    pub name:          string
+    pub version:       string
+    ;; pole `Binary:` (rozdzielone przecinkami)
+    pub binaries:      [string]
+    ;; tylko nazwy pakietow
+    pub build_depends: [string]
+    ;; pole `Directory:` (sciezka w pool)
+    pub directory:     string
+    ;; (sha256, nazwa pliku) jako rownolegle tablice
+    pub files_sha:     [string]
+    pub files_name:    [string]
+    pub repo_base_uri: string
+end
+
+fn source_blank(base_uri: string) -> SourcePackage is
+    let a: [string] = []
+    let b: [string] = []
+    let c: [string] = []
+    let d: [string] = []
+    return SourcePackage { name: "", version: "", binaries: a, build_depends: b, directory: "",
+        files_sha: c, files_name: d, repo_base_uri: base_uri }
+end
+
+pub fn source_changelog_url(s: SourcePackage) -> string is
+    let dir: string = trim_end_char(s.directory, "/")
+    if compat::str_index_of(s.repo_base_uri, "debian.org") >= 0 is
+        return "https://metadata.ftp-master.debian.org/changelogs/" + dir + "/" + s.name + "_changelog"
+    end
+    if compat::str_index_of(s.repo_base_uri, "ubuntu.com") >= 0 is
+        return "https://changelogs.ubuntu.com/changelogs/" + dir + "/" + s.name + "-" + s.version
+    end
+    return trim_end_char(s.repo_base_uri, "/") + "/" + dir + "/" + s.name + "_changelog"
+end
+
+;; URL pliku `.dsc` albo "" gdy brak na liscie.
+pub fn source_dsc_url(s: SourcePackage) -> string is
+    let mut i: int = 0
+    while i < s.files_name.len() is
+        if string_ends_with(s.files_name[i], ".dsc") is
+            return trim_end_char(s.repo_base_uri, "/") + "/" + trim_end_char(s.directory, "/") + "/" + s.files_name[i]
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; ── Parser blokow Sources ────────────────────────────────────────────────
+
+;; Pierwsza alternatywa kazdej grupy, bez wersji "(>= x)" i "[arch]".
+pub fn parse_build_depends(field: string) -> [string] is
+    let groups: [string] = str::split(field, ",")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < groups.len() is
+        let first_alt: string = str::trim(str::split(groups[i], "|")[0])
+        let name_part: string = str::trim(str::split(str::trim(str::split(first_alt, "(")[0]), "[")[0])
+        if name_part != "" is out.push(name_part) end
+        i += 1
+    end
+    return out
+end
+
+pub struct ParsedBlock is
+    pub ok:  bool
+    pub src: SourcePackage
+end
+
+fn index_of_str(xs: [string], s: string) -> int is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return i end
+        i += 1
+    end
+    return -1
+end
+
+pub fn parse_source_block(block: string, base_uri: string) -> ParsedBlock is
+    let mut src: SourcePackage = source_blank(base_uri)
+    let mut in_files: bool = false
+    let mut in_checksums: bool = false
+    let mut in_builddeps: bool = false
+    let mut builddeps_buf: string = ""
+
+    let lines: [string] = str::split(block, "\n")
+    let mut li: int = 0
+    while li < lines.len() is
+        let line: string = lines[li]
+        li += 1
+        if string_starts_with(line, " ") || string_starts_with(line, "\t") is
+            let trimmed: string = str::trim(line)
+            if in_files is
+                ;; <md5> <size> <filename>
+                let parts: [string] = str::split_whitespace(trimmed)
+                if parts.len() == 3 && index_of_str(src.files_name, parts[2]) < 0 is
+                    src.files_sha = append_str(src.files_sha, "")
+                    src.files_name = append_str(src.files_name, parts[2])
+                end
+            elsif in_checksums is
+                ;; <sha256> <size> <filename>
+                let parts2: [string] = str::split_whitespace(trimmed)
+                if parts2.len() == 3 is
+                    let at: int = index_of_str(src.files_name, parts2[2])
+                    if at >= 0 is
+                        let mut shas: [string] = src.files_sha
+                        shas[at] = parts2[0]
+                        src.files_sha = shas
+                    else is
+                        src.files_sha = append_str(src.files_sha, parts2[0])
+                        src.files_name = append_str(src.files_name, parts2[2])
+                    end
+                end
+            elsif in_builddeps is
+                builddeps_buf = builddeps_buf + " " + trimmed
+            end
+        else is
+            in_files = false
+            in_checksums = false
+            in_builddeps = false
+            if string_starts_with(line, "Package:") is
+                src.name = str::trim(str::slice(line, 8, string_len(line)))
+            elsif string_starts_with(line, "Version:") is
+                src.version = str::trim(str::slice(line, 8, string_len(line)))
+            elsif string_starts_with(line, "Directory:") is
+                src.directory = str::trim(str::slice(line, 10, string_len(line)))
+            elsif string_starts_with(line, "Binary:") is
+                let bins: [string] = str::split(str::slice(line, 7, string_len(line)), ",")
+                let mut out: [string] = []
+                let mut b: int = 0
+                while b < bins.len() is
+                    let t: string = str::trim(bins[b])
+                    if t != "" is out.push(t) end
+                    b += 1
+                end
+                src.binaries = out
+            elsif string_starts_with(line, "Build-Depends:") is
+                builddeps_buf = str::slice(line, 14, string_len(line))
+                in_builddeps = true
+            elsif string_starts_with(line, "Files:") is
+                in_files = true
+            elsif string_starts_with(line, "Checksums-Sha256:") is
+                in_checksums = true
+            end
+        end
+    end
+
+    if builddeps_buf != "" is src.build_depends = parse_build_depends(builddeps_buf) end
+    return ParsedBlock { ok: src.name != "", src: src }
+end
+
+;; ── SourcesIndex ─────────────────────────────────────────────────────────
+
+pub struct SourcesIndex is
+    pub sources:    [SourcePackage]
+    ;; nazwa zrodla -> pozycja w `sources`
+    pub by_source:  any
+    ;; nazwa binarki -> nazwa zrodla
+    pub bin_to_src: any
+end
+
+pub fn sources_empty() -> SourcesIndex is
+    let s: [SourcePackage] = []
+    return SourcesIndex { sources: s, by_source: col::hashmap_new(), bin_to_src: col::hashmap_new() }
+end
+
+fn append_src(a: [SourcePackage], x: SourcePackage) -> [SourcePackage] is
+    let mut o: [SourcePackage] = a
+    o.push(x)
+    return o
+end
+
+;; Dodaje bloki tekstu `Sources` do indeksu; zwraca nowy indeks.
+pub fn sources_ingest(idx0: SourcesIndex, text: string, base_uri: string) -> SourcesIndex is
+    let mut idx: SourcesIndex = idx0
+    let blocks: [string] = str::split(text, "\n\n")
+    let mut i: int = 0
+    while i < blocks.len() is
+        if str::trim(blocks[i]) != "" is
+            let pb: ParsedBlock = parse_source_block(blocks[i], base_uri)
+            if pb.ok is
+                let src: SourcePackage = pb.src
+                let mut b: int = 0
+                while b < src.binaries.len() is
+                    col::hashmap_insert(idx.bin_to_src, src.binaries[b], src.name)
+                    b += 1
+                end
+                if col::hashmap_contains(idx.by_source, src.name) is
+                    let at: int = conv::str_to_int(col::hashmap_get(idx.by_source, src.name))
+                    let mut all: [SourcePackage] = idx.sources
+                    all[at] = src
+                    idx.sources = all
+                else is
+                    col::hashmap_insert(idx.by_source, src.name, to_string(idx.sources.len()))
+                    idx.sources = append_src(idx.sources, src)
+                end
+            end
+        end
+        i += 1
+    end
+    return idx
+end
+
+;; Pozycja zrodla budujacego `binary_name` (najpierw mapa binarek, potem
+;; zrodlo o tej samej nazwie) albo -1.
+pub fn sources_find_for_binary(idx: SourcesIndex, binary_name: string) -> int is
+    if col::hashmap_contains(idx.bin_to_src, binary_name) is
+        let src_name: string = col::hashmap_get(idx.bin_to_src, binary_name)
+        if col::hashmap_contains(idx.by_source, src_name) is
+            return conv::str_to_int(col::hashmap_get(idx.by_source, src_name))
+        end
+    end
+    if col::hashmap_contains(idx.by_source, binary_name) is
+        return conv::str_to_int(col::hashmap_get(idx.by_source, binary_name))
+    end
+    return -1
+end
+
+;; Z cache na dysku (`*.src` w SOURCES_CACHE_DIR).
+pub fn sources_load_cached() -> SourcesIndex is
+    let mut idx: SourcesIndex = sources_empty()
+    if !fs::is_dir(sources_cache_dir()) is return idx end
+    let names: [string] = str::split(proc::shell("ls -1 " + shq(sources_cache_dir()) + " 2>/dev/null"), "\n")
+    let mut i: int = 0
+    while i < names.len() is
+        if string_ends_with(names[i], ".src") is
+            let path: string = compat::path_join(sources_cache_dir(), names[i])
+            let content: string = fs::read(path)
+            let mut base_uri: string = ""
+            let lines: [string] = str::split(content, "\n")
+            let mut k: int = 0
+            while k < lines.len() && base_uri == "" is
+                if string_starts_with(lines[k], "# hammer-base-uri:") is
+                    base_uri = str::trim(str::slice(lines[k], 18, string_len(lines[k])))
+                end
+                k += 1
+            end
+            idx = sources_ingest(idx, content, base_uri)
+        end
+        i += 1
+    end
+    return idx
+end
+
+;; ── Pobieranie indeksu Sources ───────────────────────────────────────────
+
+fn url_to_cache_name(url: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < string_len(url) && i < 120 is
+        let c: string = string_at(url, i)
+        let ok: bool = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") || c == "-" || c == "_"
+        out = out + (if ok then c else "_")
+        i += 1
+    end
+    return out
+end
+
+;; `.../binary-<arch>/Packages[.xz|.gz|.bz2]` -> `.../source/Sources`; "" gdy
+;; ukladu nie rozpoznano (np. repozytorium flat).
+pub fn derive_sources_url(packages_url: string) -> string is
+    let base: string = trim_end_matches(trim_end_matches(trim_end_matches(packages_url, ".xz"), ".gz"), ".bz2")
+    let idx: int = string_rfind(base, "/binary-")
+    if idx < 0 is return "" end
+    let after_binary: string = str::slice(base, idx + 8, string_len(base))
+    let slash: int = compat::str_index_of(after_binary, "/")
+    if slash < 0 is return "" end
+    let tail: string = str::slice(after_binary, slash + 1, string_len(after_binary))
+    if tail != "Packages" is return "" end
+    return str::slice(base, 0, idx) + "/source/Sources"
+end
+
+pub struct TextResult is
+    pub text: string
+    pub err:  string
+end
+
+fn fetch_sources_text(base_url: string) -> TextResult is
+    let suffixes: [string] = [".xz", ".gz", ".bz2", ""]
+    let mut i: int = 0
+    while i < suffixes.len() is
+        let url: string = base_url + suffixes[i]
+        let tmp: string = fs::temp_file("hammer-sources")
+        if sh_ok("curl -fsSL --retry 2 -o " + shq(tmp) + " " + shq(url)) is
+            let plain: string = lhdeb::decompress_file(tmp, "Sources" + suffixes[i])
+            let text: string = fs::read(plain)
+            fs::remove(tmp)
+            fs::remove(plain)
+            return TextResult { text: text, err: "" }
+        end
+        fs::remove(tmp)
+        i += 1
+    end
+    return TextResult { text: "", err: "No Sources index variant found at " + base_url }
+end
+
+pub struct FetchResult is
+    pub idx: SourcesIndex
+    pub err: string
+end
+
+;; Pobiera `Sources` dla kazdego skonfigurowanego repo/komponentu/suite.
+pub fn sources_fetch() -> FetchResult is
+    let rl: repo::RepoLoad = repo::load()
+    let mut idx: SourcesIndex = sources_empty()
+    if rl.err != "" is return FetchResult { idx: idx, err: rl.err } end
+    mkdir_p(sources_cache_dir())
+
+    let native: string = cache::detect_arch()
+    let binary_urls: [repo::IndexUrl] = repo::index_urls(rl.list, native)
+    if binary_urls.len() == 0 is
+        log::warn("build_dep: no repositories configured for Sources index")
+        return FetchResult { idx: idx, err: "" }
+    end
+
+    let mut seen: [string] = []
+    let mut i: int = 0
+    while i < binary_urls.len() is
+        let sources_url: string = derive_sources_url(binary_urls[i].url)
+        if sources_url == "" is
+            log::warn("build_dep: could not derive Sources URL from " + binary_urls[i].url)
+        elsif !contains_str(seen, sources_url) is
+            seen.push(sources_url)
+            let base_uri: string = binary_urls[i].base_uri
+            let tr: TextResult = fetch_sources_text(sources_url)
+            if tr.err != "" is
+                log::warn("build_dep: failed to fetch " + sources_url + ": " + tr.err)
+            else is
+                let dest: string = compat::path_join(sources_cache_dir(), url_to_cache_name(sources_url) + ".src")
+                fs::write(dest, "# hammer-base-uri: " + base_uri + "\n" + tr.text)
+                idx = sources_ingest(idx, tr.text, base_uri)
+            end
+        end
+        i += 1
+    end
+    return FetchResult { idx: idx, err: "" }
+end
+
+;; Z cache; gdy pusty — pobiera.
+pub fn sources_load_or_fetch() -> FetchResult is
+    let cached: SourcesIndex = sources_load_cached()
+    if cached.sources.len() > 0 is return FetchResult { idx: cached, err: "" } end
+    return sources_fetch()
+end
+
+;; ── hammer build-dep <pkg> ───────────────────────────────────────────────
+
+fn find_build_deps_heuristic(name: string, c: cache::PackageCache) -> [string] is
+    let mut deps: [string] = []
+    let base: [string] = ["build-essential", "dpkg-dev", "fakeroot"]
+    let mut i: int = 0
+    while i < base.len() is
+        if cache::cache_get(c, base[i]) != nil is deps.push(base[i]) end
+        i += 1
+    end
+    let dev_name: string = name + "-dev"
+    if cache::cache_get(c, dev_name) != nil is deps.push(dev_name) end
+    let hits: [package::Package] = cache::cache_search(c, name)
+    let mut k: int = 0
+    while k < hits.len() && k < 20 is
+        if string_ends_with(hits[k].name, "-dev") && !contains_str(deps, hits[k].name) is deps.push(hits[k].name) end
+        k += 1
+    end
+    return deps
+end
+
+pub fn cmd_build_dep(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer build-dep <package>" end
+    let name: string = args[0]
+    let c: cache::PackageCache = cache::cache_load()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+
+    write("  " + dim_dot() + " Loading Sources index…")
+    let fr: FetchResult = sources_load_or_fetch()
+    let sidx: SourcesIndex = if fr.err == "" then fr.idx else sources_empty()
+
+    let po: package::Package? = cache::cache_get(c, name)
+    if po == nil is return "Package '" + name + "' not found. Run `hammer sync`." end
+
+    let at: int = sources_find_for_binary(sidx, name)
+    let mut build_deps: [string] = []
+    if at >= 0 && sidx.sources[at].build_depends.len() > 0 is
+        let s: SourcePackage = sidx.sources[at]
+        write("  " + dim_dot() + " Source package: " + ui::bold(s.name) + " " + ui::dim(s.version))
+        build_deps = s.build_depends
+    else is
+        write("  " + ui::yellow("!") + " No Sources entry with Build-Depends found — using heuristics.")
+        build_deps = find_build_deps_heuristic(name, c)
+    end
+
+    if build_deps.len() == 0 is
+        write("  " + dim_dot() + " No build dependencies found for '" + ui::bold(name) + "'.")
+        return ""
+    end
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Build dependencies for " + ui::bold(name))
+    write("  " + ui::dim(str::repeat("─", 60)))
+
+    let mut to_install: [string] = []
+    let mut i: int = 0
+    while i < build_deps.len() is
+        let dep: string = build_deps[i]
+        let installed: bool = idb.is_installed(dep)
+        let available: bool = cache::cache_get(c, dep) != nil
+        let mark: string = if installed then ui::bright_green("✔") elsif available then ui::cyan("○") else ui::red("✗")
+        write("  " + mark + " " + ui::bold(dep))
+        if !installed && available is to_install.push(dep) end
+        i += 1
+    end
+
+    if to_install.len() == 0 is
+        write("")
+        write("  " + ui::bright_green("✔") + " All build dependencies already installed.")
+        return ""
+    end
+
+    write("")
+    write("  Packages to install: " + ui::cyan(str::join(to_install, ", ")))
+    if !ui::confirm("Install build dependencies?") is
+        write("  Aborted.")
+        return ""
+    end
+
+    let s2: solver::Solver = solver::solver_new(c, idb)
+    let pr: solver::PlanResult = solver::solver_resolve_install(s2, to_install, false)
+    if pr.err != "" is return pr.err end
+    let ctx: transaction::TransactionContext = transaction::context_system(pr.plan, idb, to_install, false)
+    return transaction::run_transaction(ctx, "build-dep " + name)
+end
+
+pub fn cmd_build_dep_with_flags(args: [string], flags: cli_types::GlobalFlags) -> string is
+    return cmd_build_dep(args)
+end
+
+;; ── hammer source <pkg> ──────────────────────────────────────────────────
+
+fn pool_prefix(name: string) -> string is
+    if string_starts_with(name, "lib") is
+        return "lib" + (if string_len(name) > 3 then string_at(name, 3) else "a")
+    end
+    return str::slice(name, 0, 1)
+end
+
+fn build_dsc_url_heuristic(name: string, version: string, base: string) -> string is
+    let colon: int = compat::str_index_of(version, ":")
+    let ver_no_epoch: string = if colon >= 0 then str::slice(version, colon + 1, string_len(version)) else version
+    return trim_end_char(base, "/") + "/pool/main/" + pool_prefix(name) + "/" + name + "/" + name + "_" + ver_no_epoch + ".dsc"
+end
+
+pub struct DscFiles is
+    pub shas:  [string]
+    pub names: [string]
+end
+
+pub fn parse_dsc_files(dsc: string) -> DscFiles is
+    let mut shas: [string] = []
+    let mut names: [string] = []
+    let mut section: string = ""
+    let lines: [string] = str::split(dsc, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = lines[i]
+        i += 1
+        if string_starts_with(line, "Files:") is
+            section = "files"
+        elsif string_starts_with(line, "Checksums-Sha256:") is
+            section = "sha256"
+        elsif string_starts_with(line, " ") || string_starts_with(line, "\t") is
+            let parts: [string] = str::split_whitespace(line)
+            if parts.len() == 3 is
+                let fname: string = parts[2]
+                let sha: string = if section == "sha256" then parts[0] else ""
+                let at: int = index_of_str(names, fname)
+                if at >= 0 is
+                    if sha != "" is
+                        let mut s2: [string] = shas
+                        s2[at] = sha
+                        shas = s2
+                    end
+                else is
+                    shas.push(sha)
+                    names.push(fname)
+                end
+            end
+        else is
+            section = ""
+        end
+    end
+    return DscFiles { shas: shas, names: names }
+end
+
+fn arg_value(args: [string], prefix: string) -> string? is
+    let mut i: int = 0
+    while i < args.len() is
+        if string_starts_with(args[i], prefix) is return str::slice(args[i], string_len(prefix), string_len(args[i])) end
+        i += 1
+    end
+    return nil
+end
+
+pub fn cmd_source(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer source <package>" end
+    let name: string = args[0]
+    let download_only: bool = contains_str(args, "--download-only")
+    let index_only: bool = contains_str(args, "--index")
+    let dv: string? = arg_value(args, "--dir=")
+    let output_dir: string = if dv == nil then "." else dv
+
+    if index_only is
+        write("  " + dim_dot() + " Fetching Sources index for all configured repositories…")
+        let fr: FetchResult = sources_fetch()
+        if fr.err != "" is return fr.err end
+        write("  " + ui::bright_green("✔") + " " + to_string(fr.idx.sources.len()) + " source packages indexed.")
+        return ""
+    end
+
+    let c: cache::PackageCache = cache::cache_load()
+    let po: package::Package? = cache::cache_get(c, name)
+    if po == nil is return "Package '" + name + "' not found. Run `hammer sync`." end
+    let pkg: package::Package = po
+    let base: string = if pkg.repo_base_uri == nil then "" else pkg.repo_base_uri
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Fetching source for " + ui::bold(name) + " " + ui::dim(pkg.version))
+    write("  " + ui::dim(str::repeat("─", 60)))
+
+    let fr2: FetchResult = sources_load_or_fetch()
+    let sidx: SourcesIndex = if fr2.err == "" then fr2.idx else sources_empty()
+    let at: int = sources_find_for_binary(sidx, name)
+
+    let mut dsc_url: string = ""
+    if at >= 0 is
+        let su: string = source_dsc_url(sidx.sources[at])
+        dsc_url = if su != "" then su else build_dsc_url_heuristic(name, pkg.version, base)
+    else is
+        dsc_url = build_dsc_url_heuristic(name, pkg.version, base)
+    end
+
+    write("  " + dim_dot() + " Fetching DSC: " + ui::dim(dsc_url))
+    let tmp_dsc: string = fs::temp_file("hammer-dsc")
+    if !sh_ok("curl -fsSL -o " + shq(tmp_dsc) + " " + shq(dsc_url)) is
+        fs::remove(tmp_dsc)
+        write("  " + ui::red("✗") + " Could not fetch DSC: " + dsc_url)
+        write("  Try: " + ui::cyan("https://packages.debian.org/source/" + name))
+        return ""
+    end
+    let dsc_content: string = fs::read(tmp_dsc)
+    fs::remove(tmp_dsc)
+
+    if !mkdir_p(output_dir) is return "Cannot create " + output_dir end
+    let src_name: string = if at >= 0 then sidx.sources[at].name else name
+    let dsc_path: string = compat::path_join(output_dir, src_name + "_" + pkg.version + ".dsc")
+    if !fs::write(dsc_path, dsc_content) is return "Cannot write " + dsc_path end
+    write("  " + ui::green("✔") + " Saved " + ui::bold(dsc_path))
+
+    if download_only is return "" end
+
+    ;; lista plikow: z indeksu Sources (poprawne sumy) albo z .dsc
+    let mut shas: [string] = []
+    let mut fnames: [string] = []
+    if at >= 0 && sidx.sources[at].files_name.len() > 0 is
+        shas = sidx.sources[at].files_sha
+        fnames = sidx.sources[at].files_name
+    else is
+        let df: DscFiles = parse_dsc_files(dsc_content)
+        shas = df.shas
+        fnames = df.names
+    end
+
+    let directory: string = if at >= 0 then sidx.sources[at].directory else ""
+    let mut i: int = 0
+    while i < fnames.len() is
+        let filename: string = fnames[i]
+        let file_url: string = if directory != "" then trim_end_char(base, "/") + "/" + trim_end_char(directory, "/") + "/" + filename else trim_end_char(base, "/") + "/pool/main/" + pool_prefix(name) + "/" + name + "/" + filename
+        let dest: string = compat::path_join(output_dir, filename)
+        write("  " + dim_dot() + " Downloading " + filename + "…")
+        if sh_ok("curl -fsSL --retry 2 -o " + shq(dest) + " " + shq(file_url)) is
+            let mut good: bool = true
+            if shas[i] != "" is
+                let out: string = str::trim(proc::shell("sha256sum -- " + shq(dest) + " 2>/dev/null"))
+                let actual: string = if out == "" then "" else str::slice(out, 0, compat::str_index_of(out, " "))
+                if actual != shas[i] is
+                    write("  " + ui::red("✗") + " SHA256 mismatch for " + filename + " — skipping")
+                    fs::remove(dest)
+                    good = false
+                end
+            end
+            if good is
+                write("  " + ui::green("✔") + " " + ui::bold(filename) + " (" + ui::dim(ui::human_size(fs::size(dest))) + ")")
+            end
+        else is
+            write("  " + ui::red("✗") + " " + filename + ": " + ui::dim("download failed"))
+        end
+        i += 1
+    end
+
+    write("")
+    write("  Source files in: " + ui::cyan(output_dir))
+    write("  Build: " + ui::cyan("cd " + output_dir + " && dpkg-buildpackage -us -uc"))
+    return ""
+end
+
+;; ── hammer mock ──────────────────────────────────────────────────────────
+
+pub fn cmd_mock(args: [string]) -> string is
+    let sv: string? = arg_value(args, "--suite=")
+    let suite: string = if sv == nil then "bookworm" else sv
+    let av: string? = arg_value(args, "--arch=")
+    let arch: string = if av == nil then cache::detect_arch() else av
+    let clean: bool = contains_str(args, "--clean")
+    let shell_flag: bool = contains_str(args, "--shell")
+
+    let mock_root: string = "/var/cache/hammer/mock/" + suite + "-" + arch
+    if clean && fs::exists(mock_root) is
+        write("  " + dim_dot() + " Cleaning mock root " + mock_root + "…")
+        proc::shell("rm -rf -- " + shq(mock_root))
+    end
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  hammer mock — " + ui::bold(suite) + " " + ui::dim(arch))
+    write("  Root: " + ui::dim(mock_root))
+    write("  " + ui::dim(str::repeat("─", 60)))
+
+    if !fs::exists(mock_root) is
+        write("  " + ui::cyan("·") + " Bootstrapping " + suite + " environment…")
+        let be: string = bootstrap_mock_root(mock_root, suite, arch)
+        if be != "" is return be end
+    end
+
+    if shell_flag is
+        write("  " + ui::cyan("·") + " Entering mock shell (exit to return)…")
+        enter_mock_shell(mock_root)
+    else is
+        write("  " + ui::bright_green("✔") + " Mock environment ready at " + ui::cyan(mock_root))
+        write("  Shell: " + ui::cyan("hammer mock --shell --suite=" + suite))
+    end
+    return ""
+end
+
+fn bootstrap_mock_root(root: string, suite: string, arch: string) -> string is
+    if !mkdir_p(root) is return "Cannot create " + root end
+    if sh_ok("command -v debootstrap") is
+        write("  " + dim_dot() + " Running debootstrap…")
+        let rc: int = system("debootstrap --arch " + shq(arch) + " --variant=minbase " + shq(suite) + " " + shq(root) + " http://deb.debian.org/debian")
+        if rc != 0 is return "debootstrap failed with exit code " + to_string(rc / 256) end
+        write("  " + ui::bright_green("✔") + " Bootstrap complete.")
+        return ""
+    end
+    write("  " + ui::yellow_bold("!") + " debootstrap not found.")
+    write("  Install it first: " + ui::cyan("hammer install debootstrap"))
+    return "debootstrap required for mock bootstrap"
+end
+
+;; Konczy proces kodem polecenia (jak `process::exit`).
+fn enter_mock_shell(root: string) is
+    if sh_ok("command -v systemd-nspawn") is
+        let rc: int = system("systemd-nspawn --quiet --directory " + shq(root) + " /bin/bash --login")
+        exit(rc / 256)
+    end
+    write("  " + ui::yellow("!") + " Using chroot (limited isolation).")
+    let rc2: int = system("chroot " + shq(root) + " /bin/bash")
+    exit(rc2 / 256)
+end
+
+;; ── hammer build ─────────────────────────────────────────────────────────
+
+fn read_source_name(dir: string) -> string is
+    let control: string = fs::read(compat::path_join(dir, "debian/control"))
+    let lines: [string] = str::split(control, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if string_starts_with(lines[i], "Source:") is return str::trim(str::slice(lines[i], 7, string_len(lines[i]))) end
+        if string_starts_with(lines[i], "Package:") is return str::trim(str::slice(lines[i], 8, string_len(lines[i]))) end
+        i += 1
+    end
+    return ""
+end
+
+pub fn cmd_build(args: [string]) -> string is
+    let arch_only: bool = contains_str(args, "--arch-only")
+    let indep_only: bool = contains_str(args, "--indep-only")
+    let use_sbuild: bool = contains_str(args, "--sbuild")
+    let mut dir: string = "."
+    let mut i: int = 0
+    while i < args.len() is
+        if string_slice(args[i], 0, 1) != "-" is
+            dir = args[i]
+            i = args.len()
+        else is
+            i += 1
+        end
+    end
+
+    if !fs::exists(compat::path_join(dir, "debian/control")) is
+        return "'" + dir + "' does not look like a Debian source directory (no debian/control)."
+    end
+
+    write("  " + ui::accent_bold("⬡") + "  Installing build-dependencies…")
+    let pkg_name: string = read_source_name(dir)
+    if pkg_name == "" is return "Could not determine package name from debian/control" end
+    let e: string = cmd_build_dep([pkg_name])
+    if e != "" is return e end
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Building " + ui::bold(pkg_name) + "…")
+    if use_sbuild is return build_with_sbuild(dir, arch_only, indep_only) end
+    return build_with_dpkg_buildpackage(dir, arch_only, indep_only)
+end
+
+fn build_with_dpkg_buildpackage(dir: string, arch_only: bool, indep_only: bool) -> string is
+    let mut flags: string = "-us -uc"
+    if arch_only is flags = flags + " -B" end
+    if indep_only is flags = flags + " -A" end
+    write("  " + ui::cyan("→") + " dpkg-buildpackage " + ui::dim(flags))
+    if !sh_ok("command -v dpkg-buildpackage") is return "dpkg-buildpackage not found — install dpkg-dev" end
+    let rc: int = system("cd " + shq(dir) + " && dpkg-buildpackage " + flags)
+    if rc != 0 is return "dpkg-buildpackage failed with exit " + to_string(rc / 256) end
+    write("  " + ui::bright_green_bold("✔") + " Build complete.")
+    return ""
+end
+
+fn build_with_sbuild(dir: string, arch_only: bool, indep_only: bool) -> string is
+    let mut flags: string = "--no-clean-source"
+    if arch_only is flags = flags + " --arch-only" end
+    if indep_only is flags = flags + " --indep-only" end
+    write("  " + ui::cyan("→") + " sbuild " + ui::dim(flags))
+    if !sh_ok("command -v sbuild") is return "sbuild not found — install sbuild" end
+    let rc: int = system("cd " + shq(dir) + " && sbuild " + flags)
+    if rc != 0 is return "sbuild failed with exit " + to_string(rc / 256) end
+    write("  " + ui::bright_green_bold("✔") + " sbuild complete.")
+    return ""
+end
+
+;; ── Testy (czyste funkcje; patrz `sources_url_tests` w Rust) ──────────────
+
+fn t_text(label: string, got: string, want: string) -> int is
+    if got == want is return 0 end
+    write("build_dep::self_test FAIL: " + label + " got [" + got + "] want [" + want + "]")
+    return 1
+end
+
+fn t_int(label: string, got: int, want: int) -> int is
+    if got == want is return 0 end
+    write("build_dep::self_test FAIL: " + label + " got " + to_string(got) + " want " + to_string(want))
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow.
+pub fn self_test() -> int is
+    let mut f: int = 0
+    f += t_text("derive Packages", derive_sources_url("https://deb.debian.org/debian/dists/bookworm/main/binary-amd64/Packages"), "https://deb.debian.org/debian/dists/bookworm/main/source/Sources")
+    f += t_text("derive Packages.xz", derive_sources_url("https://deb.debian.org/debian/dists/bookworm/main/binary-amd64/Packages.xz"), "https://deb.debian.org/debian/dists/bookworm/main/source/Sources")
+    f += t_text("derive flat", derive_sources_url("file:///srv/repo/Packages"), "")
+    f += t_text("derive wrong tail", derive_sources_url("https://x/dists/s/main/binary-amd64/Release"), "")
+
+    let bd: [string] = parse_build_depends("debhelper-compat (= 13), libfoo-dev | libbar-dev, libx [amd64 !i386], python3:any (>= 3.8)")
+    f += t_int("build-depends count", bd.len(), 4)
+    f += t_text("bd[0]", bd[0], "debhelper-compat")
+    f += t_text("bd[1] first alt", bd[1], "libfoo-dev")
+    f += t_text("bd[2] arch stripped", bd[2], "libx")
+    f += t_text("bd[3]", bd[3], "python3:any")
+
+    let block: string = "Package: hello\nVersion: 2.10-3\nBinary: hello, hello-dbg\nDirectory: pool/main/h/hello\nBuild-Depends: debhelper (>= 12),\n gettext\nFiles:\n aaa 100 hello_2.10-3.dsc\n bbb 200 hello_2.10.orig.tar.gz\nChecksums-Sha256:\n sha1x 100 hello_2.10-3.dsc\n sha2x 200 hello_2.10.orig.tar.gz\n"
+    let pb: ParsedBlock = parse_source_block(block, "https://deb.debian.org/debian")
+    f += t_int("block ok", if pb.ok then 1 else 0, 1)
+    f += t_text("name", pb.src.name, "hello")
+    f += t_text("version", pb.src.version, "2.10-3")
+    f += t_int("binaries", pb.src.binaries.len(), 2)
+    f += t_text("build_depends joined", str::join(pb.src.build_depends, ","), "debhelper,gettext")
+    f += t_int("files", pb.src.files_name.len(), 2)
+    f += t_text("sha of dsc", pb.src.files_sha[0], "sha1x")
+    f += t_text("dsc url", source_dsc_url(pb.src), "https://deb.debian.org/debian/pool/main/h/hello/hello_2.10-3.dsc")
+    f += t_text("changelog url", source_changelog_url(pb.src), "https://metadata.ftp-master.debian.org/changelogs/pool/main/h/hello/hello_changelog")
+
+    f += t_int("no name => not ok", if parse_source_block("Version: 1\n", "x").ok then 1 else 0, 0)
+
+    let df: DscFiles = parse_dsc_files("Format: 3.0\nFiles:\n m1 10 a.dsc\n m2 20 b.tar.gz\nChecksums-Sha256:\n s1 10 a.dsc\n s2 20 b.tar.gz\n")
+    f += t_int("dsc files", df.names.len(), 2)
+    f += t_text("dsc sha b", df.shas[1], "s2")
+    f += t_text("dsc heuristic", build_dsc_url_heuristic("libfoo", "1:2.0-1", "https://d.o/debian/"), "https://d.o/debian/pool/main/libf/libfoo/libfoo_2.0-1.dsc")
+    return f
+end
