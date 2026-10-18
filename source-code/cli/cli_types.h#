@@ -1,0 +1,221 @@
+use "std -> strings" from "str"
+use "std -> env"     from "env"
+use "std -> conv"    from "conv"
+
+mod internal
+mod ui
+
+;; hammer -> cli::cli_types
+;;
+;; Port of source-code/cli/types.rs (Rust) to H#: globalne flagi
+;; (`-y`, `--json`, `--arch=...`, ...) i pomocnicze parsowanie argumentow.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. Nazwa pliku: `types.h#` -> `cli_types.h#` (nazwa modulu = nazwa pliku;
+;;    `types` bylo zbyt ogolne, a `cli.h#` kolidowalby z katalogiem `cli`).
+;; 2. `GlobalFlags::parse(&mut Vec<String>)` (mutuje argumenty przez
+;;    `retain`) -> `parse_global_flags(args) -> ParsedArgs { flags, args }`
+;;    (interpreter i LLVM roznia sie w przekazywaniu argumentow — styl
+;;    funkcyjny dziala w obu).
+;; 3. `Option<String>` -> `string?`; `ColorMode` -> enum bez danych
+;;    porownywany przez `color_label`.
+;; 4. `libc::isatty(STDOUT)` -> `system("[ -t 1 ]")` (dziedziczy stdout, wiec
+;;    test dotyczy prawdziwego terminala), kod wyjscia 0 = terminal.
+;; 5. `std::env::set_var` -> `env::set` (zmienia srodowisko TEGO procesu i
+;;    potomkow; jak w Rust).
+;; 6. `flag_value`: zwraca napis po prefiksie z obcieciem poczatkowych `=`
+;;    (`trim_start_matches('=')`), nil gdy flagi brak.
+
+pub enum ColorMode is
+    Auto
+    Always
+    Never
+end
+
+pub fn color_label(m: ColorMode) -> string is
+    match m is
+        ColorMode::Auto   => is return "auto" end
+        ColorMode::Always => is return "always" end
+        ColorMode::Never  => is return "never" end
+    end
+end
+
+pub struct GlobalFlags is
+    ;; Potwierdzenia
+    pub yes:         bool
+    pub assume_yes:  bool
+    ;; Wyjscie
+    pub verbose:     bool
+    pub quiet:       bool
+    pub debug:       bool
+    pub json:        bool
+    pub no_progress: bool
+    pub color:       ColorMode
+    ;; Operacja
+    pub dry_run:     bool
+    pub user_mode:   bool
+    pub arch:        string?
+    pub root:        string?
+    ;; Siec
+    pub no_download: bool
+    pub force:       bool
+end
+
+pub fn flags_default() -> GlobalFlags is
+    return GlobalFlags { yes: false, assume_yes: false, verbose: false, quiet: false, debug: false,
+        json: false, no_progress: false, color: ColorMode::Auto, dry_run: false, user_mode: false,
+        arch: nil, root: nil, no_download: false, force: false }
+end
+
+pub struct ParsedArgs is
+    pub flags: GlobalFlags
+    ;; argumenty bez rozpoznanych flag globalnych (argv[0] zostaje)
+    pub args:  [string]
+end
+
+;; Rust: `GlobalFlags::parse`. Zdejmuje flagi globalne z `args`.
+pub fn parse_global_flags(args: [string]) -> ParsedArgs is
+    let mut f: GlobalFlags = flags_default()
+
+    if env::get("HAMMER_LOG_LEVEL") == "debug" is
+        f.debug = true
+        f.verbose = true
+    end
+    let no_color: string = env::get("NO_COLOR")
+    if no_color != nil && no_color != "" is f.color = ColorMode::Never end
+
+    let mut rest: [string] = []
+    let mut i: int = 0
+    while i < args.len() is
+        let a: string = args[i]
+        if a == "--user" || a == "-U" is
+            f.user_mode = true
+        elsif a == "-y" || a == "--yes" is
+            f.yes = true
+        elsif a == "--assume-yes" is
+            f.assume_yes = true
+            f.yes = true
+        elsif a == "-v" || a == "--verbose" is
+            f.verbose = true
+        elsif a == "-q" || a == "--quiet" is
+            f.quiet = true
+        elsif a == "--debug" is
+            f.debug = true
+            f.verbose = true
+        elsif a == "--json" is
+            f.json = true
+        elsif a == "--no-progress" is
+            f.no_progress = true
+        elsif a == "-n" || a == "--dry-run" is
+            f.dry_run = true
+        elsif a == "--no-download" is
+            f.no_download = true
+        elsif a == "--force" is
+            f.force = true
+        elsif a == "--color=always" is
+            f.color = ColorMode::Always
+        elsif a == "--color=never" is
+            f.color = ColorMode::Never
+        elsif a == "--color=auto" is
+            f.color = ColorMode::Auto
+        elsif string_starts_with(a, "--arch=") is
+            f.arch = str::slice(a, 7, string_len(a))
+        elsif string_starts_with(a, "--root=") is
+            f.root = str::slice(a, 7, string_len(a))
+        else is
+            rest.push(a)
+        end
+        i += 1
+    end
+
+    ;; Tryb koloru przez zmienne srodowiskowe
+    if color_label(f.color) == "never" is env::set("NO_COLOR", "1") end
+    if color_label(f.color) == "always" is env::set("CLICOLOR_FORCE", "1") end
+
+    ;; Poziom logowania
+    if f.debug is log::set_verbose() end
+    if f.quiet is log::set_quiet() end
+
+    return ParsedArgs { flags: f, args: rest }
+end
+
+;; Czy wyjscie ma byc kolorowe.
+pub fn use_color(f: GlobalFlags) -> bool is
+    let label: string = color_label(f.color)
+    if label == "always" is return true end
+    if label == "never" is return false end
+    return system("[ -t 1 ]") == 0
+end
+
+;; Baner dry-run (wolac na poczatku komendy zmieniajacej stan).
+pub fn print_dry_run_banner(f: GlobalFlags) is
+    if f.dry_run is
+        write("  " + ui::bold(ui::yellow("DRY-RUN")) + " " + ui::bold("mode") + " — no changes will be made")
+    end
+end
+
+;; Czy pokazywac interaktywne pytania.
+pub fn interactive(f: GlobalFlags) -> bool is
+    return !f.yes && !f.assume_yes && !f.json && !f.no_progress
+end
+
+;; ── Pomocnicze ───────────────────────────────────────────────────────────
+
+pub fn has_flag(args: [string], flag: string) -> bool is
+    let mut i: int = 0
+    while i < args.len() is
+        if args[i] == flag is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Wartosc flagi `--prefix=VALUE` po `prefix` (bez poczatkowych `=`); nil gdy brak.
+pub fn flag_value(args: [string], prefix: string) -> string? is
+    let mut i: int = 0
+    while i < args.len() is
+        if string_starts_with(args[i], prefix) is
+            let mut s: int = string_len(prefix)
+            while s < string_len(args[i]) && string_at(args[i], s) == "=" is
+                s += 1
+            end
+            return str::slice(args[i], s, string_len(args[i]))
+        end
+        i += 1
+    end
+    return nil
+end
+
+pub fn non_flag_args(args: [string]) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < args.len() is
+        if string_slice(args[i], 0, 1) != "-" is out.push(args[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; ── Testy ────────────────────────────────────────────────────────────────
+
+fn ct_int(label: string, got: int, want: int) -> int is
+    if got == want is return 0 end
+    write("cli_types::self_test FAIL: " + label + " got " + to_string(got) + " want " + to_string(want))
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow (bez efektow ubocznych: nie wywoluje
+;; `parse_global_flags`, ktore ustawia srodowisko i poziom logowania).
+pub fn self_test() -> int is
+    let mut f: int = 0
+    let args: [string] = ["--keep=5", "-y", "pkg", "--depth==3", "--arch=arm64"]
+    f += ct_int("has -y", if has_flag(args, "-y") then 1 else 0, 1)
+    f += ct_int("has -z", if has_flag(args, "-z") then 1 else 0, 0)
+    let kv: string? = flag_value(args, "--keep=")
+    f += ct_int("flag_value keep", if kv == nil then -1 else conv::str_to_int(kv), 5)
+    let dv: string? = flag_value(args, "--depth=")
+    f += ct_int("flag_value trims =", if dv == nil then -1 else conv::str_to_int(dv), 3)
+    f += ct_int("flag_value missing", if flag_value(args, "--nope=") == nil then 1 else 0, 1)
+    f += ct_int("non_flag_args", non_flag_args(args).len(), 1)
+    return f
+end
