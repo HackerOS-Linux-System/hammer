@@ -1,0 +1,407 @@
+use "std -> strings" from "str"
+
+mod package
+mod cache
+mod db
+mod multi_arch
+mod ui
+mod version
+
+;; hammer -> pkg::solver::conflicts
+;;
+;; Port of source-code/pkg/solver/conflicts.rs (Rust) to H#.
+;; Wykrywanie konfliktow: Conflicts:/Breaks:/Replaces:, konflikty
+;; multi-arch, odwrotne zaleznosci i `resolve_replaces`.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. Pole `with` -> `with_pkg` (`with` bywa slowem zarezerwowanym).
+;; 2. `check_install` zwraca nowa tablice (nie ma `&mut Vec`); tak samo
+;;    `check_multi_arch` zwraca liste, a `check_install` ja doklada.
+;; 3. `DbInstalledView` (adapter `InstalledView` nad `InstalledDb`) ->
+;;    `multi_arch::view_from_installed(idb.list_all())`: migawka budowana
+;;    jednym zapytaniem zamiast `db.get()` na kazde `name:arch`. Klucze
+;;    obcych architektur jak w Rust (i386, arm64, armhf, armel, ppc64el,
+;;    s390x) — ta lista siedzi w `multi_arch.h#`.
+;; 4. `format_conflict_explanation`: `owo_colors` -> `ui::` (ANSI).
+;; 5. `Option<String>` -> `string?`; `HashSet` -> tablica + `contains`.
+;; 6. `check_reverse_breaks` bierze `cache::PackageCache` (struktura z
+;;    `pkg/cache.h#`) i `cache_get` — jak `cache.get()` w Rust.
+
+pub enum ConflictKind is
+    Conflicts
+    Breaks
+    Replaces
+end
+
+pub fn kind_label(k: ConflictKind) -> string is
+    match k is
+        ConflictKind::Conflicts => is return "Conflicts" end
+        ConflictKind::Breaks    => is return "Breaks" end
+        ConflictKind::Replaces  => is return "Replaces" end
+    end
+end
+
+fn kind_is_replaces(k: ConflictKind) -> bool is
+    match k is
+        ConflictKind::Replaces  => is return true end
+        ConflictKind::Conflicts => is return false end
+        ConflictKind::Breaks    => is return false end
+    end
+end
+
+pub struct ConflictInfo is
+    pub message:  string
+    pub kind:     ConflictKind
+    pub pkg_name: string
+    pub with_pkg: string
+    pub hard:     bool
+    ;; Opcjonalnie: konkretny plik/powod konfliktu
+    pub detail:   string?
+end
+
+;; ── Pomocnicze ───────────────────────────────────────────────────────────
+
+;; `constraint.map(|c| satisfies(ver, c.op, c.version)).unwrap_or(true)`.
+fn constraint_holds(alt: package::DepAlternative, ver: string) -> bool is
+    if alt.constraint == nil is return true end
+    let c: package::VersionConstraint = alt.constraint
+    return version::satisfies(ver, package::op_to_str(c.op), c.version)
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ── check_install — z czym koliduje instalacja `candidate`? ──────────────
+
+pub fn check_install(candidate: package::Package, idb: db::InstalledDb) -> [ConflictInfo] is
+    let mut out: [ConflictInfo] = []
+
+    ;; 1. Conflicts: (twarde)
+    if candidate.conflicts != nil is
+        let c_str: string = candidate.conflicts
+        let groups: [package::DepGroup] = package::parse_dep_field(c_str)
+        let mut gi: int = 0
+        while gi < groups.len() is
+            let alts: [package::DepAlternative] = groups[gi].alternatives
+            let mut ai: int = 0
+            while ai < alts.len() is
+                let alt: package::DepAlternative = alts[ai]
+                let io: db::InstalledPackage? = idb.get(alt.name)
+                if io != nil is
+                    let inst: db::InstalledPackage = io
+                    if constraint_holds(alt, inst.version) is
+                        out.push(ConflictInfo {
+                            message: "Package '" + candidate.name + "' conflicts with installed '" + inst.name + "' " + inst.version,
+                            kind: ConflictKind::Conflicts,
+                            pkg_name: candidate.name,
+                            with_pkg: inst.name,
+                            hard: true,
+                            detail: nil })
+                    end
+                end
+                ai += 1
+            end
+            gi += 1
+        end
+    end
+
+    ;; 2. Breaks: (miekkie — ostrzezenie, bez twardej blokady)
+    if candidate.breaks != nil is
+        let b_str: string = candidate.breaks
+        let bgroups: [package::DepGroup] = package::parse_dep_field(b_str)
+        let mut bg: int = 0
+        while bg < bgroups.len() is
+            let balts: [package::DepAlternative] = bgroups[bg].alternatives
+            let mut ba: int = 0
+            while ba < balts.len() is
+                let balt: package::DepAlternative = balts[ba]
+                let bo: db::InstalledPackage? = idb.get(balt.name)
+                if bo != nil is
+                    let binst: db::InstalledPackage = bo
+                    if constraint_holds(balt, binst.version) is
+                        out.push(ConflictInfo {
+                            message: "Package '" + candidate.name + "' breaks installed '" + binst.name + "' " + binst.version + " — consider upgrading or removing it",
+                            kind: ConflictKind::Breaks,
+                            pkg_name: candidate.name,
+                            with_pkg: binst.name,
+                            hard: false,
+                            detail: nil })
+                    end
+                end
+                ba += 1
+            end
+            bg += 1
+        end
+    end
+
+    ;; 3. Replaces: (informacyjnie — kandydat moze zastapic zainstalowany)
+    if candidate.replaces != nil is
+        let r_str: string = candidate.replaces
+        let rgroups: [package::DepGroup] = package::parse_dep_field(r_str)
+        let mut rg: int = 0
+        while rg < rgroups.len() is
+            let ralts: [package::DepAlternative] = rgroups[rg].alternatives
+            let mut ra: int = 0
+            while ra < ralts.len() is
+                let ralt: package::DepAlternative = ralts[ra]
+                let ro: db::InstalledPackage? = idb.get(ralt.name)
+                if ro != nil is
+                    out.push(ConflictInfo {
+                        message: "Package '" + candidate.name + "' replaces installed '" + ralt.name + "' — the old package will be removed",
+                        kind: ConflictKind::Replaces,
+                        pkg_name: candidate.name,
+                        with_pkg: ralt.name,
+                        hard: false,
+                        detail: nil })
+                end
+                ra += 1
+            end
+            rg += 1
+        end
+    end
+
+    ;; 4. Konflikty multi-arch
+    let ma: [ConflictInfo] = check_multi_arch(candidate, idb)
+    let mut mi: int = 0
+    while mi < ma.len() is
+        out.push(ma[mi])
+        mi += 1
+    end
+    return out
+end
+
+;; ── check_reverse_breaks — co zainstalowanego zepsuje `candidate`? ───────
+
+pub fn check_reverse_breaks(candidate: package::Package, idb: db::InstalledDb, c: cache::PackageCache) -> [ConflictInfo] is
+    let mut out: [ConflictInfo] = []
+    let all: [db::InstalledPackage] = idb.list_all()
+
+    let mut i: int = 0
+    while i < all.len() is
+        let inst: db::InstalledPackage = all[i]
+        let cached: package::Package? = cache::cache_get(c, inst.name)
+        if cached != nil is
+            let cp: package::Package = cached
+            if cp.conflicts != nil is
+                let conf_str: string = cp.conflicts
+                let groups: [package::DepGroup] = package::parse_dep_field(conf_str)
+                let mut gi: int = 0
+                while gi < groups.len() is
+                    let alts: [package::DepAlternative] = groups[gi].alternatives
+                    let mut ai: int = 0
+                    while ai < alts.len() is
+                        let alt: package::DepAlternative = alts[ai]
+                        if alt.name == candidate.name is
+                            ;; czy ograniczenie wersji pasuje?
+                            if constraint_holds(alt, candidate.version) is
+                                out.push(ConflictInfo {
+                                    message: "Installed package '" + inst.name + "' " + inst.version + " conflicts with '" + candidate.name + "' " + candidate.version,
+                                    kind: ConflictKind::Conflicts,
+                                    pkg_name: inst.name,
+                                    with_pkg: candidate.name,
+                                    hard: true,
+                                    detail: "'" + inst.name + "' has Conflicts: " + candidate.name })
+                            end
+                        end
+                        ai += 1
+                    end
+                    gi += 1
+                end
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ── reverse_depends — co zainstalowanego zalezy od usuwanych? ────────────
+;; (swiadome wersji; alternatywy OR spelnione przez inne pakiety ignorowane)
+
+;; Ograniczenie wersji alternatywy: bez ograniczenia / bez wpisu w bazie
+;; => true (jak `and_then(..).unwrap_or(true)`).
+fn alt_constraint_met(idb: db::InstalledDb, alt: package::DepAlternative) -> bool is
+    if alt.constraint == nil is return true end
+    let c: package::VersionConstraint = alt.constraint
+    let io: db::InstalledPackage? = idb.get(alt.name)
+    if io == nil is return true end
+    let i: db::InstalledPackage = io
+    return version::satisfies(i.version, package::op_to_str(c.op), c.version)
+end
+
+pub fn reverse_depends(removing: [string], idb: db::InstalledDb) -> [string] is
+    let mut rdeps: [string] = []
+    let all: [db::InstalledPackage] = idb.list_all()
+
+    let mut i: int = 0
+    while i < all.len() is
+        let inst: db::InstalledPackage = all[i]
+        if !contains_str(removing, inst.name) && inst.depends != nil is
+            let dep_str: string = inst.depends
+            let groups: [package::DepGroup] = package::parse_dep_field(dep_str)
+            let mut depends_on_removed: bool = false
+            let mut gi: int = 0
+            while gi < groups.len() && !depends_on_removed is
+                let alts: [package::DepAlternative] = groups[gi].alternatives
+                ;; grupa jest NIESPELNIONA tylko gdy WSZYSTKIE alternatywy sa usuwane
+                let mut all_removed: bool = true
+                let mut ai: int = 0
+                while ai < alts.len() is
+                    if !contains_str(removing, alts[ai].name) is all_removed = false end
+                    ai += 1
+                end
+                if all_removed is
+                    let mut bi: int = 0
+                    while bi < alts.len() is
+                        if contains_str(removing, alts[bi].name) && alt_constraint_met(idb, alts[bi]) is
+                            depends_on_removed = true
+                        end
+                        bi += 1
+                    end
+                end
+                gi += 1
+            end
+            if depends_on_removed is rdeps.push(inst.name) end
+        end
+        i += 1
+    end
+    return rdeps
+end
+
+;; ── resolve_replaces — ktore zainstalowane pakiety usunac, bo kandydat
+;;    je zastepuje (Replaces:) ────────────────────────────────────────────
+
+pub fn resolve_replaces(candidates: [package::Package], idb: db::InstalledDb) -> [string] is
+    let mut to_remove: [string] = []
+    let mut ci: int = 0
+    while ci < candidates.len() is
+        let cand: package::Package = candidates[ci]
+        if cand.replaces != nil is
+            let r_str: string = cand.replaces
+            let groups: [package::DepGroup] = package::parse_dep_field(r_str)
+            let mut gi: int = 0
+            while gi < groups.len() is
+                let alts: [package::DepAlternative] = groups[gi].alternatives
+                let mut ai: int = 0
+                while ai < alts.len() is
+                    let alt: package::DepAlternative = alts[ai]
+                    let io: db::InstalledPackage? = idb.get(alt.name)
+                    if io != nil is
+                        let inst: db::InstalledPackage = io
+                        if constraint_holds(alt, inst.version) && !contains_str(to_remove, alt.name) is
+                            to_remove.push(alt.name)
+                        end
+                    end
+                    ai += 1
+                end
+                gi += 1
+            end
+        end
+        ci += 1
+    end
+    return to_remove
+end
+
+;; ── format_conflict_explanation — czytelny blok bledu ────────────────────
+
+pub fn format_conflict_explanation(conflicts: [ConflictInfo]) -> string is
+    let mut lines: [string] = []
+    let mut i: int = 0
+    while i < conflicts.len() is
+        let c: ConflictInfo = conflicts[i]
+        let mut prefix: string = ""
+        if c.hard is
+            prefix = "  " + ui::red_bold("✗") + " " + ui::red(kind_label(c.kind))
+        else is
+            prefix = "  " + ui::yellow("⚠") + " " + ui::yellow(kind_label(c.kind))
+        end
+        lines.push(prefix + ": " + c.message)
+        if c.detail != nil is
+            let d: string = c.detail
+            lines.push("     " + ui::dim(d))
+        end
+        if kind_is_replaces(c.kind) is
+            lines.push("     " + ui::dim("→") + " '" + ui::cyan(c.with_pkg) + "' will be auto-removed.")
+        end
+        i += 1
+    end
+    return str::join(lines, "\n")
+end
+
+;; ── Konflikty multi-arch (wpiete w check_install) ────────────────────────
+
+;; Uruchamia sprawdzenie multi-arch i zwraca wyniki jako `ConflictInfo`.
+pub fn check_multi_arch(candidate: package::Package, idb: db::InstalledDb) -> [ConflictInfo] is
+    let mut out: [ConflictInfo] = []
+    let ma_db: multi_arch::MultiArchDb = multi_arch::multi_arch_db_load()
+
+    ;; Tryb Multi-Arch: pakiety "all" zachowuja sie jak Foreign.
+    let mut ma_mode: multi_arch::MultiArchMode = multi_arch::MultiArchMode::No
+    if candidate.architecture == "all" is
+        ma_mode = multi_arch::MultiArchMode::Foreign
+    else is
+        let mo: multi_arch::MultiArchMode? = multi_arch::get_mode(ma_db, candidate.name)
+        if mo != nil is ma_mode = mo end
+    end
+
+    ;; Lista konfliktow z pola Conflicts: (nazwa, opcjonalny kwalifikator arch)
+    let mut specs: [multi_arch::ConflictSpec] = []
+    if candidate.conflicts != nil is
+        let s: string = candidate.conflicts
+        let groups: [package::DepGroup] = package::parse_dep_field(s)
+        let mut gi: int = 0
+        while gi < groups.len() is
+            let alts: [package::DepAlternative] = groups[gi].alternatives
+            let mut ai: int = 0
+            while ai < alts.len() is
+                let nm: string = alts[ai].name
+                let colon: int = string_find(nm, ":")
+                if colon >= 0 is
+                    let arch_q: string? = str::slice(nm, colon + 1, string_len(nm))
+                    specs.push(multi_arch::ConflictSpec { name: str::slice(nm, 0, colon), arch: arch_q })
+                else is
+                    specs.push(multi_arch::ConflictSpec { name: nm, arch: nil })
+                end
+                ai += 1
+            end
+            gi += 1
+        end
+    end
+
+    let view: multi_arch::InstalledView = multi_arch::view_from_installed(idb.list_all())
+    let ma_conflicts: [multi_arch::MultiArchConflict] = multi_arch::check_multi_arch_conflicts(
+        candidate.name, candidate.architecture, candidate.version, ma_mode, specs, view)
+
+    let mut ci: int = 0
+    while ci < ma_conflicts.len() is
+        let c: multi_arch::MultiArchConflict = ma_conflicts[ci]
+        ;; Raportuj tylko, gdy kolidujaca architektura jest wlaczona
+        let mut arch_ok: bool = true
+        if c.conflicting_arch != nil is
+            let ca: string = c.conflicting_arch
+            arch_ok = multi_arch::supports_arch(ma_db, ca)
+        end
+        if arch_ok is
+            let one: [multi_arch::MultiArchConflict] = [c]
+            let mut detail: string? = nil
+            if c.conflicting_arch != nil is
+                let da: string = c.conflicting_arch
+                detail = "Architecture: " + da
+            end
+            out.push(ConflictInfo {
+                message: multi_arch::format_conflicts(one),
+                kind: ConflictKind::Conflicts,
+                pkg_name: c.requirer,
+                with_pkg: c.conflicting,
+                hard: true,
+                detail: detail })
+        end
+        ci += 1
+    end
+    return out
+end
