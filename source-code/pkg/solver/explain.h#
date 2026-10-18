@@ -1,0 +1,397 @@
+use "std -> strings"     from "str"
+use "std -> collections" from "col"
+
+mod internal
+mod package
+mod cache
+mod db
+mod provides
+mod conflicts
+mod ui
+mod solver
+
+;; hammer -> pkg::solver::explain
+;;
+;; Port of the diagnostics half of source-code/pkg/solver/mod.rs
+;; (`impl Solver`): `explain_failure`, `find_transitive_problem`,
+;; `dependency_closure`, `why_installed`, `check_upgrade_safety`.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. Metody `Solver` -> wolne funkcje `explain_*(s: solver::Solver, ..)`.
+;; 2. `HashMap<String,String> visited` (z pustym rodzicem dla korzenia) ->
+;;    mapa nazwa -> rodzic (`std -> collections`) i kolejka jako tablica z
+;;    indeksem glowy (BFS jak w Rust).
+;; 3. `Option<(Vec<String>, String)>` -> `TransitiveProblem { found, path,
+;;    problem }`.
+;; 4. `dependency_closure`: `HashSet` + `sort()` -> mapa-zbior i
+;;    `sorting::sorted`. Zachowana osobliwosc: dla kazdej alternatywy
+;;    kolejkowany jest tylko PIERWSZY nieodwiedzony, niezainstalowany dostawca
+;;    (`break`).
+
+fn append_str(a: [string], x: string) -> [string] is
+    let mut o: [string] = a
+    o.push(x)
+    return o
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+fn dep_fields(pkg: package::Package, with_recommends: bool) -> [string] is
+    let mut out: [string] = []
+    if pkg.pre_depends != nil is
+        let a: string = pkg.pre_depends
+        out.push(a)
+    end
+    if pkg.depends != nil is
+        let b: string = pkg.depends
+        out.push(b)
+    end
+    if with_recommends && pkg.recommends != nil is
+        let c: string = pkg.recommends
+        out.push(c)
+    end
+    return out
+end
+
+fn alts_joined(group: package::DepGroup) -> string is
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < group.alternatives.len() is
+        names.push(group.alternatives[i].name)
+        i += 1
+    end
+    return str::join(names, " | ")
+end
+
+;; ── find_transitive_problem ──────────────────────────────────────────────
+
+pub struct TransitiveProblem is
+    pub found:   bool
+    pub path:    [string]
+    pub problem: string
+end
+
+fn no_problem() -> TransitiveProblem is
+    let p: [string] = []
+    return TransitiveProblem { found: false, path: p, problem: "" }
+end
+
+;; Sciezka od korzenia do `node` wg wskaznikow rodzica.
+fn reconstruct(parents: any, node0: string) -> [string] is
+    let mut rev: [string] = [node0]
+    let mut node: string = node0
+    let mut guard: int = 0
+    while col::hashmap_contains(parents, node) && guard < 100000 is
+        let parent: string = col::hashmap_get(parents, node)
+        if parent == "" is guard = 100000
+        else is
+            rev.push(parent)
+            node = parent
+            guard += 1
+        end
+    end
+    let mut out: [string] = []
+    let mut i: int = rev.len() - 1
+    while i >= 0 is
+        out.push(rev[i])
+        i -= 1
+    end
+    return out
+end
+
+fn find_transitive_problem(s: solver::Solver, root: string, pmap: provides::ProvidesMap) -> TransitiveProblem is
+    let parents: any = col::hashmap_new()
+    let mut queue: [string] = [root]
+    col::hashmap_insert(parents, root, "")
+    let mut head: int = 0
+
+    while head < queue.len() is
+        let name: string = queue[head]
+        head += 1
+        let po: package::Package? = cache::cache_get(s.cache, name)
+        if po != nil is
+            let pkg: package::Package = po
+
+            if name != root is
+                let confs: [conflicts::ConflictInfo] = conflicts::check_install(pkg, s.idb)
+                let mut ci: int = 0
+                while ci < confs.len() is
+                    if confs[ci].hard is
+                        return TransitiveProblem { found: true, path: reconstruct(parents, name), problem: confs[ci].message }
+                    end
+                    ci += 1
+                end
+                let rev: [conflicts::ConflictInfo] = conflicts::check_reverse_breaks(pkg, s.idb, s.cache)
+                if rev.len() > 0 is
+                    return TransitiveProblem { found: true, path: reconstruct(parents, name), problem: rev[0].message }
+                end
+            end
+
+            let fields: [string] = dep_fields(pkg, false)
+            let mut fi: int = 0
+            while fi < fields.len() is
+                let groups: [package::DepGroup] = package::parse_dep_field(fields[fi])
+                let mut gi: int = 0
+                while gi < groups.len() is
+                    let group: package::DepGroup = groups[gi]
+                    let mut any_provider: bool = false
+                    let mut ai: int = 0
+                    while ai < group.alternatives.len() is
+                        let providers: [string] = provides::providers_of(pmap, group.alternatives[ai].name)
+                        if providers.len() > 0 is
+                            any_provider = true
+                            let mut pi: int = 0
+                            while pi < providers.len() is
+                                let p: string = providers[pi]
+                                if !s.idb.is_installed(p) && !col::hashmap_contains(parents, p) is
+                                    col::hashmap_insert(parents, p, name)
+                                    queue = append_str(queue, p)
+                                end
+                                pi += 1
+                            end
+                        end
+                        ai += 1
+                    end
+                    if !any_provider is
+                        return TransitiveProblem { found: true, path: reconstruct(parents, name),
+                            problem: "Unmet dependency: " + alts_joined(group) + " (no provider available)" }
+                    end
+                    gi += 1
+                end
+                fi += 1
+            end
+        end
+    end
+    return no_problem()
+end
+
+;; ── explain_failure ──────────────────────────────────────────────────────
+
+;; Pelne, czytelne wyjasnienie, dlaczego pakietu nie da sie zainstalowac
+;; (jak `zypper why-not-installable`).
+pub fn explain_failure(s: solver::Solver, name: string) -> string is
+    let pmap: provides::ProvidesMap = provides::provides_build(s.cache, s.idb)
+    let mut lines: [string] = []
+
+    let po: package::Package? = cache::cache_get(s.cache, name)
+    if po == nil is
+        lines.push("  " + ui::red_bold("✗") + " Package '" + ui::bold(name) + "' not found in any configured repository.")
+        let similar: [string] = solver::solver_find_similar(s, name)
+        if similar.len() > 0 is
+            lines.push("  " + ui::cyan("ℹ") + " Did you mean: " + str::join(similar, ", ") + "?")
+        end
+        lines.push("  " + ui::dim("→") + " Run: " + ui::cyan("hammer sync"))
+        return str::join(lines, "\n")
+    end
+
+    let pkg: package::Package = po
+    lines.push("  " + ui::red_bold("✗") + " Cannot install '" + ui::bold(pkg.name) + "' " + ui::dim(pkg.version) + ":")
+
+    ;; Konflikty
+    let confs: [conflicts::ConflictInfo] = conflicts::check_install(pkg, s.idb)
+    let mut ci: int = 0
+    while ci < confs.len() is
+        let sym: string = if confs[ci].hard then ui::red_bold("✗") else ui::yellow("⚠")
+        lines.push("  " + sym + " " + confs[ci].message)
+        ci += 1
+    end
+
+    ;; Konflikty wsteczne
+    let rev: [conflicts::ConflictInfo] = conflicts::check_reverse_breaks(pkg, s.idb, s.cache)
+    let mut ri: int = 0
+    while ri < rev.len() is
+        lines.push("  " + ui::red_bold("✗") + " " + rev[ri].message)
+        ri += 1
+    end
+
+    ;; Grupy zaleznosci
+    if pkg.depends != nil is
+        let dep_str: string = pkg.depends
+        let groups: [package::DepGroup] = package::parse_dep_field(dep_str)
+        let mut gi: int = 0
+        while gi < groups.len() is
+            let group: package::DepGroup = groups[gi]
+            let mut satisfied: bool = false
+            let mut ai: int = 0
+            while ai < group.alternatives.len() && !satisfied is
+                let providers: [string] = provides::providers_of(pmap, group.alternatives[ai].name)
+                let mut pi: int = 0
+                while pi < providers.len() is
+                    if s.idb.is_installed(providers[pi]) || cache::cache_get(s.cache, providers[pi]) != nil is
+                        satisfied = true
+                    end
+                    pi += 1
+                end
+                ai += 1
+            end
+            if !satisfied is
+                lines.push("  " + ui::red_bold("✗") + " Unmet dependency: " + ui::bold(alts_joined(group)) + " (no provider available)")
+            end
+            gi += 1
+        end
+    end
+
+    ;; Hold
+    if s.idb.is_held(name) is
+        lines.push("  " + ui::cyan("ℹ") + " Package is held. Release with: " + ui::cyan("hammer unhold " + name))
+    end
+
+    ;; Pakiet wirtualny?
+    if provides::is_virtual(pmap, name) is
+        let providers: [string] = provides::providers_of(pmap, name)
+        let shown: string = if providers.len() == 0 then "none" else ui::cyan(str::join(providers, ", "))
+        lines.push("  " + ui::cyan("ℹ") + " '" + name + "' is a virtual package. Providers: " + shown)
+    end
+
+    ;; Gdy plytkie testy nic nie znalazly — przeszukaj domkniecie przechodnie
+    if lines.len() == 1 is
+        let tp: TransitiveProblem = find_transitive_problem(s, name, pmap)
+        if tp.found is
+            let depth: int = if tp.path.len() > 0 then tp.path.len() - 1 else 0
+            lines.push("  " + ui::red_bold("✗") + " Transitive problem found " + to_string(depth) + " levels deep:")
+            lines.push("    " + ui::dim(str::join(tp.path, " → ")))
+            lines.push("  " + ui::red_bold("✗") + " " + tp.problem)
+        else is
+            lines.push("  " + ui::cyan("ℹ") + " No single unmet dependency or direct conflict found, but the full dependency set is still unsatisfiable — this usually means two transitively-required packages conflict with each other rather than either one being individually broken.")
+        end
+    end
+
+    return str::join(lines, "\n")
+end
+
+;; ── dependency_closure ───────────────────────────────────────────────────
+
+;; Pelne domkniecie zaleznosci dla `names` (bez samych `names`), posortowane.
+pub fn dependency_closure(s: solver::Solver, names: [string]) -> [string] is
+    let pmap: provides::ProvidesMap = provides::provides_build(s.cache, s.idb)
+    let visited: any = col::hashmap_new()
+    let mut order: [string] = []
+    let mut queue: [string] = names
+    let mut head: int = 0
+
+    while head < queue.len() is
+        let name: string = queue[head]
+        head += 1
+        if !col::hashmap_contains(visited, name) is
+            col::hashmap_insert(visited, name, "1")
+            order.push(name)
+            let po: package::Package? = cache::cache_get(s.cache, name)
+            if po != nil is
+                let pkg: package::Package = po
+                let fields: [string] = dep_fields(pkg, false)
+                let mut fi: int = 0
+                while fi < fields.len() is
+                    let groups: [package::DepGroup] = package::parse_dep_field(fields[fi])
+                    let mut gi: int = 0
+                    while gi < groups.len() is
+                        let alts: [package::DepAlternative] = groups[gi].alternatives
+                        let mut ai: int = 0
+                        while ai < alts.len() is
+                            let providers: [string] = provides::providers_of(pmap, alts[ai].name)
+                            let mut queued: bool = false
+                            let mut pi: int = 0
+                            while pi < providers.len() && !queued is
+                                if !s.idb.is_installed(providers[pi]) && !col::hashmap_contains(visited, providers[pi]) is
+                                    queue = append_str(queue, providers[pi])
+                                    queued = true
+                                end
+                                pi += 1
+                            end
+                            ai += 1
+                        end
+                        gi += 1
+                    end
+                    fi += 1
+                end
+            end
+        end
+    end
+
+    let mut result: [string] = []
+    let mut k: int = 0
+    while k < order.len() is
+        if !contains_str(names, order[k]) is result.push(order[k]) end
+        k += 1
+    end
+    return sorting::sorted(result)
+end
+
+;; ── why_installed ────────────────────────────────────────────────────────
+
+;; Dlaczego pakiet jest zainstalowany (odwrotny lancuch zaleznosci).
+pub fn why_installed(s: solver::Solver, name: string) -> [string] is
+    let mut reasons: [string] = []
+    let installed: [db::InstalledPackage] = s.idb.list_all()
+    let mut i: int = 0
+    while i < installed.len() is
+        let inst: db::InstalledPackage = installed[i]
+        if inst.name != name is
+            let po: package::Package? = cache::cache_get(s.cache, inst.name)
+            if po != nil is
+                let pkg: package::Package = po
+                let fields: [string] = dep_fields(pkg, true)
+                let mut fi: int = 0
+                while fi < fields.len() is
+                    let groups: [package::DepGroup] = package::parse_dep_field(fields[fi])
+                    let mut gi: int = 0
+                    let mut hit: bool = false
+                    while gi < groups.len() && !hit is
+                        let alts: [package::DepAlternative] = groups[gi].alternatives
+                        let mut ai: int = 0
+                        while ai < alts.len() is
+                            if alts[ai].name == name is hit = true end
+                            ai += 1
+                        end
+                        gi += 1
+                    end
+                    if hit is reasons.push("Required by: " + inst.name) end
+                    fi += 1
+                end
+            end
+        end
+        i += 1
+    end
+    if reasons.len() == 0 is
+        let io: db::InstalledPackage? = s.idb.get(name)
+        if io != nil is
+            let inst: db::InstalledPackage = io
+            if db::reason_to_str(inst.reason) == "user" is
+                reasons.push("Explicitly installed by user")
+            else is
+                reasons.push("Installed as dependency")
+            end
+        end
+    end
+    return reasons
+end
+
+;; ── check_upgrade_safety ─────────────────────────────────────────────────
+
+;; Czy uaktualnienie tych pakietow cos zepsuje.
+pub fn check_upgrade_safety(s: solver::Solver, names: [string]) -> [string] is
+    let mut issues: [string] = []
+    let mut i: int = 0
+    while i < names.len() is
+        let ao: package::Package? = cache::cache_get(s.cache, names[i])
+        if ao != nil is
+            let avail: package::Package = ao
+            let rev: [conflicts::ConflictInfo] = conflicts::check_reverse_breaks(avail, s.idb, s.cache)
+            let mut k: int = 0
+            while k < rev.len() is
+                if rev[k].hard is
+                    issues.push("Upgrading '" + names[i] + "' to " + avail.version + " would break '" + rev[k].pkg_name + "'")
+                end
+                k += 1
+            end
+        end
+        i += 1
+    end
+    return issues
+end
