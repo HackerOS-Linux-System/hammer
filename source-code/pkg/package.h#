@@ -1,0 +1,371 @@
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+use "bit -> libhammer" from "lh"
+
+;; hammer -> pkg::package
+;;
+;; Port of source-code/pkg/package.rs (Rust) to H#.
+;; Typ `Package` (stanza z indeksu `Packages`), parser pol zaleznosci i
+;; porownywanie wersji.
+;;
+;; ── Dlaczego osobno od libhammer::package ───────────────────────────────
+;; Rust tez ma dwie definicje (libhammer/src/package.rs i pkg/package.rs)
+;; i roznia sie: tu `VersionOp` ma warianty `Le`/`Ge`, `Package` ma
+;; `multi_arch` i `description_long`, a `installed_size_kb` to `Option`.
+;; Zachowuje to 1:1, zeby reszta `pkg/` (db, cache, multi_arch, solver)
+;; portowala sie bez przerabiania pol.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `Ordering` -> `int` (-1 / 0 / 1), tak jak `lhversion::version_cmp`;
+;;    `version_cmp`/`version_satisfies` deleguja do libhammer (Rust: do
+;;    `crate::solver::version`, ktore jeszcze nie jest przepisane — ta
+;;    sama kolejnosc wersji Debiana).
+;; 2. `#[derive(Default)]` -> `Package::empty()`; `Serialize/Deserialize`
+;;    pomijamy (std -> json czyta tylko plaskie obiekty); snapshot JSON
+;;    robi `db.h#` recznie.
+;; 3. `parse::<u64>().ok()` -> `Some` tylko dla samych cyfr (jak u64).
+;; 4. `parse_dep_field` zachowuje zachowanie Rust 1:1, takze to, ze pusty
+;;    segment ("a,,b" albo "") daje grupe z jedna alternatywa o pustej
+;;    nazwie (libhammer::dep odrzuca takie grupy — swiadoma roznica).
+
+;; ── VersionOp ────────────────────────────────────────────────────────────
+
+pub enum VersionOp is
+    Eq   ;; =
+    Lt   ;; <<
+    Le   ;; <=
+    Gt   ;; >>
+    Ge   ;; >=
+end
+
+impl VersionOp is
+    pub fn as_str(self) -> string is
+        match self is
+            VersionOp::Eq => is return "="  end
+            VersionOp::Lt => is return "<<" end
+            VersionOp::Le => is return "<=" end
+            VersionOp::Gt => is return ">>" end
+            VersionOp::Ge => is return ">=" end
+        end
+    end
+end
+
+;; Wolajacy nie uzywa `x.as_str()`: backend LLVM kompiluje wywolania metod tylko dla struktur
+;; (metoda z `impl` na enumie => "no LLVM codegen for method call"), wiec ta sama logika
+;; jest tez zwyklą funkcja.
+pub fn op_to_str(o: VersionOp) -> string is
+    match o is
+        VersionOp::Eq => is return "="  end
+        VersionOp::Lt => is return "<<" end
+        VersionOp::Le => is return "<=" end
+        VersionOp::Gt => is return ">>" end
+        VersionOp::Ge => is return ">=" end
+    end
+    return "="
+end
+
+pub struct VersionConstraint is
+    pub op:      VersionOp
+    pub version: string
+end
+
+;; Display: "{op} {version}"
+pub fn constraint_to_string(c: VersionConstraint) -> string is
+    return op_to_str(c.op) + " " + c.version
+end
+
+;; ── DepAlternative / DepGroup ────────────────────────────────────────────
+
+pub struct DepAlternative is
+    pub name:       string
+    pub constraint: VersionConstraint?
+    pub arch:       string?
+end
+
+pub struct DepGroup is
+    pub alternatives: [DepAlternative]
+end
+
+;; ── Package ──────────────────────────────────────────────────────────────
+
+pub struct Package is
+    pub name:              string
+    pub version:           string
+    pub architecture:      string
+
+    pub depends:           string?
+    pub pre_depends:       string?
+    pub recommends:        string?
+    pub essential:         bool
+    pub suggests:          string?
+    pub conflicts:         string?
+    pub breaks:            string?
+    pub provides:          string?
+    pub replaces:          string?
+    pub enhances:          string?
+
+    pub section:           string?
+    pub priority:          string?
+    pub maintainer:        string?
+    pub homepage:          string?
+    pub description_short: string?
+    pub description_long:  string?
+
+    pub installed_size_kb: int?
+    pub download_size:     int?
+
+    pub repo_base_uri:     string?
+    pub filename:          string?
+    pub sha256:            string?
+
+    pub provides_list:     [string]
+
+    ;; `Multi-Arch:` (`same`, `foreign`, `allowed`; brak = `no`).
+    pub multi_arch:        string?
+end
+
+;; Rust: `impl Default for Package` (uzywane m.in. w diff.rs do placeholderow).
+pub fn empty_package() -> Package is
+    let none_list: [string] = []
+    return Package {
+        name:              "",
+        version:           "",
+        architecture:      "",
+        depends:           nil,
+        pre_depends:       nil,
+        recommends:        nil,
+        essential:         false,
+        suggests:          nil,
+        conflicts:         nil,
+        breaks:            nil,
+        provides:          nil,
+        replaces:          nil,
+        enhances:          nil,
+        section:           nil,
+        priority:          nil,
+        maintainer:        nil,
+        homepage:          nil,
+        description_short: nil,
+        description_long:  nil,
+        installed_size_kb: nil,
+        download_size:     nil,
+        repo_base_uri:     nil,
+        filename:          nil,
+        sha256:            nil,
+        provides_list:     none_list,
+        multi_arch:        nil
+    }
+end
+
+;; ── Parser stanzy ────────────────────────────────────────────────────────
+
+;; `parse::<u64>().ok()`: same cyfry (bez znaku, bez pustego).
+fn parse_u64_opt(v: string) -> int? is
+    if v == "" is return nil end
+    if !str::is_numeric(v) is return nil end
+    return conv::str_to_int(v)
+end
+
+;; `s.trim_start()` — tylko biale znaki z lewej.
+fn trim_start(s: string) -> string is
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(s, i)
+        if c == " " || c == "\t" || c == "\r" || c == "\n" is
+            i += 1
+        else is
+            return str::slice(s, i, n)
+        end
+    end
+    return ""
+end
+
+fn is_indented(line: string) -> bool is
+    return line.starts_with(" ") || line.starts_with("\t")
+end
+
+;; Przypisuje pole (`field` juz zlowercase'owane) — Rust: `set_field`.
+;; Zwraca zmodyfikowany Package (H# nie ma `&mut self`).
+fn set_field(base: Package, field: string, value: string) -> Package is
+    let mut p: Package = base
+    let v: string = str::trim(value)
+    match field is
+        "package"        => is p.name              = v end
+        "version"        => is p.version           = v end
+        "architecture"   => is p.architecture      = v end
+        "depends"        => is p.depends           = v end
+        "pre-depends"    => is p.pre_depends       = v end
+        "recommends"     => is p.recommends        = v end
+        "suggests"       => is p.suggests          = v end
+        "conflicts"      => is p.conflicts         = v end
+        "breaks"         => is p.breaks            = v end
+        "provides"       => is p.provides          = v end
+        "replaces"       => is p.replaces          = v end
+        "enhances"       => is p.enhances          = v end
+        "essential"      => is p.essential         = str::to_lower(v) == "yes" end
+        "section"        => is p.section           = v end
+        "priority"       => is p.priority          = v end
+        "maintainer"     => is p.maintainer        = v end
+        "homepage"       => is p.homepage          = v end
+        "filename"       => is p.filename          = v end
+        "sha256"         => is p.sha256            = v end
+        "multi-arch"     => is p.multi_arch        = v end
+        "installed-size" => is p.installed_size_kb = parse_u64_opt(v) end
+        "size"           => is p.download_size     = parse_u64_opt(v) end
+        "description"    => is
+            ;; splitn(2, '\n'): pierwsza linia = krotki opis, reszta = dlugi
+            let nl: int = compat::str_index_of(v, "\n")
+            if nl < 0 is
+                p.description_short = str::trim(v)
+                p.description_long  = nil
+            else is
+                p.description_short = str::trim(str::slice(v, 0, nl))
+                p.description_long  = str::slice(v, nl + 1, string_len(v))
+            end
+        end
+        _ => is end
+    end
+    return p
+end
+
+;; Surowa stanza Debiana -> `Package`; nil gdy brak nazwy lub wersji.
+pub fn parse_block(block: string) -> Package? is
+    let mut p: Package = empty_package()
+    let mut cur_field: string = ""
+    let mut cur_value: string = ""
+
+    let lines: [string] = str::split(block, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = lines[i]
+        i += 1
+        if is_indented(line) is
+            cur_value = cur_value + "\n" + trim_start(line)
+        else is
+            let colon: int = compat::str_index_of(line, ":")
+            if colon >= 0 is
+                ;; flush poprzedniego pola
+                if cur_field != "" is
+                    p = set_field(p, cur_field, cur_value)
+                end
+                cur_field = str::to_lower(str::trim(str::slice(line, 0, colon)))
+                cur_value = str::trim(str::slice(line, colon + 1, string_len(line)))
+            end
+        end
+    end
+    if cur_field != "" is
+        p = set_field(p, cur_field, cur_value)
+    end
+
+    if p.name == "" || p.version == "" is return nil end
+    return p
+end
+
+;; Caly plik `Packages` (stanzy rozdzielone pusta linia).
+pub fn parse_index(content: string) -> [Package] is
+    let mut out: [Package] = []
+    let blocks: [string] = str::split(content, "\n\n")
+    let mut i: int = 0
+    while i < blocks.len() is
+        let b: string = str::trim(blocks[i])
+        if b != "" is
+            let parsed: Package? = parse_block(b)
+            if parsed != nil is
+                let pk: Package = parsed
+                out.push(pk)
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ── Parser zaleznosci ────────────────────────────────────────────────────
+
+fn parse_version_op(s: string) -> VersionOp? is
+    if s == "=" || s == "==" is return VersionOp::Eq end
+    if s == "<<" || s == "<" is return VersionOp::Lt end
+    if s == "<=" || s == "=<" is return VersionOp::Le end
+    if s == ">>" || s == ">" is return VersionOp::Gt end
+    if s == ">=" || s == "=>" is return VersionOp::Ge end
+    return nil
+end
+
+;; `r.trim_start_matches('(')`
+fn trim_open_parens(r: string) -> string is
+    let n: int = string_len(r)
+    let mut i: int = 0
+    while i < n && string_at(r, i) == "(" is
+        i += 1
+    end
+    return str::slice(r, i, n)
+end
+
+;; "(>= 1.0)" -> VersionConstraint; nil gdy brak spacji albo nieznany operator
+;; (Rust: `?` w `and_then`).
+fn parse_constraint_part(rest: string) -> VersionConstraint? is
+    let after: string = trim_open_parens(rest)
+    let close: int = compat::str_index_of(after, ")")
+    let inner: string = if close >= 0 then str::slice(after, 0, close) else after
+    ;; splitn(2, ' ')
+    let sp: int = compat::str_index_of(inner, " ")
+    if sp < 0 is return nil end
+    let op_str: string = str::trim(str::slice(inner, 0, sp))
+    let ver: string = str::trim(str::slice(inner, sp + 1, string_len(inner)))
+    let op: VersionOp? = parse_version_op(op_str)
+    if op == nil is return nil end
+    let o: VersionOp = op
+    return VersionConstraint { op: o, version: ver }
+end
+
+pub fn parse_dep_alt(s: string) -> DepAlternative is
+    let paren: int = compat::str_index_of(s, "(")
+    let name_part: string = if paren >= 0 then str::slice(s, 0, paren) else s
+
+    let mut pkg_name: string = str::trim(name_part)
+    let mut arch: string? = nil
+    let colon: int = compat::str_index_of(name_part, ":")
+    if colon >= 0 is
+        pkg_name = str::trim(str::slice(name_part, 0, colon))
+        arch = str::trim(str::slice(name_part, colon + 1, string_len(name_part)))
+    end
+
+    let mut constraint: VersionConstraint? = nil
+    if paren >= 0 is
+        constraint = parse_constraint_part(str::slice(s, paren, string_len(s)))
+    end
+
+    return DepAlternative { name: pkg_name, constraint: constraint, arch: arch }
+end
+
+;; "a, b | c (>= 1)" -> [[a], [b, c (>= 1)]]
+pub fn parse_dep_field(s: string) -> [DepGroup] is
+    let mut out: [DepGroup] = []
+    let groups: [string] = str::split(s, ",")
+    let mut i: int = 0
+    while i < groups.len() is
+        let mut alts: [DepAlternative] = []
+        let parts: [string] = str::split(groups[i], "|")
+        let mut j: int = 0
+        while j < parts.len() is
+            alts.push(parse_dep_alt(str::trim(parts[j])))
+            j += 1
+        end
+        out.push(DepGroup { alternatives: alts })
+        i += 1
+    end
+    return out
+end
+
+;; ── Porownywanie wersji ──────────────────────────────────────────────────
+
+;; -1 / 0 / 1 (Rust: `Ordering`).
+pub fn version_cmp(a: string, b: string) -> int is
+    return lhversion::version_cmp(a, b)
+end
+
+pub fn version_satisfies(installed: string, op: string, required: string) -> bool is
+    return lhversion::version_satisfies(installed, op, required)
+end
