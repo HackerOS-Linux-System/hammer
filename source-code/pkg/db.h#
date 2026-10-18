@@ -1,0 +1,946 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+mod internal
+mod dpkg_status
+mod package
+mod ui
+
+;; hammer -> pkg::db
+;;
+;; Port of source-code/pkg/db.rs (Rust) to H#: baza zainstalowanych
+;; pakietow (installed / history / pins / holds / conffiles / file_index),
+;; migracje schematu v1..v6, eksport snapshotu JSON.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;;
+;; 1. SQLITE TYLKO PRZEZ `db_query_bind`. `std -> sqlite` udostepnia
+;;    `prepare/bind/step/column_*`, ale to atrapy (`return ""`), a kompilator
+;;    v0.8 nie ma dla nich implementacji ("codegen: undefined fn: prepare").
+;;    Co wiecej, w H# v0.9 natywny backend (AOT/LLVM) ODRZUCA kazdy program
+;;    uzywajacy `sqlite_open/exec/close` albo `std -> db/sqlite` ("this
+;;    program uses `db ->`, which the native AOT backend doesn't support
+;;    yet" — codegen.rs). Jedyna przyjmowana sciezka to wbudowane
+;;    `db_query_bind(plik, sql, bind)`: argv bez powloki, czyli
+;;    `sqlite3 -separator '\t' <plik> <sql>` (runtime/core.c). Wiec:
+;;      - "uchwytem" jest sciezka pliku bazy (nie ma open/close),
+;;      - zapis i odczyt: `sql_run(handle, sql)`; wiersze rozdzielone `\n`,
+;;        kolumny `\t`, NULL wraca jako "",
+;;      - wartosci wstawiam przez `q()` (podwajanie apostrofu, zawsze w
+;;        cudzyslowiu SQL) — bez limitu 3 bindow; wywolanie 3-argumentowe z
+;;        pustym bindem sprawia, ze runtime NIE podstawia nic za `?` (wersja
+;;        5-argumentowa podstawialaby `''` za kazde `?`, takze w danych).
+;;    WYMAGANE: `sqlite3` w PATH (hammer i tak go wymaga w image).
+;; 2. `:memory:` NIE dziala (kazde wywolanie to osobny proces sqlite3,
+;;    baza znika). `open_in_memory()` uzywa pliku tymczasowego
+;;    /tmp/hammer-mem-<pid>.sqlite.
+;; 3. "Transakcje" = jeden wsad SQL (`BEGIN; ...; COMMIT;`) w jednym
+;;    procesie sqlite3. UWAGA: CLI bez `-bail` (argv jest stale) i bez
+;;    mozliwosci `.bail on` w jednym argumencie (sprawdzone: "Usage: .bail
+;;    on|off") idzie dalej po bledzie srodka wsadu i wykona COMMIT — wiec
+;;    w razie bledu w polowie `record_upgrade` zapis moze byc CZESCIOWY
+;;    (w Rust: rollback). Przy poprawnym schemacie (migrate) bledy sa
+;;    praktycznie ograniczone do awarii dysku/blokady bazy.
+;; 4. Wynik `Result<T>` -> `string` bledu ("" = Ok) tam, gdzie Rust
+;;    zwracal `Result<()>`; `sqlite3` CLI zwraca komunikat bledu jako tekst
+;;    ("Error: ..." / "Parse error..."), rozpoznawany przez `is_sql_error`.
+;; 5. `DateTime<Utc>` -> string RFC3339 z SQLite
+;;    (`strftime('%Y-%m-%dT%H:%M:%SZ','now')`) — zawsze UTC.
+;; 6. Tekst w kolumnach jest przed odczytem czyszczony z TAB/LF
+;;    (`clean()` w SQL), bo to separatory wierszy/kolumn.
+;; 7. Import/odzyskiwanie z JSON (`import_json`, `recover_from_json`,
+;;    `open_with_recovery`, `validate_json_sync`, `*_and_sync`) — dopisane z
+;;    `internal/jsonlite.h#` (czytnik tokenow). `import_json` zapisuje tez
+;;    `multi_arch` (Rust go pomija).
+
+;; 9. dpkg-fallback (`use_dpkg_fallback`) jak w Rust: `open`/`open_at` = true,
+;;    `open_in_memory` = false. Moduly `internal` i `dpkg_status` sa wiazane
+;;    po nazwie (jak `crate::build_mode` po `#[path]`), a `mod` z cyklem
+;;    (db <-> dpkg_status) dziala w H#.
+;; 8. `reason`: w bazie "user" | "dependency" — tak jak w Rust
+;;    (`set_reason`, `row_to_pkg`); libhammer::db uzywa "dep" (osobna baza).
+
+pub fn current_schema_version() -> int is return 6 end
+
+;; ── Typy ─────────────────────────────────────────────────────────────────
+
+pub enum InstallReason is
+    User
+    Dependency
+end
+
+impl InstallReason is
+    pub fn as_str(self) -> string is
+        match self is
+            InstallReason::User       => is return "user" end
+            InstallReason::Dependency => is return "dependency" end
+        end
+    end
+
+    pub fn from_str(s: string) -> InstallReason is
+        if s == "dependency" is return InstallReason::Dependency end
+        return InstallReason::User
+    end
+end
+
+;; Wolajacy nie uzywa `x.as_str()`: backend LLVM kompiluje wywolania metod tylko dla struktur
+;; (metoda z `impl` na enumie => "no LLVM codegen for method call"), wiec ta sama logika
+;; jest tez zwyklą funkcja.
+pub fn reason_to_str(r: InstallReason) -> string is
+    match r is
+        InstallReason::User       => is return "user" end
+        InstallReason::Dependency => is return "dependency" end
+    end
+    return "user"
+end
+
+pub struct InstalledPackage is
+    pub name:              string
+    pub version:           string
+    pub architecture:      string
+    pub installed_size_kb: int
+    pub section:           string?
+    pub maintainer:        string?
+    pub description_short: string?
+    pub installed_at:      string
+    pub reason:            InstallReason
+    pub store_hash:        string
+    pub depends:           string?
+    pub recommends:        string?
+    ;; `Multi-Arch:` (same | foreign | allowed) albo nil
+    pub multi_arch:        string?
+end
+
+pub struct HistoryEntry is
+    pub id:         int
+    ;; "install" | "remove" | "upgrade"
+    pub action:     string
+    pub package:    string
+    pub old_ver:    string?
+    pub new_ver:    string?
+    pub generation: int
+    pub timestamp:  string
+end
+
+pub struct InstalledDb is
+    pub handle: string
+    ;; Czy laczyc wlasna baze z /var/lib/dpkg/status (patrz komentarz przy
+    ;; zapytaniach); `false` dla baz testowych/prywatnych.
+    pub use_dpkg_fallback: bool
+end
+
+;; ── Sciezka bazy ─────────────────────────────────────────────────────────
+
+;; Rust: `db_path()` -> `build_mode::db_path()` (atomic: /hammer/db/packages.sqlite,
+;; normal-mode: /var/lib/hammer/db.sqlite).
+pub fn default_db_path() -> string is
+    return build_mode::db_path()
+end
+
+;; ── Pomocniki SQL ────────────────────────────────────────────────────────
+
+;; Literal tekstowy SQL: 'a''b'.
+pub fn q(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "''") + "'"
+end
+
+;; Literal albo NULL dla pol opcjonalnych.
+fn qo(v: string?) -> string is
+    if v == nil is return "NULL" end
+    let s: string = v
+    return q(s)
+end
+
+fn empty_to_nil(s: string) -> string? is
+    if s == "" is return nil end
+    return s
+end
+
+;; `sqlite3` CLI raportuje bledy tekstem (stdout+stderr polaczone).
+;; `installed_size_kb: Option<u64>` -> `unwrap_or(0)`
+fn size_or_zero(v: int?) -> int is
+    if v == nil is return 0 end
+    let n: int = v
+    return n
+end
+
+fn sort_by_name(items: [InstalledPackage]) -> [InstalledPackage] is
+    let mut a: [InstalledPackage] = items
+    let mut i: int = 1
+    while i < a.len() is
+        let cur: InstalledPackage = a[i]
+        let mut j: int = i - 1
+        while j >= 0 && a[j].name > cur.name is
+            a[j + 1] = a[j]
+            j -= 1
+        end
+        a[j + 1] = cur
+        i += 1
+    end
+    return a
+end
+
+;; Jedyna sciezka do SQLite, ktora natywny backend AOT (LLVM) przyjmuje:
+;; `db_query_bind` (argv bez powloki -> CLI `sqlite3 -separator '\t' <plik> <sql>`).
+;; `sqlite_open/exec/close` i `std -> sqlite/db` SA ODRZUCANE przez AOT
+;; ("this program uses `db ->`, which the native AOT (LLVM) backend doesn't
+;; support yet"). "Uchwytem" jest po prostu sciezka pliku bazy.
+;; WAZNE: wywolanie 3-argumentowe z pustym bindem => runtime nie podstawia
+;; nic za `?` (wersja 5-argumentowa podstawialaby `\'\'` za kazde `?`, takze
+;; wewnatrz danych, np. opisu "Why?").
+pub fn sql_run(handle: string, sql: string) -> string is
+    return db_query_bind(handle, sql, "")
+end
+
+pub fn is_sql_error(out: string) -> bool is
+    if out.starts_with("Error:") is return true end
+    if out.starts_with("Parse error") is return true end
+    if out.starts_with("Runtime error") is return true end
+    if out.starts_with("db error") is return true end
+    if out.starts_with("sqlite3 not found") is return true end
+    return false
+end
+
+;; Kolumna tekstowa bez TAB/LF (separatory wynikow — odejscie 6).
+fn clean(col: string) -> string is
+    return "replace(replace(coalesce(" + col + ",''), char(9), ' '), char(10), ' ')"
+end
+
+fn pkg_columns() -> string is
+    return "name, version, architecture, installed_size_kb, " +
+        clean("section") + ", " + clean("maintainer") + ", " +
+        clean("description_short") + ", installed_at, reason, store_hash, " +
+        clean("depends") + ", " + clean("recommends") + ", " + clean("multi_arch")
+end
+
+;; Wiersze wyniku (bez pustych linii).
+fn run_rows(db: InstalledDb, sql: string) -> [string] is
+    let out: string = sql_run(db.handle, sql)
+    let mut rows: [string] = []
+    if is_sql_error(out) is return rows end
+    let lines: [string] = str::split(out, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i] != "" is rows.push(lines[i]) end
+        i += 1
+    end
+    return rows
+end
+
+fn field(cols: [string], i: int) -> string is
+    if i < cols.len() is return cols[i] end
+    return ""
+end
+
+fn row_to_pkg(line: string) -> InstalledPackage is
+    let c: [string] = str::split(line, "\t")
+    let size_raw: string = field(c, 3)
+    let mut size: int = 0
+    if str::is_numeric(size_raw) is size = conv::str_to_int(size_raw) end
+    return InstalledPackage {
+        name:              field(c, 0),
+        version:           field(c, 1),
+        architecture:      field(c, 2),
+        installed_size_kb: size,
+        section:           empty_to_nil(field(c, 4)),
+        maintainer:        empty_to_nil(field(c, 5)),
+        description_short: empty_to_nil(field(c, 6)),
+        installed_at:      field(c, 7),
+        reason:            InstallReason::from_str(field(c, 8)),
+        store_hash:        field(c, 9),
+        depends:           empty_to_nil(field(c, 10)),
+        recommends:        empty_to_nil(field(c, 11)),
+        multi_arch:        empty_to_nil(field(c, 12))
+    }
+end
+
+fn now_sql() -> string is
+    return "strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+end
+
+;; ── InstalledDb ──────────────────────────────────────────────────────────
+
+impl InstalledDb is
+    ;; Rust: `open_at(path)` — tworzy katalog, otwiera, migruje.
+    fn open_with(db_file: string, fallback: bool) -> InstalledDb is
+        let dir: string = compat::path_parent(db_file)
+        if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+        let h: string = db_file
+        let db: InstalledDb = InstalledDb { handle: h, use_dpkg_fallback: fallback }
+        ;; `foreign_keys` dziala per polaczenie; przy modelu "jeden proces
+        ;; sqlite3 na zapytanie" ustawienie jest no-op, ale zachowujemy
+        ;; je dla zgodnosci z Rust (tabele i tak nie definiuja FK).
+        sql_run(h, "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+        db.migrate()
+        return db
+    end
+
+    pub fn open_at(db_file: string) -> InstalledDb is
+        return InstalledDb::open_with(db_file, true)
+    end
+
+    ;; Rust: `open()` — domyslna sciezka.
+    pub fn open() -> InstalledDb is
+        return InstalledDb::open_at(default_db_path())
+    end
+
+    ;; Patrz odejscie 2 (plik tymczasowy zamiast `:memory:`).
+    pub fn open_in_memory() -> InstalledDb is
+        let tmp: string = "/tmp/hammer-mem-" + to_string(compat::os_pid()) + ".sqlite"
+        if fs::exists(tmp) is fs::remove(tmp) end
+        return InstalledDb::open_with(tmp, false)
+    end
+
+    pub fn close(self) is
+        ;; brak polaczenia do zamkniecia — kazde zapytanie to osobny proces sqlite3
+    end
+
+    ;; ── Zapytania ────────────────────────────────────────────────────────
+
+    ;; Kazde zapytanie sprawdza najpierw wlasna tabele `installed`, potem
+    ;; (dla `list_all`: laczy z) /var/lib/dpkg/status. Wlasny wpis hammera
+    ;; wygrywa, bo ma dokladny `store_hash`/`reason`.
+    pub fn is_installed(self, name: string) -> bool is
+        let rows: [string] = run_rows(self, "SELECT 1 FROM installed WHERE name = " + q(name))
+        if rows.len() > 0 is return true end
+        return self.use_dpkg_fallback && dpkg_status::is_installed(name)
+    end
+
+    pub fn get(self, name: string) -> InstalledPackage? is
+        let rows: [string] = run_rows(self,
+            "SELECT " + pkg_columns() + " FROM installed WHERE name = " + q(name))
+        if rows.len() > 0 is return row_to_pkg(rows[0]) end
+        if self.use_dpkg_fallback is return dpkg_status::get(name) end
+        return nil
+    end
+
+    pub fn list_all(self) -> [InstalledPackage] is
+        let rows: [string] = run_rows(self,
+            "SELECT " + pkg_columns() + " FROM installed ORDER BY name")
+        let mut out: [InstalledPackage] = []
+        let mut i: int = 0
+        while i < rows.len() is
+            out.push(row_to_pkg(rows[i]))
+            i += 1
+        end
+        if !self.use_dpkg_fallback is return out end
+
+        ;; dpkg dopelnia tylko pakiety, ktorych hammer nie zna; potem sort po nazwie.
+        let from_dpkg: [InstalledPackage] = dpkg_status::read_all()
+        let mut j: int = 0
+        while j < from_dpkg.len() is
+            let mut known: bool = false
+            let mut k: int = 0
+            while k < out.len() is
+                if out[k].name == from_dpkg[j].name is known = true end
+                k += 1
+            end
+            if !known is out.push(from_dpkg[j]) end
+            j += 1
+        end
+        return sort_by_name(out)
+    end
+
+    ;; Tylko pakiety zainstalowane wprost przez uzytkownika.
+    pub fn list_user_installed(self) -> [InstalledPackage] is
+        let rows: [string] = run_rows(self,
+            "SELECT " + pkg_columns() + " FROM installed WHERE reason = 'user' ORDER BY name")
+        let mut out: [InstalledPackage] = []
+        let mut i: int = 0
+        while i < rows.len() is
+            out.push(row_to_pkg(rows[i]))
+            i += 1
+        end
+        return out
+    end
+
+    pub fn count(self) -> int is
+        let rows: [string] = run_rows(self, "SELECT COUNT(*) FROM installed")
+        if rows.len() == 0 is return 0 end
+        if !str::is_numeric(rows[0]) is return 0 end
+        return conv::str_to_int(rows[0])
+    end
+
+    ;; ── Mutacje ──────────────────────────────────────────────────────────
+
+    fn installed_upsert_sql(pkg: package::Package, reason: InstallReason, store_hash: string) -> string is
+        return "INSERT OR REPLACE INTO installed " +
+            "(name,version,architecture,installed_size_kb,section,maintainer," +
+            " description_short,installed_at,reason,store_hash,depends,recommends,multi_arch) VALUES (" +
+            q(pkg.name) + "," + q(pkg.version) + "," + q(pkg.architecture) + "," +
+            to_string(size_or_zero(pkg.installed_size_kb)) + "," + qo(pkg.section) + "," +
+            qo(pkg.maintainer) + "," + qo(pkg.description_short) + "," + now_sql() + "," +
+            q(reason_to_str(reason)) + "," + q(store_hash) + "," +
+            qo(pkg.depends) + "," + qo(pkg.recommends) + "," + qo(pkg.multi_arch) + ");"
+    end
+
+    ;; "" = Ok, inaczej komunikat bledu sqlite3.
+    fn apply(self, batch: string) -> string is
+        let out: string = sql_run(self.handle, "BEGIN; " + batch + " COMMIT;")
+        if is_sql_error(out) is return out end
+        return ""
+    end
+
+    pub fn record_install(self, pkg: package::Package, reason: InstallReason,
+                          store_hash: string, gen: int) -> string is
+        let sql: string = InstalledDb::installed_upsert_sql(pkg, reason, store_hash) +
+            " INSERT INTO history (action,package,old_ver,new_ver,generation,timestamp) VALUES ('install'," +
+            q(pkg.name) + ",NULL," + q(pkg.version) + "," + to_string(gen) + "," + now_sql() + ");"
+        return self.apply(sql)
+    end
+
+    pub fn record_upgrade(self, old_ver: string, pkg: package::Package,
+                          store_hash: string, gen: int) -> string is
+        ;; Rust zachowuje dotychczasowy `reason` przy upgrade — czytamy go z bazy.
+        let mut reason: InstallReason = InstallReason::User
+        let cur: InstalledPackage? = self.get(pkg.name)
+        if cur != nil is
+            let c: InstalledPackage = cur
+            reason = c.reason
+        end
+        let sql: string = InstalledDb::installed_upsert_sql(pkg, reason, store_hash) +
+            " INSERT INTO history (action,package,old_ver,new_ver,generation,timestamp) VALUES ('upgrade'," +
+            q(pkg.name) + "," + q(old_ver) + "," + q(pkg.version) + "," + to_string(gen) + "," + now_sql() + ");"
+        return self.apply(sql)
+    end
+
+    pub fn record_remove(self, name: string, version: string, gen: int) -> string is
+        let sql: string = "DELETE FROM installed WHERE name = " + q(name) + ";" +
+            " INSERT INTO history (action,package,old_ver,new_ver,generation,timestamp) VALUES ('remove'," +
+            q(name) + "," + q(version) + ",NULL," + to_string(gen) + "," + now_sql() + ");"
+        return self.apply(sql)
+    end
+
+    pub fn remove(self, name: string) -> string is
+        return self.apply("DELETE FROM installed WHERE name = " + q(name) + ";")
+    end
+
+    pub fn set_reason(self, name: string, reason: InstallReason) -> string is
+        return self.apply("UPDATE installed SET reason = " + q(reason_to_str(reason)) +
+            " WHERE name = " + q(name) + ";")
+    end
+
+    ;; Najnowsze wpisy pierwsze (ORDER BY id DESC), `limit` <= 0 -> wszystkie.
+    pub fn history(self, limit: int) -> [HistoryEntry] is
+        let mut sql: string = "SELECT id, action, package, " + clean("old_ver") + ", " +
+            clean("new_ver") + ", generation, timestamp FROM history ORDER BY id DESC"
+        if limit > 0 is sql = sql + " LIMIT " + to_string(limit) end
+        let rows: [string] = run_rows(self, sql)
+        let mut out: [HistoryEntry] = []
+        let mut i: int = 0
+        while i < rows.len() is
+            let c: [string] = str::split(rows[i], "\t")
+            let id_raw: string = field(c, 0)
+            let gen_raw: string = field(c, 5)
+            out.push(HistoryEntry {
+                id:         if str::is_numeric(id_raw) then conv::str_to_int(id_raw) else 0,
+                action:     field(c, 1),
+                package:    field(c, 2),
+                old_ver:    empty_to_nil(field(c, 3)),
+                new_ver:    empty_to_nil(field(c, 4)),
+                generation: if str::is_numeric(gen_raw) then conv::str_to_int(gen_raw) else 0,
+                timestamp:  field(c, 6)
+            })
+            i += 1
+        end
+        return out
+    end
+
+    ;; ── Pins / holds ─────────────────────────────────────────────────────
+
+    pub fn pin_package(self, name: string, constraint: string, priority: int) -> string is
+        return self.apply("INSERT OR REPLACE INTO pins (name, \"constraint\", priority, note) VALUES (" +
+            q(name) + "," + q(constraint) + "," + to_string(priority) + ",NULL);")
+    end
+
+    pub fn unpin_package(self, name: string) -> string is
+        return self.apply("DELETE FROM pins WHERE name = " + q(name) + ";")
+    end
+
+    ;; "constraint\tpriority" jako dwa pola; nil gdy brak pinu.
+    pub fn get_pin(self, name: string) -> [string]? is
+        let rows: [string] = run_rows(self,
+            "SELECT \"constraint\", priority FROM pins WHERE name = " + q(name))
+        if rows.len() == 0 is return nil end
+        return str::split(rows[0], "\t")
+    end
+
+    ;; Kazdy element: [name, constraint, priority] zlaczone TAB-em.
+    pub fn list_pins(self) -> [string] is
+        return run_rows(self, "SELECT name, \"constraint\", priority FROM pins ORDER BY name")
+    end
+
+    pub fn hold_package(self, name: string) -> string is
+        return self.apply("INSERT OR REPLACE INTO holds (name, held_at) VALUES (" +
+            q(name) + "," + now_sql() + ");")
+    end
+
+    pub fn unhold_package(self, name: string) -> string is
+        return self.apply("DELETE FROM holds WHERE name = " + q(name) + ";")
+    end
+
+    pub fn is_held(self, name: string) -> bool is
+        return run_rows(self, "SELECT 1 FROM holds WHERE name = " + q(name)).len() > 0
+    end
+
+    pub fn list_holds(self) -> [string] is
+        return run_rows(self, "SELECT name FROM holds ORDER BY name")
+    end
+
+    ;; ── Conffiles ────────────────────────────────────────────────────────
+
+    pub fn register_conffile(self, pkg: string, file: string, hash: string) -> string is
+        return self.apply("INSERT OR REPLACE INTO conffiles (package, path, orig_hash, curr_hash, modified) VALUES (" +
+            q(pkg) + "," + q(file) + "," + q(hash) + "," + q(hash) + ",0);")
+    end
+
+    pub fn update_conffile_hash(self, file: string, curr_hash: string) -> string is
+        return self.apply("UPDATE conffiles SET curr_hash = " + q(curr_hash) +
+            ", modified = (orig_hash != " + q(curr_hash) + ") WHERE path = " + q(file) + ";")
+    end
+
+    ;; Elementy: "package\tpath". `pkg == ""` -> wszystkie pakiety.
+    pub fn list_modified_conffiles(self, pkg: string) -> [string] is
+        let mut sql: string = "SELECT package, path FROM conffiles WHERE modified = 1"
+        if pkg != "" is sql = sql + " AND package = " + q(pkg) end
+        return run_rows(self, sql + " ORDER BY package, path")
+    end
+
+    pub fn remove_conffiles_for_package(self, pkg: string) -> string is
+        return self.apply("DELETE FROM conffiles WHERE package = " + q(pkg) + ";")
+    end
+
+    pub fn vacuum(self) -> string is
+        let out: string = sql_run(self.handle, "VACUUM;")
+        if is_sql_error(out) is return out end
+        return ""
+    end
+
+    ;; ── Migracje ─────────────────────────────────────────────────────────
+
+    pub fn schema_version(self) -> int is
+        let rows: [string] = run_rows(self, "SELECT version FROM schema_version")
+        if rows.len() == 0 is return 0 end
+        if !str::is_numeric(rows[0]) is return 0 end
+        return conv::str_to_int(rows[0])
+    end
+
+    ;; Wolane przy kazdym open_at(); idempotentne.
+    pub fn migrate(self) is
+        sql_run(self.handle, "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
+        let version: int = self.schema_version()
+
+        if version < 1 is self.migrate_v1() end
+        if version < 2 is self.migrate_v2() end
+        if version < 3 is self.migrate_v3() end
+        if version < 4 is self.migrate_v4() end
+        if version < 5 is self.migrate_v5() end
+        if version < 6 is self.migrate_v6() end
+
+        sql_run(self.handle, "DELETE FROM schema_version; INSERT INTO schema_version VALUES (" +
+            to_string(current_schema_version()) + ");")
+    end
+
+    ;; v1 — tabele bazowe (installed, history)
+    fn migrate_v1(self) is
+        sql_run(self.handle,
+            "CREATE TABLE IF NOT EXISTS installed (" +
+            " name TEXT PRIMARY KEY, version TEXT NOT NULL," +
+            " architecture TEXT NOT NULL DEFAULT 'amd64'," +
+            " installed_size_kb INTEGER NOT NULL DEFAULT 0," +
+            " section TEXT, maintainer TEXT, description_short TEXT," +
+            " installed_at TEXT NOT NULL, reason TEXT NOT NULL DEFAULT 'user'," +
+            " store_hash TEXT NOT NULL DEFAULT '', depends TEXT, recommends TEXT);" +
+            " CREATE TABLE IF NOT EXISTS history (" +
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, action TEXT NOT NULL," +
+            " package TEXT NOT NULL, old_ver TEXT, new_ver TEXT," +
+            " generation INTEGER NOT NULL DEFAULT 0, timestamp TEXT NOT NULL);")
+    end
+
+    ;; v2 — pins i holds
+    fn migrate_v2(self) is
+        sql_run(self.handle,
+            "CREATE TABLE IF NOT EXISTS pins (" +
+            " name TEXT PRIMARY KEY, \"constraint\" TEXT NOT NULL," +
+            " priority INTEGER NOT NULL DEFAULT 100, note TEXT);" +
+            " CREATE TABLE IF NOT EXISTS holds (name TEXT PRIMARY KEY, held_at TEXT NOT NULL);")
+    end
+
+    ;; v3 — indeksy
+    fn migrate_v3(self) is
+        sql_run(self.handle,
+            "CREATE INDEX IF NOT EXISTS idx_installed_section ON installed(section);" +
+            " CREATE INDEX IF NOT EXISTS idx_installed_reason  ON installed(reason);" +
+            " CREATE INDEX IF NOT EXISTS idx_history_package   ON history(package);" +
+            " CREATE INDEX IF NOT EXISTS idx_history_action    ON history(action);" +
+            " CREATE INDEX IF NOT EXISTS idx_history_timestamp ON history(timestamp);")
+    end
+
+    ;; v4 — sledzenie conffiles
+    fn migrate_v4(self) is
+        sql_run(self.handle,
+            "CREATE TABLE IF NOT EXISTS conffiles (" +
+            " package TEXT NOT NULL, path TEXT NOT NULL, orig_hash TEXT NOT NULL," +
+            " curr_hash TEXT, modified INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (package, path));" +
+            " CREATE INDEX IF NOT EXISTS idx_conffiles_pkg  ON conffiles(package);" +
+            " CREATE INDEX IF NOT EXISTS idx_conffiles_path ON conffiles(path);")
+    end
+
+    ;; v5 — file_index (`hammer what <file>`)
+    fn migrate_v5(self) is
+        sql_run(self.handle,
+            "CREATE TABLE IF NOT EXISTS file_index (" +
+            " path TEXT NOT NULL, package TEXT NOT NULL, PRIMARY KEY (path, package));" +
+            " CREATE INDEX IF NOT EXISTS idx_file_index_pkg  ON file_index(package);" +
+            " CREATE INDEX IF NOT EXISTS idx_file_index_path ON file_index(path);")
+    end
+
+    ;; v6 — kolumna multi_arch w `installed`. Idempotentna: SQLite nie ma
+    ;; `ADD COLUMN IF NOT EXISTS`, wiec najpierw pragma_table_info.
+    fn migrate_v6(self) is
+        let rows: [string] = run_rows(self,
+            "SELECT COUNT(*) FROM pragma_table_info('installed') WHERE name = 'multi_arch'")
+        let mut has_col: bool = false
+        if rows.len() > 0 && rows[0] != "0" is has_col = true end
+        if !has_col is
+            sql_run(self.handle, "ALTER TABLE installed ADD COLUMN multi_arch TEXT;")
+        end
+    end
+
+    ;; ── Eksport JSON (snapshot) ──────────────────────────────────────────
+
+    ;; Pole opcjonalne -> "null" albo "tekst".
+    fn json_opt(v: string?) -> string is
+        if v == nil is return "null" end
+        let s: string = v
+        return "\"" + json_escape(s) + "\""
+    end
+
+    ;; Zapis atomowy: *.tmp + rename (jak w Rust). Zwraca "" albo blad.
+    pub fn export_json_to(self, file: string) -> string is
+        let pkgs: [InstalledPackage] = self.list_all()
+        let exported: [string] = run_rows(self, "SELECT " + now_sql())
+        let ts: string = if exported.len() > 0 then exported[0] else ""
+
+        let mut out: string = "{\n  \"schema_version\": " + to_string(current_schema_version()) +
+            ",\n  \"exported_at\": \"" + json_escape(ts) + "\",\n  \"packages\": ["
+        let mut i: int = 0
+        while i < pkgs.len() is
+            let p: InstalledPackage = pkgs[i]
+            if i > 0 is out = out + "," end
+            out = out + "\n    {\n" +
+                "      \"name\": \"" + json_escape(p.name) + "\",\n" +
+                "      \"version\": \"" + json_escape(p.version) + "\",\n" +
+                "      \"architecture\": \"" + json_escape(p.architecture) + "\",\n" +
+                "      \"installed_size_kb\": " + to_string(p.installed_size_kb) + ",\n" +
+                "      \"section\": " + InstalledDb::json_opt(p.section) + ",\n" +
+                "      \"maintainer\": " + InstalledDb::json_opt(p.maintainer) + ",\n" +
+                "      \"description_short\": " + InstalledDb::json_opt(p.description_short) + ",\n" +
+                "      \"installed_at\": \"" + json_escape(p.installed_at) + "\",\n" +
+                "      \"reason\": \"" + (if p.reason == InstallReason::Dependency then "Dependency" else "User") + "\",\n" +
+                "      \"store_hash\": \"" + json_escape(p.store_hash) + "\",\n" +
+                "      \"depends\": " + InstalledDb::json_opt(p.depends) + ",\n" +
+                "      \"recommends\": " + InstalledDb::json_opt(p.recommends) + ",\n" +
+                "      \"multi_arch\": " + InstalledDb::json_opt(p.multi_arch) + "\n    }"
+            i += 1
+        end
+        if pkgs.len() > 0 is out = out + "\n  " end
+        out = out + "]\n}\n"
+
+        let dir: string = compat::path_parent(file)
+        if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+        let tmp: string = file + ".tmp"
+        fs::write(tmp, out)
+        fs::rename(tmp, file)
+        return ""
+    end
+
+    ;; ── Sciezka snapshotu, wrappery *_and_sync ───────────────────────────
+
+    pub fn export_json(self) -> string is
+        return self.export_json_to(json_path())
+    end
+
+    ;; Rust: `eprintln!("[db] JSON export failed: ..")`, ale blad eksportu NIE przerywa operacji.
+    fn export_best_effort(self) is
+        let err: string = self.export_json()
+        if err != "" is ui::eprint_line("[db] JSON export failed: " + err) end
+    end
+
+    pub fn record_install_and_sync(self, pkg: package::Package, reason: InstallReason, store_hash: string, gen: int) -> string is
+        let err: string = self.record_install(pkg, reason, store_hash, gen)
+        if err != "" is return err end
+        self.export_best_effort()
+        return ""
+    end
+
+    pub fn record_upgrade_and_sync(self, old_ver: string, pkg: package::Package, store_hash: string, gen: int) -> string is
+        let err: string = self.record_upgrade(old_ver, pkg, store_hash, gen)
+        if err != "" is return err end
+        self.export_best_effort()
+        return ""
+    end
+
+    pub fn record_remove_and_sync(self, name: string, version: string, gen: int) -> string is
+        let err: string = self.record_remove(name, version, gen)
+        if err != "" is return err end
+        self.export_best_effort()
+        return ""
+    end
+
+    ;; ── Import / odzyskiwanie z JSON (jsonlite) ──────────────────────────
+    ;; Roznica wzgledem Rust: import zapisuje tez `multi_arch` (INSERT w
+    ;; oryginale go pomija, wiec odzyskana baza traci te kolumne).
+
+    ;; Liczba zaimportowanych; blad -> `ImportResult.err`.
+    pub fn import_json(self, file: string) -> ImportJsonResult is
+        if !fs::exists(file) is return ImportJsonResult { count: 0, err: "Reading " + file } end
+        let snap: SnapshotParse = parse_snapshot(fs::read(file))
+        if snap.err != "" is return ImportJsonResult { count: 0, err: snap.err } end
+        let mut imported: int = 0
+        let mut batch: string = ""
+        let mut i: int = 0
+        while i < snap.packages.len() is
+            let ip: InstalledPackage = snap.packages[i]
+            i += 1
+            if !self.is_installed_in_sqlite(ip.name) is
+                batch = batch + "INSERT OR IGNORE INTO installed " +
+                    "(name,version,architecture,installed_size_kb,section,maintainer,description_short," +
+                    "installed_at,reason,store_hash,depends,recommends,multi_arch) VALUES (" +
+                    q(ip.name) + "," + q(ip.version) + "," + q(ip.architecture) + "," + to_string(ip.installed_size_kb) + "," +
+                    qo(ip.section) + "," + qo(ip.maintainer) + "," + qo(ip.description_short) + "," + q(ip.installed_at) + "," +
+                    q(reason_to_str(ip.reason)) + "," + q(ip.store_hash) + "," + qo(ip.depends) + "," + qo(ip.recommends) + "," +
+                    qo(ip.multi_arch) + ");"
+                imported += 1
+            end
+        end
+        if batch != "" is
+            let err: string = self.apply(batch)
+            if err != "" is return ImportJsonResult { count: 0, err: err } end
+        end
+        return ImportJsonResult { count: imported, err: "" }
+    end
+
+    ;; Rust sprawdza `is_installed`, ktore w trybie z dpkg-fallbackiem patrzy tez
+    ;; w /var/lib/dpkg/status; do importu liczy sie TYLKO wlasna tabela.
+    fn is_installed_in_sqlite(self, name: string) -> bool is
+        return run_rows(self, "SELECT 1 FROM installed WHERE name = " + q(name)).len() > 0
+    end
+
+    ;; Porownanie nazw: (tylko w SQLite, tylko w JSON).
+    pub fn validate_json_sync(self) -> JsonSyncResult is
+        let sq: [InstalledPackage] = self.list_installed_sqlite_only()
+        let none: [string] = []
+        let mut only_sqlite: [string] = none
+        let mut only_json: [string] = []
+        let jp: string = json_path()
+        if !fs::exists(jp) is
+            let mut i: int = 0
+            while i < sq.len() is
+                only_sqlite.push(sq[i].name)
+                i += 1
+            end
+            return JsonSyncResult { only_sqlite: only_sqlite, only_json: only_json, err: "" }
+        end
+        let snap: SnapshotParse = parse_snapshot(fs::read(jp))
+        if snap.err != "" is return JsonSyncResult { only_sqlite: none, only_json: none, err: snap.err } end
+        let mut i: int = 0
+        while i < sq.len() is
+            if !names_have(snap.packages, sq[i].name) is only_sqlite.push(sq[i].name) end
+            i += 1
+        end
+        let mut k: int = 0
+        while k < snap.packages.len() is
+            if !names_have(sq, snap.packages[k].name) is only_json.push(snap.packages[k].name) end
+            k += 1
+        end
+        return JsonSyncResult { only_sqlite: only_sqlite, only_json: only_json, err: "" }
+    end
+
+    ;; `list_all` Rust tez miesza dpkg; `validate_json_sync` porownuje to, co zwraca `list_all`.
+    fn list_installed_sqlite_only(self) -> [InstalledPackage] is
+        return self.list_all()
+    end
+end
+
+pub struct ImportJsonResult is
+    pub count: int
+    pub err:   string
+end
+
+pub struct JsonSyncResult is
+    pub only_sqlite: [string]
+    pub only_json:   [string]
+    pub err:         string
+end
+
+;; Sciezka snapshotu (`json_path()` w Rust) — zalezy od trybu.
+pub fn json_path() -> string is
+    return compat::path_join(build_mode::db_dir(), "installed.json")
+end
+
+fn names_have(items: [InstalledPackage], name: string) -> bool is
+    let mut i: int = 0
+    while i < items.len() is
+        if items[i].name == name is return true end
+        i += 1
+    end
+    return false
+end
+
+pub struct SnapshotParse is
+    pub packages: [InstalledPackage]
+    pub err:      string
+end
+
+fn tstr(toks: [string], pos: int) -> string? is
+    if pos < toks.len() && jsonlite::is_string_tok(toks[pos]) is return jsonlite::tok_text(toks[pos]) end
+    return nil
+end
+
+fn tstr_or(toks: [string], pos: int) -> string is
+    let v: string? = tstr(toks, pos)
+    if v == nil is return "" end
+    let s: string = v
+    return s
+end
+
+struct SnapPkgParsed is
+    pub p:   InstalledPackage
+    pub pos: int
+    pub ok:  bool
+end
+
+fn parse_snapshot_pkg(toks: [string], start: int) -> SnapPkgParsed is
+    let mut p: InstalledPackage = InstalledPackage { name: "", version: "", architecture: "", installed_size_kb: 0,
+        section: nil, maintainer: nil, description_short: nil, installed_at: "", reason: InstallReason::User,
+        store_hash: "", depends: nil, recommends: nil, multi_arch: nil }
+    let mut pos: int = start
+    if pos >= toks.len() || toks[pos] != "{" is return SnapPkgParsed { p: p, pos: pos, ok: false } end
+    pos += 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is return SnapPkgParsed { p: p, pos: pos, ok: false } end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        if key == "name" is p.name = tstr_or(toks, vpos) end
+        if key == "version" is p.version = tstr_or(toks, vpos) end
+        if key == "architecture" is p.architecture = tstr_or(toks, vpos) end
+        if key == "installed_at" is p.installed_at = tstr_or(toks, vpos) end
+        if key == "store_hash" is p.store_hash = tstr_or(toks, vpos) end
+        if key == "section" is p.section = tstr(toks, vpos) end
+        if key == "maintainer" is p.maintainer = tstr(toks, vpos) end
+        if key == "description_short" is p.description_short = tstr(toks, vpos) end
+        if key == "depends" is p.depends = tstr(toks, vpos) end
+        if key == "recommends" is p.recommends = tstr(toks, vpos) end
+        if key == "multi_arch" is p.multi_arch = tstr(toks, vpos) end
+        if key == "installed_size_kb" && jsonlite::is_word_tok(toks[vpos]) is
+            let t: string = jsonlite::tok_text(toks[vpos])
+            if t != "" && str::is_numeric(t) is p.installed_size_kb = conv::str_to_int(t) end
+        end
+        ;; serde zapisuje wariant enum jako napis ("User" / "Dependency")
+        if key == "reason" is
+            let r: string = tstr_or(toks, vpos)
+            if r == "Dependency" || r == "dependency" is p.reason = InstallReason::Dependency end
+        end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return SnapPkgParsed { p: p, pos: pos, ok: false } end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    if pos >= toks.len() is return SnapPkgParsed { p: p, pos: pos, ok: false } end
+    return SnapPkgParsed { p: p, pos: pos + 1, ok: true }
+end
+
+pub fn parse_snapshot(text: string) -> SnapshotParse is
+    let none: [InstalledPackage] = []
+    let toks: [string] = jsonlite::tokenize(text)
+    if toks.len() == 0 || toks[0] != "{" is return SnapshotParse { packages: none, err: "Parsing JSON snapshot" } end
+    let mut pkgs: [InstalledPackage] = []
+    let mut pos: int = 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is return SnapshotParse { packages: none, err: "Parsing JSON snapshot" } end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        if key == "packages" && toks[vpos] == "[" is
+            let mut ppos: int = vpos + 1
+            while ppos < toks.len() && toks[ppos] != "]" is
+                let r: SnapPkgParsed = parse_snapshot_pkg(toks, ppos)
+                if !r.ok is return SnapshotParse { packages: none, err: "Parsing JSON snapshot" } end
+                pkgs.push(r.p)
+                ppos = r.pos
+                if ppos < toks.len() && toks[ppos] == "," is ppos += 1 end
+            end
+        end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return SnapshotParse { packages: none, err: "Parsing JSON snapshot" } end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    return SnapshotParse { packages: pkgs, err: "" }
+end
+
+pub struct OpenRecovery is
+    pub db:        InstalledDb
+    pub recovered: int
+    pub err:       string
+end
+
+;; `InstalledDb::open_with_recovery`: gdy SQLite jest pusta, a snapshot istnieje.
+pub fn open_with_recovery() -> OpenRecovery is
+    let db: InstalledDb = InstalledDb::open()
+    let mut n: int = 0
+    if db.count() == 0 is
+        let jp: string = json_path()
+        if fs::exists(jp) is
+            let r: ImportJsonResult = db.import_json(jp)
+            if r.err != "" is return OpenRecovery { db: db, recovered: 0, err: r.err } end
+            n = r.count
+            if n > 0 is ui::eprint_line("[hammer] Recovered " + to_string(n) + " packages from JSON backup.") end
+        end
+    end
+    return OpenRecovery { db: db, recovered: n, err: "" }
+end
+
+;; `InstalledDb::recover_from_json`: 0 gdy nie ma czego odzyskiwac.
+pub fn recover_from_json() -> OpenRecovery is
+    let jp: string = json_path()
+    let db: InstalledDb = InstalledDb::open()
+    if !fs::exists(jp) is return OpenRecovery { db: db, recovered: 0, err: "" } end
+    if db.count() > 0 is
+        ;; SQLite zdrowa — tylko zsynchronizuj JSON
+        let e: string = db.export_json()
+        return OpenRecovery { db: db, recovered: 0, err: e }
+    end
+    let r: ImportJsonResult = db.import_json(jp)
+    if r.err != "" is return OpenRecovery { db: db, recovered: 0, err: r.err } end
+    ui::eprint_line("[hammer] Recovered " + to_string(r.count) + " packages from JSON snapshot.")
+    return OpenRecovery { db: db, recovered: r.count, err: "" }
+end
+
+
+;; Escapowanie do JSON (jak `internal::log::json_escape`; lokalna kopia,
+;; zeby pkg/ nie zalezalo od internal/ w kolejnosci `mod`).
+fn json_escape(s: string) -> string is
+    let mut out: string = ""
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(s, i)
+        if c == "\"" is
+            out = out + "\\\""
+        elsif c == "\\" is
+            out = out + "\\\\"
+        elsif c == "\n" is
+            out = out + "\\n"
+        elsif c == "\r" is
+            out = out + "\\r"
+        elsif c == "\t" is
+            out = out + "\\t"
+        else is
+            out = out + c
+        end
+        i += 1
+    end
+    return out
+end
