@@ -1,0 +1,542 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+
+;; hammer -> gpg_verify
+;;
+;; Port of source-code/system/gpg_verify.rs (Rust) to H#: parser InRelease,
+;; weryfikacja podpisu (`gpgv`), weryfikacja plikow po SHA-256, import
+;; kluczy, informacje o kluczu (`gpg --with-colons`).
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. API BAJTOWE -> PLIKOWE (patrz pkg/deb.h#, ui/download.h#): w H# bajty
+;;    to `[int]`, nieuzyteczne dla .deb/Packages. `verify_file`,
+;;    `verify_index_file` i `verify_deb` dostaja SCIEZKE pliku; rozmiar
+;;    z `fs::size`, skrot z `sha256sum`. `import_key_bytes(&[u8], name)` ->
+;;    `import_key_file(sciezka, name)`.
+;; 2. `HashMap<String,(u64,String)>` -> trzy rownolegle tablice
+;;    (`paths`/`sizes`/`hashes`); ta sama semantyka `insert` (pozniejszy
+;;    duplikat nadpisuje).
+;; 3. `Result<..>` -> struktury z polem `err` ("" = Ok) / `string` bledu.
+;; 4. `KEYRING_DIR` (re-eksport z `gpg.rs`) -> `keyring_dir()`; wartosc
+;;    `/etc/hammer/trusted.gpg.d`, jak w gpg.rs.
+;;
+;; ── BEZPIECZENSTWO — ODSTEPSTWA SWIADOME ────────────────────────────────
+;; A. PLIKI TYMCZASOWE. Rust tworzyl `/tmp/hammer_inrelease_<pid>`,
+;;    `/tmp/hammer_keyring_<pid>.gpg` itd. pod PRZEWIDYWALNA nazwa przez
+;;    `fs::write` (podaza za dowiazaniem symbolicznym). Hammer dziala jako
+;;    root, wiec lokalny uzytkownik mogl wczesniej zalozyc `/tmp/...`
+;;    jako symlink na np. `/etc/passwd` i nadpisac go trescia InRelease
+;;    (klasyczny atak symlink/TOCTOU). Tu: `mktemp` (O_EXCL, tryb 0600,
+;;    losowa nazwa) i usuniecie po uzyciu.
+;; B. `fingerprint` w `parse_gpg_colons`: Rust nadpisywal `fingerprint`
+;;    KAZDA linia `fpr`, a `gpg --with-colons` wypisuje najpierw `pub`+`fpr`
+;;    klucza glownego, potem `sub`+`fpr` PODKLUCZY — wiec dla kluczy z
+;;    podkluczami raportowano odcisk OSTATNIEGO PODKLUCZA, nie klucza
+;;    glownego. Tu: odcisk brany tylko z `fpr` bezposrednio po `pub`/`sec`.
+;; C. `gpg --dearmor --output <dest>` pyta o nadpisanie istniejacego
+;;    pliku i bez terminala konczy bledem (Rust wtedy po cichu zapisywal
+;;    klucz jako `.asc` OBOK starego `.gpg`). Tu `--yes`.
+;;
+;; G. **LUKA W ORYGINALE (WSTRZYKNIECIE PREFIKSU), NAPRAWIONA.** `gpgv`
+;;    uznaje za poprawny plik InRelease z DOWOLNYM niepodpisanym tekstem
+;;    PRZED blokiem `-----BEGIN PGP SIGNED MESSAGE-----` (i za podpisem) —
+;;    sprawdzone na prawdziwym gpgv 2.4.4: rc=0, "Good signature". Rust
+;;    parsowal `InRelease` z SUROWEGO pliku (`strip_pgp_armor` bierze tekst
+;;    od pierwszej pustej linii), wiec atakujacy (MITM na `http://`
+;;    zrodlach — a domyslne zrodla to `http://deb.debian.org`) mogl dopisac
+;;    przed prawdziwym, publicznie dostepnym InRelease wlasna sekcje
+;;    `SHA256:` z wpisem dla pliku, ktorego prawdziwy InRelease nie
+;;    wymienia (np. `Packages.zst`, probowany jako PIERWSZY wariant), podac
+;;    zlosliwy `Packages.zst` o pasujacym skrocie i dostac `gpg_ok = true`
+;;    oraz `sha256_ok = true` (+ znacznik `.gpg-verified`). Tu: `gpgv
+;;    --output` zwraca WYLACZNIE podpisana tresc (identyczna bajt w bajt z
+;;    oryginalnym `Release`; tekst z prefiksu odpada — sprawdzone) i tylko ona
+;;    jest parsowana (`VerifyStatus.content`).
+;;
+;; ── ZACHOWANE ZE ZLOGO ZACHOWANIA ORYGINALU (do Twojej decyzji) ──────────
+;; D. FAIL-OPEN: `verify_inrelease` zwraca sukces (tylko ostrzezenie w
+;;    logu), gdy brak katalogu kluczy, katalog jest pusty ALBO `gpgv` nie
+;;    jest zainstalowany. Na systemie bez `gnupg` repozytorium NIE jest
+;;    weryfikowane. To swiadoma wygoda "dla systemow deweloperskich" w
+;;    oryginale; port jej nie zmienia, ale to jest decyzja bezpieczenstwa
+;;    warta przemyslenia (np. tryb `strict`).
+;; E. `name` w `parse_gpg_colons` zdejmuje koncowy ')' z czesci przed '<':
+;;    dla "Debian Archive (Automatic) <x@y>" wychodzi "Debian Archive
+;;    (Automatic" (komentarz byl pewnie zamierzony do usuniecia).
+;; F. `safe_name` w `import_key_file`: tylko ASCII [A-Za-z0-9-.] zostaje;
+;;    kazdy INNY BAJT (nie znak Unicode) -> '_'.
+
+pub fn keyring_dir() -> string is return "/etc/hammer/trusted.gpg.d" end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sys_ok(cmd: string) -> bool is
+    return system(cmd) == 0
+end
+
+fn have_cmd(name: string) -> bool is
+    return sys_ok("command -v " + shq(name) + " >/dev/null 2>&1")
+end
+
+;; Bezpieczny plik tymczasowy (patrz A); "" gdy sie nie udalo.
+fn tmp_file(prefix: string) -> string is
+    return str::trim(proc::shell("mktemp /tmp/" + prefix + ".XXXXXX 2>/dev/null"))
+end
+
+fn lines_of(s: string) -> [string] is
+    let parts: [string] = str::split(s, "\n")
+    let mut out: [string] = []
+    let n: int = if parts.len() > 0 && parts[parts.len() - 1] == "" then parts.len() - 1 else parts.len()
+    let mut i: int = 0
+    while i < n is
+        out.push(parts[i])
+        i += 1
+    end
+    return out
+end
+
+;; `split_whitespace()`
+fn split_ws(s: string) -> [string] is
+    let norm: string = str::replace_all(str::replace_all(s, "\t", " "), "\r", " ")
+    let raw: [string] = str::split(norm, " ")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < raw.len() is
+        if raw[i] != "" is out.push(raw[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; SHA-256 pliku (hex, male litery) albo "" gdy nie da sie odczytac.
+pub fn sha256_file(file: string) -> string is
+    let out: string = str::trim(proc::shell("sha256sum -- " + shq(file) + " 2>/dev/null | cut -d' ' -f1"))
+    if string_len(out) == 64 is return out end
+    return ""
+end
+
+;; ── InRelease ────────────────────────────────────────────────────────────
+
+pub struct InRelease is
+    pub origin:      string?
+    pub suite:       string?
+    pub codename:    string?
+    pub date:        string?
+    pub valid_until: string?
+    ;; SHA256: sciezka -> (rozmiar, skrot) — rownolegle tablice
+    pub paths:       [string]
+    pub sizes:       [int]
+    pub hashes:      [string]
+    ;; surowa podpisana tresc (do weryfikacji GPG)
+    pub raw:         string
+end
+
+;; Rust: `strip_pgp_armor` — tresc miedzy pierwsza pusta linia a
+;; `-----BEGIN PGP SIGNATURE-----`; w innym razie cala tresc.
+fn strip_pgp_armor(content: string) -> string is
+    let start: int = compat::str_index_of(content, "\n\n")
+    let end_pos: int = compat::str_index_of(content, "-----BEGIN PGP SIGNATURE-----")
+    if start >= 0 && end_pos >= 0 && start + 2 <= end_pos is
+        return str::slice(content, start + 2, end_pos)
+    end
+    return content
+end
+
+fn rest_after(line: string, prefix_len: int) -> string is
+    return str::trim(str::slice(line, prefix_len, string_len(line)))
+end
+
+;; Parsuje InRelease (podpisany lub zwykly `Release`). Nigdy nie zwraca bledu.
+pub fn inrelease_parse(content: string) -> InRelease is
+    let mut paths: [string] = []
+    let mut sizes: [int] = []
+    let mut hashes: [string] = []
+    let mut origin: string? = nil
+    let mut suite: string? = nil
+    let mut codename: string? = nil
+    let mut date: string? = nil
+    let mut valid_until: string? = nil
+
+    let body: string = strip_pgp_armor(content)
+    let mut in_sha256: bool = false
+    let lines: [string] = lines_of(body)
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = lines[i]
+        i += 1
+        if line.starts_with("Origin:") is
+            origin = rest_after(line, 7)
+        elsif line.starts_with("Suite:") is
+            suite = rest_after(line, 6)
+        elsif line.starts_with("Codename:") is
+            codename = rest_after(line, 9)
+        elsif line.starts_with("Date:") is
+            date = rest_after(line, 5)
+        elsif line.starts_with("Valid-Until:") is
+            valid_until = rest_after(line, 12)
+        elsif line.starts_with("SHA256:") is
+            in_sha256 = true
+        elsif in_sha256 is
+            if line.starts_with(" ") || line.starts_with("\t") is
+                ;; format: " <hash> <size> <path>"
+                let parts: [string] = split_ws(line)
+                if parts.len() == 3 is
+                    let hash: string = parts[0]
+                    let size: int = if str::is_numeric(parts[1]) then conv::str_to_int(parts[1]) else 0
+                    let p: string = parts[2]
+                    ;; HashMap::insert — pozniejszy duplikat nadpisuje
+                    let mut found: int = -1
+                    let mut k: int = 0
+                    while k < paths.len() is
+                        if paths[k] == p is found = k end
+                        k += 1
+                    end
+                    if found >= 0 is
+                        sizes[found] = size
+                        hashes[found] = hash
+                    else is
+                        paths.push(p)
+                        sizes.push(size)
+                        hashes.push(hash)
+                    end
+                end
+            else is
+                in_sha256 = false
+            end
+        end
+    end
+    return InRelease { origin: origin, suite: suite, codename: codename, date: date,
+        valid_until: valid_until, paths: paths, sizes: sizes, hashes: hashes, raw: content }
+end
+
+;; Sprawdza plik wzgledem rozmiaru i SHA-256 zadeklarowanych w InRelease.
+;; "" = Ok, inaczej tresc bledu (jak `bail!` w Rust).
+pub fn inrelease_verify_file(ir: InRelease, rel_path: string, file: string) -> string is
+    let mut idx: int = -1
+    let mut i: int = 0
+    while i < ir.paths.len() is
+        if ir.paths[i] == rel_path is idx = i end
+        i += 1
+    end
+    if idx < 0 is return "File '" + rel_path + "' not listed in InRelease SHA256 section" end
+
+    if !fs::exists(file) is return "Reading " + file end
+    let actual_size: int = fs::size(file)
+    if actual_size != ir.sizes[idx] is
+        return "Size mismatch for '" + rel_path + "': expected " + to_string(ir.sizes[idx]) +
+            " bytes, got " + to_string(actual_size)
+    end
+    let actual_hash: string = sha256_file(file)
+    if actual_hash != ir.hashes[idx] is
+        return "SHA256 mismatch for '" + rel_path + "':\n  expected: " + ir.hashes[idx] +
+            "\n  actual:   " + actual_hash
+    end
+    return ""
+end
+
+;; ── Weryfikacja podpisu ──────────────────────────────────────────────────
+
+fn is_key_ext(name: string) -> bool is
+    return name.ends_with(".gpg") || name.ends_with(".asc") || name.ends_with(".pgp")
+end
+
+;; Sklada jeden plik keyring dla gpgv: pliki binarne doklejane, `.asc` przez
+;; `gpg --dearmor`. "" gdy sie nie udalo.
+fn build_combined_keyring(keyfiles: [string]) -> string is
+    let dest: string = tmp_file("hammer_keyring")
+    if dest == "" is return "" end
+    let mut cmd: string = ": > " + shq(dest) + "; "
+    let mut i: int = 0
+    while i < keyfiles.len() is
+        let kf: string = keyfiles[i]
+        i += 1
+        if kf.ends_with(".asc") is
+            cmd = cmd + "gpg --dearmor < " + shq(kf) + " >> " + shq(dest) + " 2>/dev/null || true; "
+        else is
+            cmd = cmd + "cat -- " + shq(kf) + " >> " + shq(dest) + " 2>/dev/null || true; "
+        end
+    end
+    system("sh -c " + shq(cmd))
+    return dest
+end
+
+;; Wynik weryfikacji podpisu. `state`:
+;;   "verified" — gpgv potwierdzil podpis zaufanym kluczem,
+;;   "skipped"  — NIE sprawdzano (brak katalogu kluczy / pusty keyring / brak
+;;                `gpgv`) — patrz D w naglowku,
+;;   "failed"   — gpgv odrzucil podpis (`err` = "GPG signature verification
+;;                failed:\n<stderr>") albo nie dalo sie go uruchomic.
+pub struct VerifyStatus is
+    pub state:   string
+    pub err:     string
+    ;; Tresc PODPISANA (to, co gpgv faktycznie zweryfikowal) gdy state ==
+    ;; "verified", inaczej "". TYLKO z tej tresci wolno czytac skroty
+    ;; plikow — patrz G w naglowku.
+    pub content: string
+end
+
+fn vs(state: string, err: string) -> VerifyStatus is
+    return VerifyStatus { state: state, err: err, content: "" }
+end
+
+;; Jak `verify_inrelease`, ale ROZROZNIA "zweryfikowano" od "pominieto".
+;; (Rust zwracal `Ok(())` w obu przypadkach — `cache::update` uznawal wtedy
+;; zrodlo za zweryfikowane i zapisywal znacznik zaufania `.gpg-verified`.)
+pub fn verify_inrelease_status(content: string, keyring: string) -> VerifyStatus is
+    if !fs::exists(keyring) is
+        log::warn("gpg: no keyring directory — skipping signature verification")
+        return vs("skipped", "")
+    end
+
+    let names: [string] = fs::list_dir(keyring)
+    let mut keyfiles: [string] = []
+    let mut i: int = 0
+    while i < names.len() is
+        if is_key_ext(names[i]) is keyfiles.push(compat::path_join(keyring, names[i])) end
+        i += 1
+    end
+    if keyfiles.len() == 0 is
+        log::warn("gpg: keyring is empty — skipping signature verification")
+        return vs("skipped", "")
+    end
+
+    if !have_cmd("gpgv") is
+        ;; gpgv nie zainstalowany — ostrzezenie, bez bledu
+        log::warn("gpg: gpgv not found — install gnupg for signature verification")
+        return vs("skipped", "")
+    end
+
+    let tmp_content: string = tmp_file("hammer_inrelease")
+    if tmp_content == "" is return vs("failed", "Failed to run gpgv: cannot create temp file") end
+    fs::write(tmp_content, content)
+    let tmp_keyring: string = build_combined_keyring(keyfiles)
+    if tmp_keyring == "" is
+        system("rm -f -- " + shq(tmp_content))
+        return vs("failed", "Failed to run gpgv: cannot create temp keyring")
+    end
+
+    ;; stderr gpgv -> plik, kod wyjscia osobno
+    let errf: string = tmp_file("hammer_gpgv_err")
+    let outf: string = tmp_file("hammer_gpgv_out")
+    let rc: int = system("gpgv --keyring " + shq(tmp_keyring) + " --output " + shq(outf) + " " + shq(tmp_content) +
+        " >/dev/null 2>" + shq(errf))
+    let stderr_text: string = if errf != "" && fs::exists(errf) then str::trim(fs::read(errf)) else ""
+    ;; plik wyjsciowy gpgv jest wypelniony takze przy NIEPOWODZENIU — czytamy go tylko przy rc == 0
+    let verified_text: string = if rc == 0 && outf != "" && fs::exists(outf) then fs::read(outf) else ""
+    system("rm -f -- " + shq(tmp_content) + " " + shq(tmp_keyring) + " " + shq(errf) + " " + shq(outf))
+
+    if rc == 0 is
+        log::info("gpg: InRelease signature OK")
+        return VerifyStatus { state: "verified", err: "", content: verified_text }
+    end
+    return vs("failed", "GPG signature verification failed:\n" + stderr_text)
+end
+
+;; Zgodne z Rust: "" = Ok takze gdy weryfikacje POMINIETO (D). Kto potrzebuje
+;; rozroznienia, wola `verify_inrelease_status`.
+pub fn verify_inrelease(content: string, keyring: string) -> string is
+    return verify_inrelease_status(content, keyring).err
+end
+
+;; ── Weryfikacja plikow ───────────────────────────────────────────────────
+
+;; Pobrany .deb wzgledem SHA-256 z indeksu. "" = Ok.
+pub fn verify_deb(file: string, expected_sha256: string) -> string is
+    if !fs::exists(file) is return "Reading " + file end
+    let actual: string = sha256_file(file)
+    if actual != expected_sha256 is
+        return "SHA256 mismatch for " + file + ":\n  expected: " + expected_sha256 + "\n  actual:   " + actual
+    end
+    return ""
+end
+
+;; Plik indeksu (Packages, Packages.gz …) wzgledem InRelease. "" = Ok.
+pub fn verify_index_file(rel_path: string, file: string, ir: InRelease) -> string is
+    return inrelease_verify_file(ir, rel_path, file)
+end
+
+;; ── Import klucza ────────────────────────────────────────────────────────
+
+pub struct ImportResult is
+    pub path: string
+    pub err:  string
+end
+
+fn is_safe_name_char(c: string) -> bool is
+    if c == "-" || c == "." is return true end
+    if c >= "0" && c <= "9" is return true end
+    if c >= "a" && c <= "z" is return true end
+    if c >= "A" && c <= "Z" is return true end
+    return false
+end
+
+fn safe_key_name(name: string) -> string is
+    let mut out: string = ""
+    let n: int = string_len(name)
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(name, i)
+        out = out + (if is_safe_name_char(c) then c else "_")
+        i += 1
+    end
+    return out
+end
+
+;; Importuje klucz z pliku `src` (armored .asc albo binarny .gpg) do keyringu
+;; hammera. Zwraca sciezke zapisanego pliku.
+pub fn import_key_file(src: string, key_name: string) -> ImportResult is
+    fs::mkdir(keyring_dir())
+    if !fs::is_dir(keyring_dir()) is return ImportResult { path: "", err: "Cannot create " + keyring_dir() } end
+    if !fs::exists(src) is return ImportResult { path: "", err: "Reading " + src } end
+
+    let head: string = proc::shell("head -c 5 -- " + shq(src) + " 2>/dev/null")
+    let ext: string = if head == "-----" then "asc" else "gpg"
+    let safe_name: string = safe_key_name(key_name)
+    let dest: string = compat::path_join(keyring_dir(), safe_name + "." + ext)
+
+    if ext == "asc" is
+        ;; --yes: patrz C
+        if have_cmd("gpg") && sys_ok("gpg --yes --dearmor --output " + shq(dest) + " " + shq(src) + " >/dev/null 2>&1") is
+            log::info("gpg: imported key to " + dest)
+            return ImportResult { path: dest, err: "" }
+        end
+        ;; gpg niedostepny albo blad — zapisz armored bezposrednio
+        let asc_dest: string = compat::path_join(keyring_dir(), safe_name + ".asc")
+        if !sys_ok("cp -f -- " + shq(src) + " " + shq(asc_dest)) is
+            return ImportResult { path: "", err: "Writing " + asc_dest }
+        end
+        log::info("gpg: saved armored key to " + asc_dest)
+        return ImportResult { path: asc_dest, err: "" }
+    end
+
+    if !sys_ok("cp -f -- " + shq(src) + " " + shq(dest)) is return ImportResult { path: "", err: "Writing " + dest } end
+    log::info("gpg: imported key to " + dest)
+    return ImportResult { path: dest, err: "" }
+end
+
+;; ── Informacje o kluczu ──────────────────────────────────────────────────
+
+pub struct KeyInfo is
+    pub fingerprint: string
+    pub name:        string
+    pub email:       string?
+    pub key_id:      string
+end
+
+pub struct KeyInfoResult is
+    pub info: KeyInfo
+    pub err:  string
+end
+
+fn no_key_info(err: string) -> KeyInfoResult is
+    return KeyInfoResult { info: KeyInfo { fingerprint: "", name: "", email: nil, key_id: "" }, err: err }
+end
+
+;; `s.trim_end_matches(')')`
+fn trim_end_parens(s: string) -> string is
+    let mut n: int = string_len(s)
+    while n > 0 && str::slice(s, n - 1, n) == ")" is
+        n -= 1
+    end
+    return str::slice(s, 0, n)
+end
+
+;; Parsuje wyjscie `gpg --with-colons` (patrz B i E w naglowku).
+pub fn parse_gpg_colons(output: string) -> KeyInfoResult is
+    let mut fingerprint: string = ""
+    let mut name: string = ""
+    let mut email: string? = nil
+    let mut key_id: string = ""
+    let mut after_primary: bool = false
+
+    let lines: [string] = lines_of(output)
+    let mut i: int = 0
+    while i < lines.len() is
+        let parts: [string] = str::split(lines[i], ":")
+        i += 1
+        if parts.len() >= 2 is
+            let kind: string = parts[0]
+            if kind == "pub" || kind == "sec" is
+                if parts.len() > 4 is key_id = parts[4] end
+                ;; plik z kilkoma kluczami: jak w Rust wygrywa OSTATNI klucz glowny
+                ;; (key_id, odcisk i uid musza pochodzic z tego samego klucza)
+                fingerprint = ""
+                after_primary = true
+            elsif kind == "sub" || kind == "ssb" is
+                after_primary = false
+            elsif kind == "fpr" is
+                ;; B: tylko odcisk klucza glownego (pierwszy `fpr` po pub/sec)
+                if after_primary && fingerprint == "" && parts.len() > 9 is fingerprint = parts[9] end
+            elsif kind == "uid" is
+                if parts.len() > 9 is
+                    let uid: string = parts[9]
+                    let lt: int = compat::str_index_of(uid, "<")
+                    if lt >= 0 is
+                        name = str::trim(trim_end_parens(str::trim(str::slice(uid, 0, lt))))
+                        let gt: int = compat::str_index_of(uid, ">")
+                        if gt >= 0 && gt > lt is email = str::slice(uid, lt + 1, gt) end
+                    else is
+                        name = uid
+                    end
+                end
+            end
+        end
+    end
+
+    if fingerprint == "" && key_id == "" is return no_key_info("Could not parse GPG key info") end
+    return KeyInfoResult { info: KeyInfo { fingerprint: fingerprint, name: name, email: email, key_id: key_id }, err: "" }
+end
+
+pub fn read_key_info(key_path: string) -> KeyInfoResult is
+    if !have_cmd("gpg") is
+        ;; gpg niedostepny — wartosci zastepcze
+        let mut stem: string = compat::path_stem(key_path)
+        if stem == "" is stem = "unknown" end
+        return KeyInfoResult { info: KeyInfo { fingerprint: "unavailable", name: stem, email: nil, key_id: "unavailable" }, err: "" }
+    end
+    let out: string = proc::shell("gpg --with-colons --import-options show-only --import " + shq(key_path) + " 2>/dev/null")
+    return parse_gpg_colons(out)
+end
+
+;; ── Pomocnicze dla system/gpg.h# ─────────────────────────────────────────
+
+;; Zlozony keyring z wszystkich kluczy w `dir` (`.gpg` binarne i `.asc` przez
+;; --dearmor) — plik tymczasowy do skasowania przez wolajacego; "" gdy brak
+;; kluczy albo nie da sie utworzyc pliku.
+pub fn keyring_from_dir(dir: string) -> string is
+    if !fs::exists(dir) is return "" end
+    let names: [string] = fs::list_dir(dir)
+    let mut keyfiles: [string] = []
+    let mut i: int = 0
+    while i < names.len() is
+        if is_key_ext(names[i]) is keyfiles.push(compat::path_join(dir, names[i])) end
+        i += 1
+    end
+    if keyfiles.len() == 0 is return "" end
+    return build_combined_keyring(keyfiles)
+end
+
+;; Podpis ODDZIELONY (`.asc`/`.gpg`) pliku `data`. FAIL-CLOSED: brak kluczy albo
+;; `gpgv` = blad (w odroznieniu od InRelease, patrz D). "" = Ok.
+;; Rust wolal `gpgv --keyring <KATALOG>`, co gpgv odrzuca (rc=2, sprawdzone) —
+;; ta funkcja w oryginale ZAWSZE konczyla sie bledem.
+pub fn verify_detached(data: string, sig: string) -> string is
+    if !have_cmd("gpgv") is return "gpgv not found — install gnupg" end
+    let ring: string = keyring_from_dir(keyring_dir())
+    if ring == "" is return "no trusted keys in " + keyring_dir() + " — add one with `hammer key add`" end
+    let errf: string = tmp_file("hammer_gpgv_err")
+    let rc: int = system("gpgv --keyring " + shq(ring) + " -- " + shq(sig) + " " + shq(data) + " >/dev/null 2>" + shq(errf))
+    let msg: string = if errf != "" && fs::exists(errf) then str::trim(fs::read(errf)) else ""
+    system("rm -f -- " + shq(ring) + " " + shq(errf))
+    if rc == 0 is
+        log::info("gpg: signature OK for " + data)
+        return ""
+    end
+    return "GPG signature verification failed for '" + data + "'" + (if msg != "" then ":\n" + msg else "")
+end
