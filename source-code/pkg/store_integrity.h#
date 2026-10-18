@@ -1,0 +1,391 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> fmt"     from "fmt"
+
+mod internal
+mod ui
+mod db
+mod tools
+
+;; hammer -> pkg::store_integrity
+;;
+;; Port of source-code/pkg/store_integrity.rs (Rust) to H#: weryfikacja
+;; magazynu (`hammer verify [<pkg>] [--deep] [--fix] [--json]`), pelny skan
+;; i demon w tle.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `walkdir` -> jedno `find -mindepth 1 (-type f -o -type l)` na pakiet
+;;    z petla `sh` (`-exec sh -c … {} +`), bo H# nie ma rekurencyjnego
+;;    odczytu katalogu z typem wpisu. `find` bez `-L` nie wchodzi w
+;;    dowiazania (jak `walkdir` domyslnie).
+;; 2. Skrot SHA-256 liczy `sha256sum` (jeden proces na paczke plikow, nie na
+;;    plik); nieczytelny plik => `Corrupted`, jak `Err(_)` w Rust.
+;;    Sciezki z nowa linia w nazwie nie sa obslugiwane (Debian ich nie ma).
+;; 3. `Duration` -> milisekundy (`time::now_ms`); wypisywane jako sekundy
+;;    z jednym miejscem po przecinku.
+;; 4. `Result<..>` -> `string` ("" = OK); `scan_full_store` zwraca strukture
+;;    z polem `err`.
+;; 5. BLAD ORYGINALU POPRAWIONY: w trybie `--deep` Rust zwraca wpis
+;;    `Ok` (ze skrotem) dla KAZDEGO pliku, wiec `issues.is_empty()` nigdy nie
+;;    zachodzilo i kazdy pakiet liczyl sie jako "problem". `verify_package`
+;;    zwraca nadal surowe wpisy (ze skrotami — przydadza sie do audytu), ale
+;;    `scan_full_store` i `cmd_verify_extended` licza problemy tylko dla
+;;    wpisow o statusie innym niz `Ok` (`real_issues`).
+;; 6. ZACHOWANE: dowiazanie jest "zdrowe", gdy jego CEL (surowy tekst z
+;;    `readlink`) istnieje wzgledem BIEZACEGO KATALOGU procesu — nie wzgledem
+;;    katalogu dowiazania. Dla wzglednych celow to daje falszywe
+;;    `DanglingSymlink`. Naprawa wymaga decyzji (zmienia wynik `verify`).
+;; 7. `--fix`: Rust wola `Solver::resolve_reinstall` i wypisuje tylko
+;;    "Reinstalling N package(s)…" (nie reinstaluje!). `Solver` nie jest jeszcze
+;;    przepisany, wiec port wypisuje liste uszkodzonych pakietow i wskazuje
+;;    `hammer fix-broken`. TODO: wywolac `solver::resolve_reinstall`.
+;; 8. Demon: watek + tokio -> petla `time::sleep_s(3600)` (`daemon_loop`),
+;;    uruchamiana przez wolajacego jako osobny proces (`hammerd`); H# nie
+;;    ma watkow w tym zakresie.
+;; 9. JSON: `JsonVerifyResult` => klucze w kolejnosci deklaracji struktury
+;;    (checked, ok, problems, deep, fix) — `#[derive(Serialize)]` zachowuje
+;;    kolejnosc pol (inaczej niz `json!`).
+
+pub enum IntegrityStatus is
+    Intact   ;; (nie `Ok`: arnosc wariantow jest globalna po nazwie — kolidowalo z SatResult::Ok(T))
+    Missing
+    Corrupted
+    DanglingSymlink
+    Unknown
+end
+
+;; Odpowiednik `{:?}`.
+pub fn status_debug(s: IntegrityStatus) -> string is
+    match s is
+        IntegrityStatus::Intact              => is return "Ok" end
+        IntegrityStatus::Missing         => is return "Missing" end
+        IntegrityStatus::Corrupted       => is return "Corrupted" end
+        IntegrityStatus::DanglingSymlink => is return "DanglingSymlink" end
+        IntegrityStatus::Unknown         => is return "Unknown" end
+    end
+end
+
+pub fn status_is_ok(s: IntegrityStatus) -> bool is
+    return status_debug(s) == "Ok"
+end
+
+pub struct IntegrityEntry is
+    pub path:         string
+    pub expected_sha: string?
+    pub actual_sha:   string?
+    pub status:       IntegrityStatus
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+;; Skrypt `sh` wywolywany przez `find -exec`: argument 1 = "deep"/"fast",
+;; reszta = sciezki. Wyjscie: `D\t\t<path>` (dangling), `E\t\t<path>`
+;; (nieczytelny), `H\t<sha>\t<path>` (skrot, tylko deep).
+fn scan_script() -> string is
+    return "mode=$1; shift; for f in \"$@\"; do " +
+        "if [ -L \"$f\" ]; then " +
+            "t=$(readlink -- \"$f\") || {{ printf 'D\\t\\t%s\\n' \"$f\"; continue; }}; " +
+            "if [ -e \"$t\" ] || [ -L \"$t\" ]; then :; else printf 'D\\t\\t%s\\n' \"$f\"; fi; " +
+        "elif [ -f \"$f\" ] && [ \"$mode\" = deep ]; then " +
+            "h=$(sha256sum -- \"$f\" 2>/dev/null) && printf 'H\\t%s\\t%s\\n' \"${{h%% *}}\" \"$f\" || printf 'E\\t\\t%s\\n' \"$f\"; " +
+        "fi; done"
+end
+
+;; Weryfikuje jeden pakiet w magazynie (surowe wpisy; patrz odejscie 5).
+pub fn verify_package(name: string, version: string, store_hash: string, deep: bool) -> [IntegrityEntry] is
+    let store_path: string = compat::path_join(build_mode::store_dir(), name + "-" + version + "-" + store_hash)
+    let mut entries: [IntegrityEntry] = []
+
+    if !fs::exists(store_path) is
+        entries.push(IntegrityEntry { path: store_path, expected_sha: nil, actual_sha: nil, status: IntegrityStatus::Missing })
+        return entries
+    end
+
+    let mode: string = if deep then "deep" else "fast"
+    let cmd: string = "find " + shq(store_path) + " -mindepth 1 \\( -type f -o -type l \\) -exec sh -c " + shq(scan_script()) + " sh " + mode + " {{}} + 2>/dev/null"
+    let lines: [string] = str::split(proc::shell(cmd), "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let parts: [string] = str::split(lines[i], "\t")
+        if parts.len() == 3 is
+            let kind: string = parts[0]
+            if kind == "D" is
+                entries.push(IntegrityEntry { path: parts[2], expected_sha: nil, actual_sha: nil, status: IntegrityStatus::DanglingSymlink })
+            elsif kind == "E" is
+                entries.push(IntegrityEntry { path: parts[2], expected_sha: nil, actual_sha: nil, status: IntegrityStatus::Corrupted })
+            elsif kind == "H" is
+                entries.push(IntegrityEntry { path: parts[2], expected_sha: nil, actual_sha: parts[1], status: IntegrityStatus::Intact })
+            end
+        end
+        i += 1
+    end
+    return entries
+end
+
+;; Wpisy ze statusem != Ok (patrz odejscie 5).
+pub fn real_issues(entries: [IntegrityEntry]) -> [IntegrityEntry] is
+    let mut out: [IntegrityEntry] = []
+    let mut i: int = 0
+    while i < entries.len() is
+        if !status_is_ok(entries[i].status) is out.push(entries[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; ── Pelny skan magazynu ──────────────────────────────────────────────────
+
+pub struct ScanIssue is
+    pub package: string
+    pub entry:   IntegrityEntry
+end
+
+pub struct StoreScanResult is
+    pub checked:    int
+    pub ok:         int
+    pub missing:    int
+    pub corrupted:  int
+    pub dangling:   int
+    pub issues:     [ScanIssue]
+    pub elapsed_ms: int
+    pub err:        string
+end
+
+pub fn scan_full_store(deep: bool) -> StoreScanResult is
+    let start: int = compat::time_now_ms()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let pkgs: [db::InstalledPackage] = idb.list_all()
+
+    let no_issues: [ScanIssue] = []
+    let mut r: StoreScanResult = StoreScanResult { checked: 0, ok: 0, missing: 0, corrupted: 0,
+        dangling: 0, issues: no_issues, elapsed_ms: 0, err: "" }
+
+    let mut i: int = 0
+    while i < pkgs.len() is
+        let p: db::InstalledPackage = pkgs[i]
+        let issues: [IntegrityEntry] = real_issues(verify_package(p.name, p.version, p.store_hash, deep))
+        r.checked += 1
+        if issues.len() == 0 is
+            r.ok += 1
+        else is
+            let mut k: int = 0
+            while k < issues.len() is
+                let e: IntegrityEntry = issues[k]
+                let s: string = status_debug(e.status)
+                if s == "Missing" is r.missing += 1 end
+                if s == "Corrupted" is r.corrupted += 1 end
+                if s == "DanglingSymlink" is r.dangling += 1 end
+                r.issues = append_issue(r.issues, ScanIssue { package: p.name, entry: e })
+                k += 1
+            end
+        end
+        i += 1
+    end
+    r.elapsed_ms = compat::time_now_ms() - start
+    return r
+end
+
+;; `push` do tablicy w polu struktury musi isc przez funkcje zwracajaca
+;; nowa tablice (patrz uwaga o semantyce tablic w `provides.h#`).
+fn append_issue(items: [ScanIssue], x: ScanIssue) -> [ScanIssue] is
+    let mut a: [ScanIssue] = items
+    a.push(x)
+    return a
+end
+
+fn tenths_s(ms: int) -> string is
+    let t: int = (ms + 50) / 100
+    return to_string(t / 10) + "." + to_string(t % 10)
+end
+
+;; ── Demon w tle ──────────────────────────────────────────────────────────
+
+;; Jedna iteracja: skan + powiadomienie przy problemach.
+pub fn daemon_tick() is
+    log::info("store-integrity: starting background scan")
+    let result: StoreScanResult = scan_full_store(false)
+    log::info("store-integrity: " + to_string(result.ok) + "/" + to_string(result.checked) + " ok, " + to_string(result.issues.len()) + " issues in " + tenths_s(result.elapsed_ms) + "s")
+    if result.issues.len() > 0 is
+        let msg: string = to_string(result.issues.len()) + " store integrity issue(s) found"
+        let mut lines: [string] = []
+        let mut i: int = 0
+        while i < result.issues.len() && i < 3 is
+            lines.push(result.issues[i].package + ": " + status_debug(result.issues[i].entry.status))
+            i += 1
+        end
+        let detail: string = str::join(lines, "\n")
+        notify::send_notification(msg, detail, notify::Urgency::Critical, "dialog-error")
+        log::error("store-integrity: " + msg + ": " + detail)
+    end
+end
+
+;; Petla co godzine — blokuje (patrz odejscie 8).
+pub fn daemon_loop() is
+    while true is
+        daemon_tick()
+        compat::time_sleep_s(3600)
+    end
+end
+
+;; ── hammer verify [<pkg>] [--deep] [--fix] [--json] ──────────────────────
+
+fn has_flag(args: [string], a: string) -> bool is
+    let mut i: int = 0
+    while i < args.len() is
+        if args[i] == a is return true end
+        i += 1
+    end
+    return false
+end
+
+fn first_positional(args: [string]) -> string? is
+    let mut i: int = 0
+    while i < args.len() is
+        if str::slice(args[i], 0, 1) != "-" is return args[i] end
+        i += 1
+    end
+    return nil
+end
+
+pub struct VerifyProblem is
+    pub package: string
+    pub issues:  [IntegrityEntry]
+end
+
+fn append_problem(items: [VerifyProblem], x: VerifyProblem) -> [VerifyProblem] is
+    let mut a: [VerifyProblem] = items
+    a.push(x)
+    return a
+end
+
+pub fn cmd_verify_extended(args: [string]) -> string is
+    let filter: string? = first_positional(args)
+    let deep: bool = has_flag(args, "--deep")
+    let fix: bool = has_flag(args, "--fix")
+    let json_mode: bool = json_output::is_json_mode(args)
+
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let all: [db::InstalledPackage] = idb.list_all()
+    let want: string = if filter == nil then "" else filter
+    let mut to_check: [db::InstalledPackage] = []
+    let mut i: int = 0
+    while i < all.len() is
+        if filter == nil || all[i].name == want is to_check.push(all[i]) end
+        i += 1
+    end
+
+    ;; Jedno przejscie po magazynie (Rust weryfikowal kazdy pakiet DWA razy:
+    ;; raz do zliczenia, raz do wypisania — przy --deep to podwojne haszowanie).
+    let mut ok: int = 0
+    let mut problems: [VerifyProblem] = []
+    let mut results: [[IntegrityEntry]] = []
+    let mut k: int = 0
+    while k < to_check.len() is
+        let p: db::InstalledPackage = to_check[k]
+        let issues: [IntegrityEntry] = real_issues(verify_package(p.name, p.version, p.store_hash, deep))
+        results.push(issues)
+        if issues.len() == 0 is
+            ok += 1
+        else is
+            problems = append_problem(problems, VerifyProblem { package: p.name, issues: issues })
+        end
+        k += 1
+    end
+
+    if json_mode is return print_verify_json(to_check, ok, problems, deep, fix) end
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Verifying store integrity" + (if deep then " (deep — hashing all files)" else ""))
+    write("  " + ui::dim(str::repeat("─", 65)))
+
+    let mut j: int = 0
+    while j < to_check.len() is
+        let p: db::InstalledPackage = to_check[j]
+        let issues: [IntegrityEntry] = results[j]
+        if issues.len() == 0 is
+            if filter != nil is
+                write("  " + ui::bright_green("✔") + " " + ui::bold(p.name) + " " + ui::dim(p.version) + " — OK")
+            end
+        else is
+            let mut e: int = 0
+            while e < issues.len() is
+                let entry: IntegrityEntry = issues[e]
+                let s: string = status_debug(entry.status)
+                let mut status_str: string = ui::dim("unknown")
+                if s == "Missing" is status_str = ui::red("missing") end
+                if s == "Corrupted" is status_str = ui::red_bold("CORRUPTED") end
+                if s == "DanglingSymlink" is status_str = ui::yellow("dangling symlink") end
+                write("  " + ui::red_bold("✗") + " " + ui::bold(p.name) + " — " + status_str + " — " + ui::dim(entry.path))
+                e += 1
+            end
+        end
+        j += 1
+    end
+
+    write("")
+    write("  " + ui::dim(str::repeat("─", 65)))
+    write("  " + ui::bold(fmt::pad_right("Checked:", 22)) + " " + to_string(to_check.len()))
+    write("  " + ui::bold(fmt::pad_right("OK:", 22)) + " " + ui::bright_green(to_string(ok)))
+    let probs: string = if problems.len() == 0 then ui::bright_green("0") else ui::red_bold(to_string(problems.len()))
+    write("  " + ui::bold(fmt::pad_right("Problems:", 22)) + " " + probs)
+
+    if problems.len() > 0 is
+        if fix is
+            write("")
+            write("  " + ui::yellow_bold("⬡") + "  Attempting to fix…")
+            ;; patrz odejscie 7
+            let mut names: [string] = []
+            let mut n: int = 0
+            while n < problems.len() is
+                names.push(problems[n].package)
+                n += 1
+            end
+            write("  " + ui::yellow("⚠") + " Automatic reinstall is not available in the H# port yet.")
+            write("  Affected package(s): " + str::join(names, ", "))
+            write("  Run: " + ui::cyan("hammer fix-broken"))
+        else is
+            write("")
+            write("  Fix: " + ui::cyan("hammer verify --fix"))
+            write("  Or:  " + ui::cyan("hammer fix-broken"))
+        end
+    else is
+        write("")
+        write("  " + ui::bright_green_bold("✔") + " Store integrity OK.")
+    end
+    return ""
+end
+
+fn print_verify_json(to_check: [db::InstalledPackage], ok: int, problems: [VerifyProblem], deep: bool, fix: bool) -> string is
+    if to_check.len() == 0 is
+        json_output::print_json_error("verify", "No matching packages found")
+        return ""
+    end
+    let mut jp: [string] = []
+    let mut i: int = 0
+    while i < problems.len() is
+        let pr: VerifyProblem = problems[i]
+        let mut ji: [string] = []
+        let mut k: int = 0
+        while k < pr.issues.len() is
+            let e: IntegrityEntry = pr.issues[k]
+            ji.push(json_output::jobj([
+                json_output::jfield("path", json_output::jstr(e.path)),
+                json_output::jfield("status", json_output::jstr(status_debug(e.status)))]))
+            k += 1
+        end
+        jp.push(json_output::jobj([
+            json_output::jfield("package", json_output::jstr(pr.package)),
+            json_output::jfield("issues", json_output::jarr(ji))]))
+        i += 1
+    end
+    json_output::print_json("verify", json_output::jobj([
+        json_output::jfield("checked", json_output::jint(to_check.len())),
+        json_output::jfield("ok", json_output::jint(ok)),
+        json_output::jfield("problems", json_output::jarr(jp)),
+        json_output::jfield("deep", json_output::jbool(deep)),
+        json_output::jfield("fix", json_output::jbool(fix))]))
+    return ""
+end
