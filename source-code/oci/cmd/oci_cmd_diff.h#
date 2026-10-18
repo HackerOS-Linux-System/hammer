@@ -1,0 +1,79 @@
+mod internal
+mod ui
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_diff   (port cmd/diff.rs)
+
+fn find_layer(layers: [oci_types::PackageLayer], name: string) -> int is
+    let mut i: int = 0
+    while i < layers.len() is
+        if layers[i].name == name is return i end
+        i += 1
+    end
+    return -1
+end
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    let sr: oci_sysroot::SysrootResult = oci_sysroot::sysroot_open(cfg.sysroot_path, cfg.ostree_repo_path, cfg.osname)
+    if sr.err != "" is return sr.err end
+    let sysroot: oci_sysroot::Sysroot = sr.sysroot
+    let dl: oci_sysroot::DeploymentsList = oci_sysroot::list_deployments(sysroot)
+    if dl.err != "" is return dl.err end
+
+    let mut cur: int = -1
+    let mut prev: int = -1
+    let mut i: int = 0
+    while i < dl.items.len() is
+        if cur < 0 && dl.items[i].booted is cur = i end
+        if prev < 0 && !dl.items[i].booted is prev = i end
+        i += 1
+    end
+    if cur < 0 is
+        write("  No booted deployment.")
+        return ""
+    end
+    if prev < 0 is
+        write("  Only one deployment exists — nothing to diff against.")
+        return ""
+    end
+    let cur_layers: [oci_types::PackageLayer] = oci_sysroot::read_layer_metadata(sysroot, dl.items[cur].checksum).layers
+    let prev_layers: [oci_types::PackageLayer] = oci_sysroot::read_layer_metadata(sysroot, dl.items[prev].checksum).layers
+
+    let mut lines: [string] = []
+    let mut a: int = 0
+    while a < cur_layers.len() is
+        let pi: int = find_layer(prev_layers, cur_layers[a].name)
+        if pi < 0 is
+            lines.push("  " + ui::bright_green_bold("+") + " " + ui::bold(cur_layers[a].name) + " " + ui::dim(cur_layers[a].version))
+        end
+        a += 1
+    end
+    let mut r: int = 0
+    while r < prev_layers.len() is
+        if find_layer(cur_layers, prev_layers[r].name) < 0 is
+            lines.push("  " + ui::red_bold("-") + " " + ui::bold(prev_layers[r].name))
+        end
+        r += 1
+    end
+    let mut c: int = 0
+    while c < cur_layers.len() is
+        let pj: int = find_layer(prev_layers, cur_layers[c].name)
+        if pj >= 0 && prev_layers[pj].version != cur_layers[c].version is
+            lines.push("  " + ui::yellow_bold("~") + " " + ui::bold(cur_layers[c].name) + " " + ui::dim(prev_layers[pj].version) + " " + ui::dim("->") + " " + ui::dim(cur_layers[c].version))
+        end
+        c += 1
+    end
+
+    if lines.len() == 0 is
+        write("  No package-level differences between the two most recent deployments.")
+        return ""
+    end
+    write("")
+    let mut k: int = 0
+    while k < lines.len() is
+        write(lines[k])
+        k += 1
+    end
+    write("")
+    return ""
+end
