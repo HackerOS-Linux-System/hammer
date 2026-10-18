@@ -1,0 +1,23 @@
+mod internal
+mod ui
+mod oci
+mod cmd
+
+;; hammer -> oci::cmd::oci_cmd_upgrade   (port cmd/upgrade.rs)
+;; `upgrade` = rebase na ten sam obraz (origin zapisany przy deploy/rebase).
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    let sr: oci_sysroot::SysrootResult = oci_sysroot::sysroot_open(cfg.sysroot_path, cfg.ostree_repo_path, cfg.osname)
+    if sr.err != "" is return sr.err end
+    let sysroot: oci_sysroot::Sysroot = sr.sysroot
+    let booted: oci_sysroot::BootedResult = oci_sysroot::booted_deployment(sysroot)
+    if booted.err != "" is return booted.err end
+    if !booted.found is return "No booted deployment. Use 'hammer oci deploy <image-ref>' first." end
+    let lm: oci_sysroot::LayerMeta = oci_sysroot::read_layer_metadata(sysroot, booted.dep.checksum)
+    let origin: string = if lm.origin == "" then booted.dep.origin_refspec else lm.origin
+    if !origin.starts_with("hammer-oci:") is
+        return "Cannot determine base image reference from origin '" + origin + "'. Use 'hammer oci rebase <image-ref>' explicitly."
+    end
+    let image_ref: string = str::slice(origin, string_len("hammer-oci:"), string_len(origin))
+    return oci_cmd_rebase::run([image_ref], cfg)
+end
