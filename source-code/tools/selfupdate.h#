@@ -1,0 +1,327 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod ui
+;; [mod audit pominiete: source-code/system/audit.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania audit::fn dzialaja bez zmian]
+
+;; hammer -> tools::selfupdate
+;;
+;; Port of source-code/tools/selfupdate.rs (Rust) to H#: `hammer self-update`
+;; i sprawdzanie nowej wersji (`check_for_update`).
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `async`/`HttpClient::get_bytes/get_string` -> `curl -fsSL` do pliku
+;;    (pobrane dane nie przechodza przez `string`, wiec binaria sa bezpieczne).
+;;    `get_bytes` w Rust nie wolal `--fail`: tu `-f`, wiec kod HTTP >= 400
+;;    jest bledem (jak `error_for_status`, jesli Rust go uzywal).
+;; 2. `Result<Option<String>>` -> `UpdateCheck { err, newer }`.
+;; 3. `cfg!(feature = "normal-mode")` -> `build_mode::normal_mode()` (czas
+;;    dzialania). Oba warianty (atomic/normal) sa dostepne w jednym pliku.
+;; 4. tar.gz -> `tar -xzOf` z wyszukaniem wpisu o nazwie dokladnie `hammer`
+;;    (na dowolnej glebokosci: `tar -tzf | grep` po ostatnim czlonie sciezki).
+;; 5. `set_mode(0o755)` -> `chmod 755`; `fs::rename` -> `mv -f` (atomowe w
+;;    obrebie jednego systemu plikow; /tmp -> /usr/bin moze byc kopiowaniem
+;;    miedzy FS — jak `rename` w Rust, ktore wtedy zwroci EXDEV; tu `mv`
+;;    skopiuje i usunie, czyli NIE jest atomowe miedzy FS. Zmiana
+;;    swiadoma: Rust w takim wypadku konczyl bledem).
+;; 6. ZACHOWANY BLAD ORYGINALU: wersje porownuje `version_gt` po SEGMENTACH
+;;    LICZBOWYCH rozdzielonych kropka; segment nieliczbowy ("1.0-rc1") jest
+;;    pomijany (`filter_map(parse().ok())`), wiec "1.0.0-rc1" == "1.0.0".
+;; 7. `read_link`/`env!(CARGO_PKG_VERSION)` -> `build_mode::hammer_version()`.
+
+pub fn version_file() -> string is return "/usr/lib/HackerOS/hammer/version.hacker" end
+pub fn hammer_bin() -> string is return "/usr/bin/hammer" end
+pub fn anvil_bin() -> string is return "/usr/bin/anvil" end
+pub fn store_bin() -> string is return "/usr/share/hammer/store" end
+
+fn version_url() -> string is
+    return "https://raw.githubusercontent.com/HackerOS-Linux-System/hammer/main/version.hacker"
+end
+
+fn release_base() -> string is
+    return "https://github.com/HackerOS-Linux-System/hammer/releases/download"
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+;; ── version.hacker: "[\n 0.1\n]" ─────────────────────────────────────────
+
+;; "" gdy nie da sie sparsowac.
+pub fn parse_version_hacker(content: string) -> string is
+    let t: string = str::trim(content)
+    let n: int = string_len(t)
+    if n < 2 || string_at(t, 0) != "[" || string_at(t, n - 1) != "]" is return "" end
+    return str::trim(str::slice(t, 1, n - 1))
+end
+
+fn read_local_version() -> string is
+    if !fs::exists(version_file()) is return "" end
+    return parse_version_hacker(fs::read(version_file()))
+end
+
+fn current_version() -> string is
+    let v: string = read_local_version()
+    if v == "" is return build_mode::hammer_version() end
+    return v
+end
+
+;; Odpowiednik `version_gt` (patrz odejscie 6).
+pub fn version_gt(a: string, b: string) -> bool is
+    let av: [int] = version_segments(a)
+    let bv: [int] = version_segments(b)
+    let n: int = if av.len() > bv.len() then av.len() else bv.len()
+    let mut i: int = 0
+    while i < n is
+        let ai: int = if i < av.len() then av[i] else 0
+        let bi: int = if i < bv.len() then bv[i] else 0
+        if ai > bi is return true end
+        if ai < bi is return false end
+        i += 1
+    end
+    return false
+end
+
+fn version_segments(s0: string) -> [int] is
+    let mut s: string = s0
+    while string_len(s) > 0 && string_at(s, 0) == "v" is
+        s = str::slice(s, 1, string_len(s))
+    end
+    let parts: [string] = str::split(s, ".")
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < parts.len() is
+        if str::is_numeric(parts[i]) is out.push(conv::str_to_int(parts[i])) end
+        i += 1
+    end
+    return out
+end
+
+;; ── Pobieranie ───────────────────────────────────────────────────────────
+
+;; Pobiera `url` do `dest`; true gdy sukces (kod 2xx).
+fn fetch_to(url: string, dest: string) -> bool is
+    return sh_ok("curl -fsSL --retry 2 -o " + shq(dest) + " " + shq(url))
+end
+
+;; ── check_for_update ─────────────────────────────────────────────────────
+
+pub struct UpdateCheck is
+    pub err:   string
+    ;; nowsza wersja albo "" gdy brak aktualizacji
+    pub newer: string
+end
+
+pub fn check_for_update() -> UpdateCheck is
+    let tmp: string = fs::temp_file("hammer-version")
+    if !fetch_to(version_url(), tmp) is
+        fs::remove(tmp)
+        return UpdateCheck { err: "Fetching remote version.hacker", newer: "" }
+    end
+    let content: string = fs::read(tmp)
+    fs::remove(tmp)
+    let remote: string = parse_version_hacker(content)
+    if remote == "" is return UpdateCheck { err: "Cannot parse remote version.hacker", newer: "" } end
+    if version_gt(remote, current_version()) is return UpdateCheck { err: "", newer: remote } end
+    return UpdateCheck { err: "", newer: "" }
+end
+
+;; ── self_update ──────────────────────────────────────────────────────────
+
+pub fn self_update() -> string is
+    let chk: UpdateCheck = check_for_update()
+    if chk.err != "" is return chk.err end
+    if chk.newer == "" is
+        write("  " + ui::bright_green("✔") + " hammer is already up to date (" + ui::cyan(build_mode::hammer_version()) + ").")
+        return ""
+    end
+    let new_version: string = chk.newer
+    write("  " + ui::accent_bold("⬡") + "  Self-update: " + ui::dim(current_version()) + " → " + ui::bright_cyan_bold(new_version))
+    let tag: string = "v" + new_version
+    if build_mode::normal_mode() is return self_update_normal_mode(tag, new_version) end
+    return self_update_atomic(tag, new_version)
+end
+
+fn write_version_file(new_version: string) -> string is
+    proc::shell("mkdir -p " + shq(compat::path_parent(version_file())))
+    let tmp: string = version_file() + ".tmp"
+    if !fs::write(tmp, "[\n " + new_version + "\n]\n") is return "Cannot write " + tmp end
+    if !sh_ok("mv -f " + shq(tmp) + " " + shq(version_file())) is return "Cannot replace " + version_file() end
+    return ""
+end
+
+;; Weryfikacja `.sig` obok pliku (nazwa jak `with_extension("sig")`). Zwraca
+;; "" (OK albo brak podpisu — komunikat wypisany) albo tresc bledu.
+fn verify_with_sig(path: string, sig_url: string, label: string) -> string is
+    let sig_path: string = compat::path_with_extension(path, "sig")
+    if fetch_to(sig_url, sig_path) is
+        let e: string = audit::verify_package_signature(path)
+        if e == "" is
+            write("  " + ui::bright_green("✔") + " Ed25519 OK: " + label)
+            fs::remove(sig_path)
+            return ""
+        end
+        fs::remove(sig_path)
+        return "Signature verification FAILED for " + label + ": " + e + "\n  Self-update aborted — hammer was NOT updated."
+    end
+    write("  " + ui::yellow("⚠") + " No .sig for " + label + " — skipping signature check (legacy release?)")
+    return ""
+end
+
+fn self_update_normal_mode(tag: string, new_version: string) -> string is
+    let archive_url: string = release_base() + "/" + tag + "/hammer-normal-mode.tar.gz"
+    write("  " + ui::dim("·") + " Downloading hammer-normal-mode.tar.gz…")
+    let tmp_archive: string = "/tmp/hammer-update-normal-mode.tar.gz.tmp"
+    if !fetch_to(archive_url, tmp_archive) is return "Downloading " + archive_url end
+    write("  " + ui::green("✔") + " Downloaded (" + to_string(fs::size(tmp_archive)) + " bytes)")
+
+    ;; podpis archiwum PRZED rozpakowaniem
+    let ve: string = verify_with_sig(tmp_archive, archive_url + ".sig", "hammer-normal-mode.tar.gz")
+    if ve != "" is
+        fs::remove(tmp_archive)
+        return ve
+    end
+
+    ;; wpis o nazwie dokladnie `hammer` na dowolnej glebokosci
+    let listing: [string] = str::split(proc::shell("tar -tzf " + shq(tmp_archive) + " 2>/dev/null"), "\n")
+    let mut entry: string = ""
+    let mut i: int = 0
+    while i < listing.len() && entry == "" is
+        if compat::path_filename(listing[i]) == "hammer" is entry = listing[i] end
+        i += 1
+    end
+    if entry == "" is
+        fs::remove(tmp_archive)
+        return "hammer-normal-mode.tar.gz did not contain a 'hammer' binary"
+    end
+    let extracted: string = "/tmp/hammer-update-hammer.tmp"
+    if !sh_ok("tar -xzOf " + shq(tmp_archive) + " " + shq(entry) + " > " + shq(extracted)) is
+        fs::remove(tmp_archive)
+        return "Extracting hammer binary from hammer-normal-mode.tar.gz"
+    end
+    fs::remove(tmp_archive)
+
+    sh_ok("chmod 755 " + shq(extracted))
+    proc::shell("mkdir -p " + shq(compat::path_parent(hammer_bin())))
+    if !sh_ok("mv -f " + shq(extracted) + " " + shq(hammer_bin())) is
+        return "Replacing " + hammer_bin() + " (atomic rename)"
+    end
+    log::info("self-update: replaced " + hammer_bin())
+    write("  " + ui::bright_green("✔") + " " + hammer_bin() + " updated.")
+
+    let e: string = write_version_file(new_version)
+    if e != "" is return e end
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  hammer updated to " + ui::bright_cyan_bold(new_version) + ".")
+    write("  " + ui::dim("·") + "  Restart hammer for the new version to take effect.")
+    return ""
+end
+
+fn self_update_atomic(tag: string, new_version: string) -> string is
+    let names: [string] = ["hammer", "anvil", "hammer-store"]
+    let dests: [string] = [hammer_bin(), anvil_bin(), store_bin()]
+    let required: [bool] = [true, false, false]
+
+    ;; Faza 1: pobierz wszystko do /tmp (wszystko albo nic)
+    let mut tmps: [string] = []
+    let mut tmp_dests: [string] = []
+    let mut i: int = 0
+    while i < names.len() is
+        write("  " + ui::dim("·") + " Downloading " + names[i] + "…")
+        let tmp: string = "/tmp/hammer-update-" + names[i] + ".tmp"
+        let url: string = release_base() + "/" + tag + "/" + names[i]
+        if fetch_to(url, tmp) is
+            sh_ok("chmod 755 " + shq(tmp))
+            tmps.push(tmp)
+            tmp_dests.push(dests[i])
+            write("  " + ui::green("✔") + " " + names[i] + " downloaded (" + to_string(fs::size(tmp)) + " bytes)")
+        else is
+            if required[i] is
+                let mut k: int = 0
+                while k < tmps.len() is
+                    fs::remove(tmps[k])
+                    k += 1
+                end
+                return "Failed to download " + names[i]
+            end
+            write("  " + ui::dim("·") + " " + names[i] + " not in this release, skipping.")
+        end
+        i += 1
+    end
+
+    ;; Faza 1b: podpisy WSZYSTKICH przed instalacja ktoregokolwiek
+    let mut j: int = 0
+    while j < tmps.len() is
+        let base: string = compat::path_filename(tmp_dests[j])
+        let ve: string = verify_with_sig(tmps[j], release_base() + "/" + tag + "/" + base + ".sig", tmp_dests[j])
+        if ve != "" is
+            let mut k2: int = 0
+            while k2 < tmps.len() is
+                fs::remove(tmps[k2])
+                k2 += 1
+            end
+            return ve
+        end
+        j += 1
+    end
+
+    ;; Faza 2: podmiana — punkt bez powrotu
+    let mut m: int = 0
+    while m < tmps.len() is
+        proc::shell("mkdir -p " + shq(compat::path_parent(tmp_dests[m])))
+        if !sh_ok("mv -f " + shq(tmps[m]) + " " + shq(tmp_dests[m])) is
+            return "Replacing " + tmp_dests[m] + " (atomic rename)"
+        end
+        log::info("self-update: replaced " + tmp_dests[m])
+        write("  " + ui::bright_green("✔") + " " + tmp_dests[m] + " updated.")
+        m += 1
+    end
+
+    ;; Faza 3: plik wersji
+    let e: string = write_version_file(new_version)
+    if e != "" is return e end
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  hammer updated to " + ui::bright_cyan_bold(new_version) + ".")
+    write("  " + ui::dim("·") + "  Restart hammer for the new version to take effect.")
+    return ""
+end
+
+;; ── Testy ────────────────────────────────────────────────────────────────
+
+fn t_bool(label: string, got: bool, want: bool) -> int is
+    if got == want is return 0 end
+    write("selfupdate::self_test FAIL: " + label)
+    return 1
+end
+
+fn t_text(label: string, got: string, want: string) -> int is
+    if got == want is return 0 end
+    write("selfupdate::self_test FAIL: " + label + " got [" + got + "] want [" + want + "]")
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow.
+pub fn self_test() -> int is
+    let mut f: int = 0
+    f += t_text("parse", parse_version_hacker("[\n 0.1\n]"), "0.1")
+    f += t_text("parse spaces", parse_version_hacker("  [ 1.2.3 ]  "), "1.2.3")
+    f += t_text("parse bad", parse_version_hacker("0.1"), "")
+    f += t_text("parse empty", parse_version_hacker("[]"), "")
+    f += t_bool("1.1 > 1.0", version_gt("1.1", "1.0"), true)
+    f += t_bool("1.0 > 1.1", version_gt("1.0", "1.1"), false)
+    f += t_bool("1.0 > 1.0", version_gt("1.0", "1.0"), false)
+    f += t_bool("v2 > 1.9.9", version_gt("v2", "1.9.9"), true)
+    f += t_bool("1.0.1 > 1.0", version_gt("1.0.1", "1.0"), true)
+    f += t_bool("1.0 > 1.0.0", version_gt("1.0", "1.0.0"), false)
+    f += t_bool("10 > 9", version_gt("10.0", "9.0"), true)
+    f += t_bool("rc ignored (quirk)", version_gt("1.0.0-rc1", "1.0.0"), false)
+    return f
+end
