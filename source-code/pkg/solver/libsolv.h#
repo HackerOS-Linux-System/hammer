@@ -1,0 +1,124 @@
+use "std -> strings" from "str"
+use "std -> env"     from "env"
+use "bit -> libhammer" from "lh"
+
+mod internal
+mod package
+mod cache
+mod db
+
+;; hammer -> pkg::solver::libsolv
+;;
+;; Most do PRAWDZIWEGO libsolv (przez `satsolv` + `libhammer::solver`).
+;; Bez odpowiednika w Rust: Rust ma tylko wlasny CDCL; port ma DPLL
+;; (`sat.h#`) oraz — ten modul — niezalezna weryfikacje przez libsolv,
+;; czyli solver uzywany przez zypper/dnf/conda.
+;;
+;; Jak jest uzywany (patrz `resolve.h#`, `ctx_run_libsolv_verification`):
+;;   1. heurystyka hammera buduje plan (`inst_names`),
+;;   2. DPLL sprawdza jego spojnosc,
+;;   3. libsolv dostaje CALE universum (`cache.all` + zainstalowane z bazy) i
+;;      zadanie "zainstaluj planowane, usun planowane do usuniecia":
+;;        - brak rozwiazania  => twardy blad z opisami problemow z libsolv
+;;                               (lepsza diagnostyka niz DPLL),
+;;        - rozwiazanie       => pakiety, ktorych libsolv wymaga, a plan ich
+;;                               nie ma, sa DODAWANE (z ostrzezeniem),
+;;        - nie udalo sie zaladowac danych => zostajemy przy DPLL (ostrzezenie).
+;;
+;; Wylaczenie: `HAMMER_SOLVER=builtin` (tylko DPLL).
+;;
+;; ── Znane ograniczenia (z `libhammer/src/solver.h#`) ─────────────────────
+;; * alternatywy `a | b` w jednym polu Depends sprowadzone do PIERWSZEJ;
+;; * `--no-recommends`: pole Recommends jest USUWANE z pakietow przekazanych
+;;   libsolv (libsolv domyslnie instaluje slabe zaleznosci);
+;; * koszt: konwersja calego cache (~60k pakietow) przy kazdym rozwiazaniu.
+
+pub struct LibsolvVerdict is
+    ;; false = libsolv nie byl uzyty (wylaczony / blad ladowania danych)
+    pub used:     bool
+    pub ok:       bool
+    ;; nazwy z transakcji (do zainstalowania)
+    pub installs: [string]
+    ;; powod nieuzycia albo opisy problemow (po jednym na element)
+    pub messages: [string]
+end
+
+fn opt_str(v: string?) -> string is
+    if v == nil is return "" end
+    let s: string = v
+    return s
+end
+
+;; Rust `Package` (hammera) -> `lhpackage::Package` (libhammer).
+fn to_lh(p: package::Package, strip_recommends: bool) -> lhpackage::Package is
+    let mut kib: int = 0
+    if p.installed_size_kb != nil is kib = p.installed_size_kb end
+    let rec: string? = if strip_recommends then nil else p.recommends
+    return lhpackage::Package {
+        name: p.name, version: p.version, architecture: p.architecture,
+        installed_size_kb: kib, download_size: p.download_size,
+        section: p.section, priority: p.priority, maintainer: p.maintainer, homepage: p.homepage,
+        description_short: p.description_short, description: p.description_long,
+        depends: p.depends, pre_depends: p.pre_depends, recommends: rec,
+        suggests: p.suggests, enhances: p.enhances, breaks: p.breaks, conflicts: p.conflicts,
+        provides: p.provides, replaces: p.replaces, sha256: p.sha256, filename: p.filename,
+        repo_base_uri: p.repo_base_uri, essential: p.essential, provides_list: p.provides_list
+    }
+end
+
+;; Zainstalowany pakiet z bazy -> minimalny `lhpackage::Package`.
+fn installed_to_lh(ip: db::InstalledPackage) -> lhpackage::Package is
+    let none: [string] = []
+    return lhpackage::Package {
+        name: ip.name, version: ip.version, architecture: ip.architecture,
+        installed_size_kb: ip.installed_size_kb, download_size: nil,
+        section: ip.section, priority: nil, maintainer: ip.maintainer, homepage: nil,
+        description_short: ip.description_short, description: nil,
+        depends: ip.depends, pre_depends: nil, recommends: nil,
+        suggests: nil, enhances: nil, breaks: nil, conflicts: nil,
+        provides: nil, replaces: nil, sha256: nil, filename: nil,
+        repo_base_uri: nil, essential: false, provides_list: none
+    }
+end
+
+pub fn libsolv_enabled() -> bool is
+    let v: string = env::get("HAMMER_SOLVER")
+    if v == nil is return true end
+    return str::to_lower(str::trim(v)) != "builtin"
+end
+
+fn not_used(why: string) -> LibsolvVerdict is
+    let none: [string] = []
+    return LibsolvVerdict { used: false, ok: false, installs: none, messages: [why] }
+end
+
+;; `wanted` = pakiety do zainstalowania, `remove` = do usuniecia, `arch` =
+;; architektura docelowa (np. "amd64").
+pub fn libsolv_verify(c: cache::PackageCache, idb: db::InstalledDb, wanted: [string], remove: [string], arch: string, no_recommends: bool) -> LibsolvVerdict is
+    if !libsolv_enabled() is return not_used("HAMMER_SOLVER=builtin") end
+    if wanted.len() == 0 && remove.len() == 0 is return not_used("nothing to solve") end
+
+    let mut installed: [lhpackage::Package] = []
+    let inst: [db::InstalledPackage] = idb.list_all()
+    let mut i: int = 0
+    while i < inst.len() is
+        installed.push(installed_to_lh(inst[i]))
+        i += 1
+    end
+
+    let mut available: [lhpackage::Package] = []
+    let mut k: int = 0
+    while k < c.all.len() is
+        available.push(to_lh(c.all[k], no_recommends))
+        k += 1
+    end
+
+    let r: solver::SolveSummary = solver::resolve_summary(installed, available, wanted, remove, arch, false)
+    if r.load_failed is
+        return LibsolvVerdict { used: false, ok: false, installs: r.names, messages: r.problems }
+    end
+    if !r.ok is
+        return LibsolvVerdict { used: true, ok: false, installs: r.names, messages: r.problems }
+    end
+    return LibsolvVerdict { used: true, ok: true, installs: r.names, messages: r.problems }
+end
