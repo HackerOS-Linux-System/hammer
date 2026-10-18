@@ -1,0 +1,673 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+;; [mod download pominiete: source-code/ui/download.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez ui/mod.h# — wywolania download::fn dzialaja bez zmian]
+mod gpg_verify
+;; [mod store pominiete: source-code/pkg/store.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania store::fn dzialaja bez zmian]
+
+;; hammer -> gpg
+;;
+;; Port of source-code/system/gpg.rs (Rust) to H#: baza zaufanych kluczy
+;; (`hammer key add|list|remove`), import klucza, weryfikacja InRelease /
+;; Release.gpg, "Trusted Boot" (skroty generacji) i pomocnicze.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. JSON: `serde_json` -> `internal/jsonlite.h#` (czytnik schematow
+;;    `keyring.json` i `boot-hashes.json` + reczny zapis w formacie
+;;    `to_string_pretty`), jak w system/profile.h#.
+;; 2. `import_key` jest `async` w Rust; tu synchroniczne, pobieranie przez
+;;    `download::get_file` (curl). `Vec<u8>` -> plik tymczasowy z `mktemp`.
+;; 3. Skroty: `sha2` -> `sha256sum` (coreutils). `hash_generation` liczy
+;;    manifest powloka (bash): `find` + `sort -z` (porzadek bajtowy jak
+;;    `String::cmp`) + `sha256sum`/`readlink -n`; wynik zgodny bajt w bajt z
+;;    algorytmem Rusta (sprawdzone na drzewie testowym). To jest wolniejsze
+;;    od kodu natywnego (po jednym procesie `sha256sum` na plik).
+;; 4. Stale sciezek (`KEYRING_DB`, `BOOT_HASH_FILE`, `PROFILES_DIR`) jako
+;;    funkcje nad `build_mode::` (tryb w czasie dzialania).
+;; 5. `Result<..>` -> `string` bledu ("" = Ok) albo struktury z `err`.
+;;
+;; ── BLEDY / LUKI ORYGINALU, KTORE NAPRAWIAM ──────────────────────────────
+;; A. `verify_inrelease` i `verify_release_gpg` podawaly `--keyring ...` PO
+;;    `--decrypt <plik>` / `--verify <sig> <plik>`. gpg 2.4 traktuje wtedy
+;;    `--keyring` jako zwykly argument ("Note: '--keyring' is not considered
+;;    an option", rc=2, sprawdzone) — obie funkcje ZAWSZE konczyly sie
+;;    bledem, gdy w katalogu byly jakiekolwiek klucze. W Rust sa to martwy
+;;    kod (nikt ich nie wola; dziala `gpg_verify::verify_inrelease`), tu
+;;    opcje sa PRZED poleceniem.
+;; B. `verify_file_detached` wolal `gpgv --keyring <KATALOG>`; gpgv odrzuca
+;;    katalog (rc=2, sprawdzone), wiec weryfikacja podpisu odlaczonego
+;;    (uzywana przez `audit::verify_package_signature`) NIGDY nie
+;;    przechodzila. Teraz: `gpg_verify::verify_detached` (keyring zlozony z
+;;    kluczy w katalogu; fail-closed gdy brak kluczy/gpgv).
+;; C. `import_key` zapisywal pobrany klucz pod nazwa `<id>.gpg` BEZ wzgledu
+;;    na format (klucz ASCII-armored w pliku `.gpg` psul zlozony keyring:
+;;    gpgv rc=2 "invalid packet") ORAZ dodatkowo importowal go do
+;;    `hammer.gpg` — plik w formacie KEYBOX (`KBXf`), ktory po sklejeniu z
+;;    surowymi kluczami tez daje rc=2 (sprawdzone). Po pierwszym
+;;    `hammer key add` KAZDA synchronizacja konczyla sie "GPG failed". Teraz
+;;    import idzie przez `gpg_verify::import_key_file` (armored -> `--dearmor`
+;;    do `.gpg`, binarny -> kopia) i nie powstaje `hammer.gpg`.
+;;    Predykcyjny plik `/tmp/hammer-import-<pid>.gpg` (symlink jako root) ->
+;;    `mktemp`.
+;; D. `verify_packages_hash` szukal wpisu przez `line.contains(filename)`:
+;;    "main/binary-amd64/Packages" pasuje tez do ".../Packages.xz" i
+;;    ".../Packages.gz", wiec mogl porownac skrot INNEGO pliku (martwy kod w
+;;    Rust). Teraz dopasowanie po trzecim polu = dokladnej sciezce.
+;; E. `KeyringDb::remove("")` usuwalo WSZYSTKIE klucze (kazdy odcisk
+;;    `ends_with("")`). `db_remove`/`db_find` z pustym identyfikatorem
+;;    nic nie robia.
+;;
+;; ── ZACHOWANE ZE ZLOGO ZACHOWANIA ORYGINALU (martwy kod; do Twojej decyzji) ─
+;; F. `verify_inrelease` bez `gpg` zwraca tresc NIEZWERYFIKOWANA
+;;    (`extract_inrelease_content`) z ostrzezeniem; `verify_release_gpg` bez
+;;    `gpg` zwraca Ok. `verify_packages_hash` zwraca Ok, gdy plik nie jest
+;;    wymieniony w Release. `verify_boot_integrity` zwraca Ok, gdy dla
+;;    generacji nie zapisano skrotu. Zadna z tych funkcji nie jest wolana z
+;;    toru instalacji/synchronizacji (poza `verify_boot_integrity` z
+;;    `cli/sys.rs`), wiec to ostrzezenie, nie luka w aktywnym kodzie.
+
+pub fn keyring_dir() -> string is return gpg_verify::keyring_dir() end
+pub fn keyring_db() -> string is return compat::path_join(build_mode::db_dir(), "keyring.json") end
+pub fn boot_hash_file() -> string is return build_mode::boot_hash_file() end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sys_ok(cmd: string) -> bool is
+    return system(cmd) == 0
+end
+
+fn opt(v: string?) -> string is
+    if v == nil is return "" end
+    let s: string = v
+    return s
+end
+
+fn now_rfc3339() -> string is
+    return str::trim(proc::shell("date -u +%Y-%m-%dT%H:%M:%S+00:00"))
+end
+
+fn tmp_path(tag: string) -> string is
+    return str::trim(proc::shell("mktemp /tmp/hammer-" + tag + ".XXXXXX 2>/dev/null"))
+end
+
+;; ── Baza kluczy ──────────────────────────────────────────────────────────
+
+pub struct TrustedKey is
+    pub fingerprint: string
+    pub name:        string
+    pub email:       string?
+    pub added_at:    string
+    pub source:      string
+end
+
+pub struct KeyringDb is
+    pub keys: [TrustedKey]
+end
+
+pub struct KeyringLoad is
+    pub db:  KeyringDb
+    pub err: string
+end
+
+pub fn keyring_empty() -> KeyringDb is
+    let none: [TrustedKey] = []
+    return KeyringDb { keys: none }
+end
+
+;; `fingerprint.to_uppercase().replace(' ', "")`
+fn norm_fp(s: string) -> string is
+    return str::replace_all(str::to_upper(s), " ", "")
+end
+
+fn key_matches(k: TrustedKey, fp: string) -> bool is
+    return str::replace_all(k.fingerprint, " ", "").ends_with(fp)
+end
+
+pub fn db_find(d: KeyringDb, fingerprint: string) -> TrustedKey? is
+    let fp: string = norm_fp(fingerprint)
+    if fp == "" is return nil end
+    let mut i: int = 0
+    while i < d.keys.len() is
+        if key_matches(d.keys[i], fp) is return d.keys[i] end
+        i += 1
+    end
+    return nil
+end
+
+;; Nowa baza bez pasujacych kluczy + informacja, czy cos usunieto.
+pub struct RemoveResult is
+    pub db:      KeyringDb
+    pub removed: bool
+end
+
+pub fn db_remove(d: KeyringDb, fingerprint: string) -> RemoveResult is
+    let fp: string = norm_fp(fingerprint)
+    if fp == "" is return RemoveResult { db: d, removed: false } end
+    let mut out: [TrustedKey] = []
+    let mut i: int = 0
+    while i < d.keys.len() is
+        if !key_matches(d.keys[i], fp) is out.push(d.keys[i]) end
+        i += 1
+    end
+    return RemoveResult { db: KeyringDb { keys: out }, removed: out.len() < d.keys.len() }
+end
+
+fn tok_str(toks: [string], pos: int) -> string is
+    if pos < toks.len() && jsonlite::is_string_tok(toks[pos]) is return jsonlite::tok_text(toks[pos]) end
+    return ""
+end
+
+struct KeyParsed is
+    pub key: TrustedKey
+    pub pos: int
+    pub ok:  bool
+end
+
+fn parse_trusted_key(toks: [string], start: int) -> KeyParsed is
+    let mut k: TrustedKey = TrustedKey { fingerprint: "", name: "", email: nil, added_at: "", source: "" }
+    let mut pos: int = start
+    if pos >= toks.len() || toks[pos] != "{" is return KeyParsed { key: k, pos: pos, ok: false } end
+    pos += 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is
+            return KeyParsed { key: k, pos: pos, ok: false }
+        end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        let v: string = toks[vpos]
+        if key == "fingerprint" is k.fingerprint = tok_str(toks, vpos) end
+        if key == "name" is k.name = tok_str(toks, vpos) end
+        if key == "added_at" is k.added_at = tok_str(toks, vpos) end
+        if key == "source" is k.source = tok_str(toks, vpos) end
+        if key == "email" && jsonlite::is_string_tok(v) is k.email = jsonlite::tok_text(v) end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return KeyParsed { key: k, pos: pos, ok: false } end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    if pos >= toks.len() is return KeyParsed { key: k, pos: pos, ok: false } end
+    return KeyParsed { key: k, pos: pos + 1, ok: true }
+end
+
+pub fn parse_keyring_json(text: string) -> KeyringLoad is
+    let toks: [string] = jsonlite::tokenize(text)
+    if toks.len() == 0 || toks[0] != "{" is return KeyringLoad { db: keyring_empty(), err: "Parsing keyring.json" } end
+    let mut keys: [TrustedKey] = []
+    let mut pos: int = 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is
+            return KeyringLoad { db: keyring_empty(), err: "Parsing keyring.json" }
+        end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        if key == "keys" && toks[vpos] == "[" is
+            let mut kpos: int = vpos + 1
+            while kpos < toks.len() && toks[kpos] != "]" is
+                let kr: KeyParsed = parse_trusted_key(toks, kpos)
+                if !kr.ok is return KeyringLoad { db: keyring_empty(), err: "Parsing keyring.json" } end
+                keys.push(kr.key)
+                kpos = kr.pos
+                if kpos < toks.len() && toks[kpos] == "," is kpos += 1 end
+            end
+        end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return KeyringLoad { db: keyring_empty(), err: "Parsing keyring.json" } end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    return KeyringLoad { db: KeyringDb { keys: keys }, err: "" }
+end
+
+pub fn db_load() -> KeyringLoad is
+    let file: string = keyring_db()
+    if !fs::exists(file) is return KeyringLoad { db: keyring_empty(), err: "" } end
+    return parse_keyring_json(fs::read(file))
+end
+
+pub fn keyring_to_json(d: KeyringDb) -> string is
+    if d.keys.len() == 0 is return "{{\n  \"keys\": []\n}}" end
+    let mut out: string = "{\n  \"keys\": [\n"
+    let mut i: int = 0
+    while i < d.keys.len() is
+        let k: TrustedKey = d.keys[i]
+        out = out + "    {\n" +
+            "      \"fingerprint\": \"" + jsonlite::escape(k.fingerprint) + "\",\n" +
+            "      \"name\": \"" + jsonlite::escape(k.name) + "\",\n" +
+            "      \"email\": " + jsonlite::str_or_null(k.email) + ",\n" +
+            "      \"added_at\": \"" + jsonlite::escape(k.added_at) + "\",\n" +
+            "      \"source\": \"" + jsonlite::escape(k.source) + "\"\n" +
+            "    }"
+        if i + 1 < d.keys.len() is out = out + "," end
+        out = out + "\n"
+        i += 1
+    end
+    return out + "  ]\n}"
+end
+
+;; Zapis atomowy (*.tmp + rename). "" = Ok.
+pub fn db_save(d: KeyringDb) -> string is
+    let file: string = keyring_db()
+    let dir: string = compat::path_parent(file)
+    if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+    let tmp: string = file + ".tmp"
+    fs::write(tmp, keyring_to_json(d))
+    fs::rename(tmp, file)
+    return ""
+end
+
+;; ── Import klucza ────────────────────────────────────────────────────────
+
+pub struct ImportKeyResult is
+    pub ok:  bool
+    pub err: string
+    pub key: TrustedKey
+end
+
+fn import_failed(err: string) -> ImportKeyResult is
+    return ImportKeyResult { ok: false, err: err,
+        key: TrustedKey { fingerprint: "", name: "", email: nil, added_at: "", source: "" } }
+end
+
+;; Ostatnie 16 znakow odcisku (jak `fingerprint_short`).
+pub fn fingerprint_short(fp: string) -> string is
+    let n: int = string_len(fp)
+    if n >= 16 is return str::slice(fp, n - 16, n) end
+    return fp
+end
+
+pub fn import_key(source: string, c: download::HttpClient) -> ImportKeyResult is
+    fs::mkdir(keyring_dir())
+    if !fs::is_dir(keyring_dir()) is return import_failed("Cannot create " + keyring_dir()) end
+
+    let tmp_key: string = tmp_path("import")
+    if tmp_key == "" is return import_failed("Cannot create temp file for key import") end
+
+    if source.starts_with("http://") || source.starts_with("https://") is
+        let err: string = download::get_file(c, source, tmp_key)
+        if err != "" is
+            system("rm -f -- " + shq(tmp_key))
+            return import_failed("Fetching key from " + source + ": " + err)
+        end
+    else is
+        if !fs::exists(source) is
+            system("rm -f -- " + shq(tmp_key))
+            return import_failed("Reading key file " + source)
+        end
+        if !sys_ok("cp -f -- " + shq(source) + " " + shq(tmp_key)) is
+            system("rm -f -- " + shq(tmp_key))
+            return import_failed("Reading key file " + source)
+        end
+    end
+
+    let ki: gpg_verify::KeyInfoResult = gpg_verify::read_key_info(tmp_key)
+    if ki.err != "" is
+        system("rm -f -- " + shq(tmp_key))
+        return import_failed("Cannot read key info — is gpg installed? " + ki.err)
+    end
+    let info: gpg_verify::KeyInfo = ki.info
+
+    ;; patrz C: armored -> .gpg przez --dearmor, binarny -> kopia; bez `hammer.gpg`
+    let imp: gpg_verify::ImportResult = gpg_verify::import_key_file(tmp_key, fingerprint_short(info.fingerprint))
+    system("rm -f -- " + shq(tmp_key))
+    if imp.err != "" is return import_failed(imp.err) end
+
+    let key: TrustedKey = TrustedKey {
+        fingerprint: info.fingerprint, name: info.name, email: info.email,
+        added_at: now_rfc3339(), source: source
+    }
+    let lr: KeyringLoad = db_load()
+    if lr.err != "" is return import_failed(lr.err) end
+    let rr: RemoveResult = db_remove(lr.db, info.fingerprint)
+    let mut keys: [TrustedKey] = rr.db.keys
+    keys.push(key)
+    let serr: string = db_save(KeyringDb { keys: keys })
+    if serr != "" is return import_failed(serr) end
+
+    log::info("gpg: imported key " + fingerprint_short(info.fingerprint) + " (" + info.name + ")")
+    return ImportKeyResult { ok: true, err: "", key: key }
+end
+
+;; ── InRelease / Release.gpg ──────────────────────────────────────────────
+
+fn gpg_available() -> bool is
+    return sys_ok("gpg --version >/dev/null 2>&1")
+end
+
+;; Tresc InRelease bez otoczki PGP (UWAGA: NIEZWERYFIKOWANA — patrz F).
+pub fn extract_inrelease_content(text: string) -> string is
+    let lines: [string] = str::split(text, "\n")
+    let mut in_content: bool = false
+    let mut past_header: bool = false
+    let mut content: string = ""
+    let mut i: int = 0
+    let mut done: bool = false
+    while i < lines.len() && !done is
+        let line: string = lines[i]
+        i += 1
+        if line.starts_with("-----BEGIN PGP SIGNED MESSAGE-----") is
+            in_content = true
+        elsif line.starts_with("-----BEGIN PGP SIGNATURE-----") is
+            done = true
+        elsif in_content is
+            if !past_header && line == "" is
+                past_header = true
+            elsif past_header is
+                content = content + line + "\n"
+            end
+        end
+    end
+    if content == "" is return text end
+    return content
+end
+
+pub struct ContentResult is
+    pub content: string
+    pub err:     string
+end
+
+;; Zwraca PODPISANA tresc (to, co zweryfikowal gpg), jak apt. Opcje PRZED
+;; poleceniem (A). `--yes`: plik wyjsciowy z `mktemp` juz istnieje, a gpg w trybie
+;; --batch nie nadpisuje (rc=2) — sprawdzone.
+pub fn verify_inrelease(inrelease: string) -> ContentResult is
+    if !gpg_available() is
+        log::warn("gpg: not installed, skipping signature verification")
+        return ContentResult { content: extract_inrelease_content(inrelease), err: "" }
+    end
+    let ring: string = gpg_verify::keyring_from_dir(keyring_dir())
+    let tmp_in: string = tmp_path("inrelease")
+    let tmp_out: string = tmp_path("release")
+    let errf: string = tmp_path("gpgerr")
+    if tmp_in == "" || tmp_out == "" is return ContentResult { content: "", err: "Failed to run gpg: cannot create temp file" } end
+    fs::write(tmp_in, inrelease)
+
+    ;; brak kluczy => gpg nie ma czym sprawdzic (rc=2) — jak w Rust, blad
+    let keyring_arg: string = if ring != "" then " --keyring " + shq(ring) else ""
+    let rc: int = system("gpg --batch --no-default-keyring" + keyring_arg + " --trust-model always --yes --output " +
+        shq(tmp_out) + " --decrypt " + shq(tmp_in) + " >/dev/null 2>" + shq(errf))
+    let stderr_text: string = if errf != "" && fs::exists(errf) then str::trim(fs::read(errf)) else ""
+    let content: string = if rc == 0 && fs::exists(tmp_out) then fs::read(tmp_out) else ""
+    system("rm -f -- " + shq(tmp_in) + " " + shq(tmp_out) + " " + shq(errf) + (if ring != "" then " " + shq(ring) else ""))
+    if rc == 0 is
+        log::info("gpg: InRelease signature OK")
+        return ContentResult { content: content, err: "" }
+    end
+    return ContentResult { content: "", err: "GPG signature verification FAILED:\n" + stderr_text }
+end
+
+;; "" = Ok.
+pub fn verify_release_gpg(release: string, sig: string) -> string is
+    if !gpg_available() is
+        log::warn("gpg: not installed, skipping signature verification")
+        return ""
+    end
+    let ring: string = gpg_verify::keyring_from_dir(keyring_dir())
+    let tmp_rel: string = tmp_path("release")
+    let tmp_sig: string = tmp_path("release-gpg")
+    let errf: string = tmp_path("gpgerr")
+    if tmp_rel == "" || tmp_sig == "" is return "Failed to run gpg: cannot create temp file" end
+    fs::write(tmp_rel, release)
+    fs::write(tmp_sig, sig)
+    let keyring_arg: string = if ring != "" then " --keyring " + shq(ring) else ""
+    let rc: int = system("gpg --batch --no-default-keyring" + keyring_arg + " --trust-model always --verify " +
+        shq(tmp_sig) + " " + shq(tmp_rel) + " >/dev/null 2>" + shq(errf))
+    let stderr_text: string = if errf != "" && fs::exists(errf) then str::trim(fs::read(errf)) else ""
+    system("rm -f -- " + shq(tmp_rel) + " " + shq(tmp_sig) + " " + shq(errf) + (if ring != "" then " " + shq(ring) else ""))
+    if rc == 0 is
+        log::info("gpg: Release.gpg signature OK")
+        return ""
+    end
+    return "GPG signature verification FAILED:\n" + stderr_text
+end
+
+;; "" = Ok (takze gdy plik nie jest wymieniony w Release — patrz F).
+pub fn verify_packages_hash(packages_file: string, release_content: string, filename: string) -> string is
+    let actual: string = gpg_verify::sha256_file(packages_file)
+    let lines: [string] = str::split(release_content, "\n")
+    let mut in_sha: bool = false
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = lines[i]
+        i += 1
+        if line.starts_with("SHA256:") is
+            in_sha = true
+        elsif in_sha is
+            if line.starts_with(" ") is
+                let parts: [string] = str::split(str::replace_all(str::trim(line), "\t", " "), " ")
+                let mut f: [string] = []
+                let mut k: int = 0
+                while k < parts.len() is
+                    if parts[k] != "" is f.push(parts[k]) end
+                    k += 1
+                end
+                ;; dokladna sciezka (patrz D)
+                if f.len() >= 3 && f[2] == filename is
+                    if f[0] != actual is
+                        return "SHA256 mismatch for " + filename + ":\n  expected: " + f[0] + "\n  actual:   " + actual
+                    end
+                    return ""
+                end
+            else is
+                in_sha = false
+            end
+        end
+    end
+    return ""
+end
+
+;; ── Trusted Boot ─────────────────────────────────────────────────────────
+
+pub struct BootHashEntry is
+    pub gen_number: int
+    pub hash:       string
+    pub timestamp:  string
+    pub signed_by:  string?
+end
+
+pub struct BootHashDb is
+    pub entries: [BootHashEntry]
+end
+
+pub struct BootLoad is
+    pub db:  BootHashDb
+    pub err: string
+end
+
+pub fn boot_empty() -> BootHashDb is
+    let none: [BootHashEntry] = []
+    return BootHashDb { entries: none }
+end
+
+pub fn boot_get_gen(d: BootHashDb, gen: int) -> BootHashEntry? is
+    let mut i: int = 0
+    while i < d.entries.len() is
+        if d.entries[i].gen_number == gen is return d.entries[i] end
+        i += 1
+    end
+    return nil
+end
+
+struct BootEntryParsed is
+    pub e:   BootHashEntry
+    pub pos: int
+    pub ok:  bool
+end
+
+fn parse_boot_entry(toks: [string], start: int) -> BootEntryParsed is
+    let mut e: BootHashEntry = BootHashEntry { gen_number: 0, hash: "", timestamp: "", signed_by: nil }
+    let mut pos: int = start
+    if pos >= toks.len() || toks[pos] != "{" is return BootEntryParsed { e: e, pos: pos, ok: false } end
+    pos += 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is
+            return BootEntryParsed { e: e, pos: pos, ok: false }
+        end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        let v: string = toks[vpos]
+        if key == "gen_number" && jsonlite::is_word_tok(v) is
+            let t: string = jsonlite::tok_text(v)
+            if t != "" && str::is_numeric(t) is e.gen_number = conv::str_to_int(t) end
+        end
+        if key == "hash" is e.hash = tok_str(toks, vpos) end
+        if key == "timestamp" is e.timestamp = tok_str(toks, vpos) end
+        if key == "signed_by" && jsonlite::is_string_tok(v) is e.signed_by = jsonlite::tok_text(v) end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return BootEntryParsed { e: e, pos: pos, ok: false } end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    if pos >= toks.len() is return BootEntryParsed { e: e, pos: pos, ok: false } end
+    return BootEntryParsed { e: e, pos: pos + 1, ok: true }
+end
+
+pub fn parse_boot_json(text: string) -> BootLoad is
+    let toks: [string] = jsonlite::tokenize(text)
+    if toks.len() == 0 || toks[0] != "{" is return BootLoad { db: boot_empty(), err: "Parsing boot-hashes.json" } end
+    let mut entries: [BootHashEntry] = []
+    let mut pos: int = 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is
+            return BootLoad { db: boot_empty(), err: "Parsing boot-hashes.json" }
+        end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        if key == "entries" && toks[vpos] == "[" is
+            let mut epos: int = vpos + 1
+            while epos < toks.len() && toks[epos] != "]" is
+                let er: BootEntryParsed = parse_boot_entry(toks, epos)
+                if !er.ok is return BootLoad { db: boot_empty(), err: "Parsing boot-hashes.json" } end
+                entries.push(er.e)
+                epos = er.pos
+                if epos < toks.len() && toks[epos] == "," is epos += 1 end
+            end
+        end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return BootLoad { db: boot_empty(), err: "Parsing boot-hashes.json" } end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    return BootLoad { db: BootHashDb { entries: entries }, err: "" }
+end
+
+pub fn boot_load() -> BootLoad is
+    let file: string = boot_hash_file()
+    if !fs::exists(file) is return BootLoad { db: boot_empty(), err: "" } end
+    return parse_boot_json(fs::read(file))
+end
+
+pub fn boot_to_json(d: BootHashDb) -> string is
+    if d.entries.len() == 0 is return "{{\n  \"entries\": []\n}}" end
+    let mut out: string = "{\n  \"entries\": [\n"
+    let mut i: int = 0
+    while i < d.entries.len() is
+        let e: BootHashEntry = d.entries[i]
+        out = out + "    {\n" +
+            "      \"gen_number\": " + to_string(e.gen_number) + ",\n" +
+            "      \"hash\": \"" + jsonlite::escape(e.hash) + "\",\n" +
+            "      \"timestamp\": \"" + jsonlite::escape(e.timestamp) + "\",\n" +
+            "      \"signed_by\": " + jsonlite::str_or_null(e.signed_by) + "\n" +
+            "    }"
+        if i + 1 < d.entries.len() is out = out + "," end
+        out = out + "\n"
+        i += 1
+    end
+    return out + "  ]\n}"
+end
+
+pub fn boot_save(d: BootHashDb) -> string is
+    let file: string = boot_hash_file()
+    let dir: string = compat::path_parent(file)
+    if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+    let tmp: string = file + ".tmp"
+    fs::write(tmp, boot_to_json(d))
+    fs::rename(tmp, file)
+    return ""
+end
+
+;; Manifest skrotow generacji — patrz odejscie 3. Skrypt uruchamiany przez
+;; bash (`read -d ''`); zgodny z algorytmem Rusta: pliki zwykle i symlinki
+;; (symlink: sha256("symlink:" + cel), nieczytelny plik: "000000"), sciezki
+;; wzgledne bez `./`, posortowane bajtowo, linie `sciezka:skrot\n`.
+fn manifest_script(profile_path: string) -> string is
+    return "cd " + shq(profile_path) + " || exit 1\n" +
+        "find . -mindepth 1 \\( -type f -o -type l \\) -print0 | LC_ALL=C sort -z | " +
+        "while IFS= read -r -d '' f; do\n" +
+        "  rel=\"${{f#./}}\"\n" +
+        "  if [ -L \"$f\" ]; then\n" +
+        "    h=$({{ printf 'symlink:'; readlink -n -- \"$f\"; }} | sha256sum | cut -d' ' -f1)\n" +
+        "  else\n" +
+        "    if h=$(sha256sum < \"$f\" 2>/dev/null); then h=${{h%% *}}; else h=000000; fi\n" +
+        "  fi\n" +
+        "  printf '%s:%s\\n' \"$rel\" \"$h\"\n" +
+        "done | sha256sum | cut -d' ' -f1\n"
+end
+
+pub struct HashResult is
+    pub hash: string
+    pub err:  string
+end
+
+pub fn hash_generation(gen_number: int) -> HashResult is
+    let profile_path: string = compat::path_join(store::profiles_dir(), "gen-" + to_string(gen_number))
+    if !fs::exists(profile_path) is
+        return HashResult { hash: "", err: "Generation profile gen-" + to_string(gen_number) + " not found" }
+    end
+    let out: string = str::trim(proc::shell("bash -c " + shq(manifest_script(profile_path)) + " 2>/dev/null"))
+    if string_len(out) != 64 is return HashResult { hash: "", err: "Hashing generation gen-" + to_string(gen_number) + " failed" } end
+    return HashResult { hash: out, err: "" }
+end
+
+pub fn record_gen_hash(gen_number: int) -> HashResult is
+    let h: HashResult = hash_generation(gen_number)
+    if h.err != "" is return h end
+    let lr: BootLoad = boot_load()
+    if lr.err != "" is return HashResult { hash: "", err: lr.err } end
+    let mut entries: [BootHashEntry] = []
+    let mut i: int = 0
+    while i < lr.db.entries.len() is
+        if lr.db.entries[i].gen_number != gen_number is entries.push(lr.db.entries[i]) end
+        i += 1
+    end
+    entries.push(BootHashEntry { gen_number: gen_number, hash: h.hash, timestamp: now_rfc3339(), signed_by: nil })
+    let err: string = boot_save(BootHashDb { entries: entries })
+    if err != "" is return HashResult { hash: "", err: err } end
+    return h
+end
+
+;; "" = Ok (takze gdy nie zapisano skrotu — patrz F).
+pub fn verify_boot_integrity(gen_number: int) -> string is
+    let lr: BootLoad = boot_load()
+    if lr.err != "" is return lr.err end
+    let entry: BootHashEntry? = boot_get_gen(lr.db, gen_number)
+    if entry == nil is
+        log::warn("boot-integrity: no recorded hash for gen-" + to_string(gen_number) + ", skipping")
+        return ""
+    end
+    let e: BootHashEntry = entry
+    let h: HashResult = hash_generation(gen_number)
+    if h.err != "" is return h.err end
+    if h.hash != e.hash is
+        return "BOOT INTEGRITY VIOLATION: gen-" + to_string(gen_number) + " hash mismatch!\n  recorded: " + e.hash +
+            "\n  actual:   " + h.hash
+    end
+    log::info("boot-integrity: gen-" + to_string(gen_number) + " OK (" + str::slice(h.hash, 0, 16) + "…)")
+    return ""
+end
+
+;; ── Podpis oddzielony / zaufanie do repo ─────────────────────────────────
+
+;; "" = Ok (patrz B).
+pub fn verify_file_detached(data_path: string, sig_path: string) -> string is
+    return gpg_verify::verify_detached(data_path, sig_path)
+end
+
+;; Czy repozytorium, z ktorego pobrano .deb, zostalo zweryfikowane GPG
+;; (znacznik `.gpg-verified` w katalogu paczki ustawia `cache::update`).
+pub fn is_repo_trusted(deb_path: string) -> bool is
+    return fs::exists(compat::path_join(compat::path_parent(deb_path), ".gpg-verified"))
+end
