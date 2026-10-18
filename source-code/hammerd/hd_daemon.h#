@@ -1,0 +1,655 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> fmt"     from "fmt"
+use "std -> conv"    from "conv"
+
+mod internal
+mod ui
+mod tools
+mod hammerd
+
+;; hammer -> hammerd::hd_daemon
+;;
+;; Port of source-code/hammerd/{server,scheduler,actions,notify,service,
+;; client,ipc,daemon}.rs (Rust) to H#: demon `hammerd` — planista zadan
+;; (sync / upgrade-check / verify / gc), IPC i komendy `hammer daemon ...`.
+;;
+;; ── Odejscia od oryginalu (ZMIANA ARCHITEKTURY — swiadoma) ───────────────
+;; 1. BRAK tokio i BRAK gniazda Unix. H# (backend LLVM v0.9) nie ma runtime
+;;    async ani sprawdzonego API gniazd domenowych. Demon to JEDNA petla
+;;    (1 s) robiaca na przemian: obsluge zadan IPC i wykonanie wymagalnych
+;;    zadan planisty. Wszystko wykonuje sie sekwencyjnie.
+;; 2. IPC (`/run/hammerd.sock`, JSON przez gniazdo) -> KATALOG SPOOL
+;;    `/run/hammerd/spool/`: klient zapisuje `<id>.req` (atomowo przez `mv`),
+;;    demon przetwarza je w kolejnosci nazw, zapisuje `<id>.resp` (JSON
+;;    {ok,message,data}, jak `DaemonResponse`) i kasuje `.req`; klient czeka
+;;    na `.resp` (do 900 s, odpytywanie co 200 ms) i je kasuje. Semantyka
+;;    zadan (Status/Sync/Check/Verify/Reload/Shutdown/GetUpdates/
+;;    SecurityUpgrade/GcGenerations) zachowana. Skutki uboczne: zadania
+;;    wykonuja sie sekwencyjnie (dlugi `sync` opoznia odpowiedz na `status`),
+;;    a w czasie `with_retry` (czekanie 30/60/120 s) demon nadal obsluguje
+;;    spool, wiec `status` i `stop` odpowiadaja.
+;; 3. WATCHDOG (`watchdog_scheduler`) POMINIETY: systemd `Restart=on-failure`
+;;    z unitu `hammerd.service` robi to samo na poziomie procesu.
+;; 4. `with_retry` — te same stale: 30 s bazowo, x2, limit 3600 s, 5 prob;
+;;    ostatnia nieudana proba zwraca blad (bez czekania).
+;; 5. Akcje wolaja `hammer ...` przez `system()` (dziedziczy terminal/journal)
+;;    — jak `Command::status()`; `do_check_updates` przechwytuje stdout
+;;    (`proc::shell`) i liczy NIEPUSTE LINIE.
+;; 6. ZACHOWANE BLEDY ORYGINALU:
+;;    a) `do_check_updates` liczy linie wyjscia `hammer list --upgradable
+;;       --json`; ta komenda drukuje JSON w ukladzie pretty (wiele linii na
+;;       pakiet), wiec `n_updates` jest wieksze niz liczba pakietow.
+;;    b) `hammer upgrade --security-only` i `hammer verify --quiet` — takich
+;;       flag `cmd_upgrade`/`cmd_verify` nie obsluguja (sa ignorowane: upgrade
+;;       zrobi PELNE uaktualnienie z `--yes`!). Uwaga przy
+;;       `auto_security_upgrade = true`.
+;;    c) `Reload` zwieksza `config_gen`, ale konfiguracja uzywana przez
+;;       petle planisty jest wczytana RAZ przy starcie (jak w Rust:
+;;       `_new_cfg` jest porzucany) — reload nie zmienia interwalow.
+;;    d) `gc` hamuje sie na `hammer gen gc --keep N` (osobny argument), a
+;;       `cmd_gen` rozumie `--keep=N` lub drugi argument — oba dzialaja.
+;; 7. Czas: sekundy unixowe (`compat::time_now_unix`); `format_epoch` w `status`
+;;    -> `date -u -d @ts` (`%Y-%m-%d %H:%M:%S UTC`).
+;; 8. Unit systemd: tresc 1:1 jak w Rust (`ExecStart={bin} daemon start`,
+;;    `PIDFile=/run/hammerd.pid`, `ReadWritePaths=/hammer /run /var/log`).
+;;    UWAGA: `ProtectSystem=strict` pozwala pisac tylko w `/hammer /run
+;;    /var/log` — `hammer sync` zapisuje tez w `/var/lib/hammer`, wiec pod
+;;    tym unitem sync moze sie nie udac (blad oryginalu, zachowany).
+;; 9. `PID`: `compat::os_pid()` (builtin `os_pid`).
+
+pub fn pid_file() -> string is return "/run/hammerd.pid" end
+pub fn spool_dir() -> string is return "/run/hammerd/spool" end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+fn elog(msg: string) is
+    ui::eprint_line("[hammerd] " + msg)
+end
+
+fn now() -> int is return compat::time_now_unix() end
+
+;; ── PID ──────────────────────────────────────────────────────────────────
+
+pub fn write_pid_file() -> string is
+    if !fs::write(pid_file(), to_string(compat::os_pid()) + "\n") is return "Writing PID file" end
+    return ""
+end
+
+pub fn remove_pid_file() is
+    fs::remove(pid_file())
+end
+
+;; -1 gdy brak/niepoprawny.
+pub fn read_pid() -> int is
+    if !fs::exists(pid_file()) is return -1 end
+    let t: string = str::trim(fs::read(pid_file()))
+    if !str::is_numeric(t) is return -1 end
+    return conv::str_to_int(t)
+end
+
+pub fn is_running() -> bool is
+    let pid: int = read_pid()
+    if pid < 0 is return false end
+    return fs::exists("/proc/" + to_string(pid) + "/cmdline")
+end
+
+;; ── Odpowiedz IPC ────────────────────────────────────────────────────────
+
+pub struct DaemonResponse is
+    pub ok:      bool
+    pub message: string
+    ;; JSON (kompaktowy) albo "" gdy brak
+    pub data:    string
+end
+
+fn resp_ok(msg: string) -> DaemonResponse is
+    return DaemonResponse { ok: true, message: msg, data: "" }
+end
+
+fn resp_data(msg: string, data: string) -> DaemonResponse is
+    return DaemonResponse { ok: true, message: msg, data: data }
+end
+
+fn resp_err(msg: string) -> DaemonResponse is
+    return DaemonResponse { ok: false, message: msg, data: "" }
+end
+
+fn resp_to_json(r: DaemonResponse) -> string is
+    let mut fields: [string] = [json_output::jfield("ok", json_output::jbool(r.ok)), json_output::jfield("message", json_output::jstr(r.message))]
+    if r.data != "" is fields.push(json_output::jfield("data", r.data)) end
+    return json_output::jobj(fields)
+end
+
+;; Wartosc klucza (token tekstowy lub slowo) z kompaktowego JSON-a; "" gdy brak.
+fn json_find(toks: [string], key: string) -> string is
+    let mut i: int = 0
+    while i + 2 < toks.len() is
+        if jsonlite::is_string_tok(toks[i]) && jsonlite::tok_text(toks[i]) == key && toks[i + 1] == ":" is
+            let v: string = toks[i + 2]
+            if jsonlite::is_string_tok(v) is return jsonlite::tok_text(v) end
+            if jsonlite::is_word_tok(v) is return jsonlite::tok_text(v) end
+            return v
+        end
+        i += 1
+    end
+    return ""
+end
+
+pub fn resp_parse(text: string) -> DaemonResponse is
+    let toks: [string] = jsonlite::tokenize(text)
+    if toks.len() == 0 is return resp_err("Invalid response") end
+    let ok: bool = json_find(toks, "ok") == "true"
+    return DaemonResponse { ok: ok, message: json_find(toks, "message"), data: text }
+end
+
+;; ── Akcje (patrz odejscie 5 i 6) ─────────────────────────────────────────
+
+fn exit_code(rc: int) -> int is
+    if rc < 0 is return -1 end
+    return rc / 256
+end
+
+fn run_hammer(label: string, args: string) -> string is
+    let rc: int = system("hammer " + args)
+    if rc != 0 is return "hammer " + args + " exited " + to_string(exit_code(rc)) end
+    return ""
+end
+
+pub fn do_sync() -> string is
+    elog("Running sync…")
+    let e: string = run_hammer("sync", "sync")
+    if e == "" is elog("Sync complete.") end
+    return e
+end
+
+pub struct CheckResult is
+    pub n:   int
+    pub err: string
+end
+
+pub fn do_check_updates() -> CheckResult is
+    elog("Checking for updates…")
+    let out: string = proc::shell("hammer list --upgradable --json 2>/dev/null; echo \"__rc=$?\"")
+    let lines: [string] = str::split(out, "\n")
+    let mut n: int = 0
+    let mut rc: string = "0"
+    let mut i: int = 0
+    while i < lines.len() is
+        if string_starts_with(lines[i], "__rc=") is
+            rc = str::slice(lines[i], 5, string_len(lines[i]))
+        elsif str::trim(lines[i]) != "" is
+            n += 1
+        end
+        i += 1
+    end
+    if rc != "0" is return CheckResult { n: 0, err: "" } end
+    elog(to_string(n) + " update(s) available.")
+    return CheckResult { n: n, err: "" }
+end
+
+pub fn do_verify() -> string is
+    elog("Running store verify…")
+    let e: string = run_hammer("verify", "verify --quiet")
+    if e == "" is elog("Verify complete.") end
+    return e
+end
+
+pub fn do_security_upgrade() -> string is
+    elog("Applying security upgrades…")
+    let e: string = run_hammer("upgrade", "upgrade --security-only --yes")
+    if e == "" is elog("Security upgrade complete.") end
+    return e
+end
+
+pub fn do_gc_generations(keep: int) -> string is
+    elog("GC generations (keep=" + to_string(keep) + ")…")
+    let e: string = run_hammer("gen", "gen gc --keep " + to_string(keep))
+    if e == "" is elog("GC complete.") end
+    return e
+end
+
+;; ── Powiadomienia ────────────────────────────────────────────────────────
+
+fn plural(n: int) -> string is
+    if n == 1 is return "" end
+    return "s"
+end
+
+fn send_update_notification(n: int) is
+    notify::send_notification(to_string(n) + " update" + plural(n) + " available",
+        "Run 'hammer upgrade' to install updates.", notify::Urgency::Normal, "software-update-available")
+end
+
+fn send_verify_failure_notification(msg: string) is
+    notify::send_notification("Store integrity problem", msg, notify::Urgency::Critical, "dialog-warning")
+end
+
+;; ── Obsluga zadan IPC ────────────────────────────────────────────────────
+
+pub struct Handled is
+    pub state: hd_state::DaemonState
+    pub resp:  DaemonResponse
+end
+
+fn kv_value(text: string, key: string) -> string is
+    let lines: [string] = str::split(text, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if string_starts_with(lines[i], key + "=") is return str::trim(str::slice(lines[i], string_len(key) + 1, string_len(lines[i]))) end
+        i += 1
+    end
+    return ""
+end
+
+fn ts_or_null(ts: int) -> string is
+    if ts < 0 is return "null" end
+    return to_string(ts)
+end
+
+pub fn handle_request(req: string, s0: hd_state::DaemonState) -> Handled is
+    let mut s: hd_state::DaemonState = s0
+    let cmd: string = kv_value(req, "cmd")
+
+    if cmd == "Status" is
+        return Handled { state: s, resp: resp_data("ok", json_output::jobj([
+            json_output::jfield("running", json_output::jbool(s.running)),
+            json_output::jfield("n_updates", json_output::jint(s.n_updates)),
+            json_output::jfield("config_gen", json_output::jint(s.config_gen)),
+            json_output::jfield("last_sync", ts_or_null(s.last_sync)),
+            json_output::jfield("last_check", ts_or_null(s.last_check)),
+            json_output::jfield("last_verify", ts_or_null(s.last_verify))])) }
+    end
+    if cmd == "Sync" is
+        let e: string = do_sync()
+        if e != "" is return Handled { state: s, resp: resp_err("Sync failed: " + e) } end
+        s.last_sync = now()
+        return Handled { state: s, resp: resp_ok("Sync completed") }
+    end
+    if cmd == "Check" is
+        let r: CheckResult = do_check_updates()
+        if r.err != "" is return Handled { state: s, resp: resp_err("Check failed: " + r.err) } end
+        s.last_check = now()
+        s.n_updates = r.n
+        return Handled { state: s, resp: resp_data(to_string(r.n) + " update(s) available", json_output::jobj([json_output::jfield("n_updates", json_output::jint(r.n))])) }
+    end
+    if cmd == "Verify" is
+        let e2: string = do_verify()
+        if e2 != "" is return Handled { state: s, resp: resp_err("Verify failed: " + e2) } end
+        s.last_verify = now()
+        return Handled { state: s, resp: resp_ok("Store verified OK") }
+    end
+    if cmd == "GetUpdates" is
+        return Handled { state: s, resp: resp_data("ok", json_output::jobj([json_output::jfield("n_updates", json_output::jint(s.n_updates))])) }
+    end
+    if cmd == "Reload" is
+        hd_config::config_load()
+        s.config_gen = s.config_gen + 1
+        return Handled { state: s, resp: resp_ok("Config reloaded") }
+    end
+    if cmd == "Shutdown" is
+        s.running = false
+        return Handled { state: s, resp: resp_ok("Shutting down") }
+    end
+    if cmd == "SecurityUpgrade" is
+        let e3: string = do_security_upgrade()
+        if e3 != "" is return Handled { state: s, resp: resp_err("Security upgrade failed: " + e3) } end
+        return Handled { state: s, resp: resp_ok("Security upgrades applied") }
+    end
+    if cmd == "GcGenerations" is
+        let kv: string = kv_value(req, "keep")
+        let keep: int = if str::is_numeric(kv) then conv::str_to_int(kv) else 20
+        let e4: string = do_gc_generations(keep)
+        if e4 != "" is return Handled { state: s, resp: resp_err("GC failed: " + e4) } end
+        return Handled { state: s, resp: resp_ok("GC complete (kept " + to_string(keep) + " generations)") }
+    end
+    return Handled { state: s, resp: resp_err("Invalid request: " + cmd) }
+end
+
+;; Przetwarza wszystkie oczekujace `.req` (kolejnosc alfabetyczna).
+pub fn process_spool(s0: hd_state::DaemonState) -> hd_state::DaemonState is
+    let mut s: hd_state::DaemonState = s0
+    if !fs::is_dir(spool_dir()) is return s end
+    let names: [string] = sorting::sorted(str::split(proc::shell("ls -1 " + shq(spool_dir()) + " 2>/dev/null"), "\n"))
+    let mut i: int = 0
+    while i < names.len() is
+        if string_ends_with(names[i], ".req") is
+            let req_path: string = compat::path_join(spool_dir(), names[i])
+            let req: string = fs::read(req_path)
+            fs::remove(req_path)
+            let h: Handled = handle_request(req, s)
+            s = h.state
+            let id: string = str::slice(names[i], 0, string_len(names[i]) - 4)
+            let tmp: string = compat::path_join(spool_dir(), id + ".resp.tmp")
+            if fs::write(tmp, resp_to_json(h.resp)) is
+                sh_ok("mv -f " + shq(tmp) + " " + shq(compat::path_join(spool_dir(), id + ".resp")))
+            end
+        end
+        i += 1
+    end
+    return s
+end
+
+;; ── Planista ─────────────────────────────────────────────────────────────
+
+fn has_kind(s: hd_state::DaemonState, kind: string) -> bool is
+    let mut i: int = 0
+    while i < s.tasks.len() is
+        if s.tasks[i].kind == kind is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Rejestruje domyslne zadania (idempotentnie).
+pub fn register_default_tasks(s0: hd_state::DaemonState, cfg: hd_config::DaemonConfig, t: int) -> hd_state::DaemonState is
+    let mut s: hd_state::DaemonState = s0
+    if cfg.sync_interval_hours > 0 && !has_kind(s, "sync") is
+        s = hd_state::state_schedule(s, "sync", t + cfg.sync_interval_hours * 3600, cfg.sync_interval_hours * 3600)
+    end
+    if cfg.check_interval_hours > 0 && !has_kind(s, "upgrade-check") is
+        s = hd_state::state_schedule(s, "upgrade-check", t + cfg.check_interval_hours * 3600, cfg.check_interval_hours * 3600)
+    end
+    if cfg.verify_interval_hours > 0 && !has_kind(s, "verify") is
+        s = hd_state::state_schedule(s, "verify", t + cfg.verify_interval_hours * 3600, cfg.verify_interval_hours * 3600)
+    end
+    if !has_kind(s, "gc") is
+        s = hd_state::state_schedule(s, "gc", t + 24 * 3600, 24 * 3600)
+    end
+    hd_state::state_save(s)
+    return s
+end
+
+pub struct RetryResult is
+    pub state: hd_state::DaemonState
+    pub err:   string
+    ;; wynik `do_check_updates` (tylko dla upgrade-check)
+    pub n:     int
+end
+
+;; Czeka `secs` sekund, obslugujac w miedzyczasie spool (patrz odejscie 2).
+fn wait_with_ipc(s0: hd_state::DaemonState, secs: int) -> hd_state::DaemonState is
+    let mut s: hd_state::DaemonState = s0
+    let mut waited: int = 0
+    while waited < secs && s.running is
+        s = process_spool(s)
+        compat::time_sleep_ms(1000)
+        waited += 1
+    end
+    return s
+end
+
+;; Jedna proba zadania; "" = OK.
+fn attempt(kind: string) -> RetryResult is
+    let blank: hd_state::DaemonState = hd_state::state_blank()
+    if kind == "sync" is return RetryResult { state: blank, err: do_sync(), n: 0 } end
+    if kind == "verify" is return RetryResult { state: blank, err: do_verify(), n: 0 } end
+    let r: CheckResult = do_check_updates()
+    return RetryResult { state: blank, err: r.err, n: r.n }
+end
+
+pub fn with_retry(label: string, kind: string, s0: hd_state::DaemonState) -> RetryResult is
+    let mut s: hd_state::DaemonState = s0
+    let mut delay: int = 30
+    let mut attempt_no: int = 1
+    while attempt_no <= 5 is
+        let r: RetryResult = attempt(kind)
+        if r.err == "" is return RetryResult { state: s, err: "", n: r.n } end
+        if attempt_no == 5 is
+            elog(label + ": failed after " + to_string(attempt_no) + " attempts: " + r.err)
+            return RetryResult { state: s, err: r.err, n: 0 }
+        end
+        elog(label + ": attempt " + to_string(attempt_no) + "/5 failed: " + r.err + " — retrying in " + to_string(delay) + "s")
+        s = wait_with_ipc(s, delay)
+        if !s.running is return RetryResult { state: s, err: r.err, n: 0 } end
+        delay = if delay * 2 > 3600 then 3600 else delay * 2
+        attempt_no += 1
+    end
+    return RetryResult { state: s, err: "retry exhausted", n: 0 }
+end
+
+;; Wykonuje jedno wymagalne zadanie i zapisuje wynik.
+fn run_task(s0: hd_state::DaemonState, cfg: hd_config::DaemonConfig, id: int) -> hd_state::DaemonState is
+    let mut s: hd_state::DaemonState = s0
+    let to: hd_state::ScheduledTask? = hd_state::state_task_by_id(s, id)
+    if to == nil is return s end
+    let task: hd_state::ScheduledTask = to
+    let mut err: string = ""
+
+    if task.kind == "sync" is
+        let r: RetryResult = with_retry("sync", "sync", s)
+        s = r.state
+        if r.err == "" is s.last_sync = now() else is err = r.err end
+    elsif task.kind == "upgrade-check" is
+        let r2: RetryResult = with_retry("upgrade-check", "upgrade-check", s)
+        s = r2.state
+        if r2.err == "" is
+            s.last_check = now()
+            s.n_updates = r2.n
+            if r2.n > 0 && cfg.notify is send_update_notification(r2.n) end
+            if cfg.auto_security_upgrade && r2.n > 0 is do_security_upgrade() end
+        else is
+            err = r2.err
+        end
+    elsif task.kind == "verify" is
+        let r3: RetryResult = with_retry("verify", "verify", s)
+        s = r3.state
+        if r3.err == "" is
+            s.last_verify = now()
+        else is
+            err = r3.err
+            if cfg.notify is send_verify_failure_notification(err) end
+        end
+    elsif task.kind == "gc" is
+        err = do_gc_generations(cfg.max_generations)
+    else is
+        elog("Unknown task kind: " + task.kind)
+        err = "Unknown task kind: " + task.kind
+    end
+
+    s = hd_state::state_task_done(s, id, err, now())
+    if err != "" is elog("Task '" + task.kind + "' (id " + to_string(id) + ") failed: " + err) end
+    return s
+end
+
+;; ── Punkt wejscia demona ─────────────────────────────────────────────────
+
+pub fn run_daemon() -> string is
+    let cfg: hd_config::DaemonConfig = hd_config::config_load()
+    hd_config::config_init_default()
+    let pe: string = write_pid_file()
+    if pe != "" is return pe end
+
+    let mut s: hd_state::DaemonState = hd_state::state_new(now())
+    proc::shell("mkdir -p " + shq(spool_dir()) + " && rm -f " + shq(spool_dir()) + "/*.req " + shq(spool_dir()) + "/*.resp")
+    elog("Spool: " + spool_dir())
+    s = register_default_tasks(s, cfg, now())
+
+    while s.running is
+        s = process_spool(s)
+        if s.running is
+            let id: int = hd_state::state_next_due(s, now())
+            if id >= 0 is s = run_task(s, cfg, id) end
+        end
+        if s.running is compat::time_sleep_ms(1000) end
+    end
+
+    elog("Shutting down.")
+    remove_pid_file()
+    return ""
+end
+
+;; ── Klient ───────────────────────────────────────────────────────────────
+
+pub fn send_request(cmd: string, keep: int) -> DaemonResponse is
+    if !fs::is_dir(spool_dir()) || !is_running() is
+        return resp_err("Cannot connect to hammerd — is hammerd running?\n  Start with: systemctl start hammerd")
+    end
+    let id: string = to_string(compat::time_now_ms()) + "-" + to_string(compat::os_pid())
+    let body: string = "cmd=" + cmd + "\nkeep=" + to_string(keep) + "\n"
+    let tmp: string = compat::path_join(spool_dir(), id + ".req.tmp")
+    if !fs::write(tmp, body) is return resp_err("Cannot write request in " + spool_dir()) end
+    sh_ok("mv -f " + shq(tmp) + " " + shq(compat::path_join(spool_dir(), id + ".req")))
+
+    let resp_path: string = compat::path_join(spool_dir(), id + ".resp")
+    let mut waited_ms: int = 0
+    while waited_ms < 900000 is
+        if fs::exists(resp_path) is
+            let text: string = fs::read(resp_path)
+            fs::remove(resp_path)
+            return resp_parse(text)
+        end
+        compat::time_sleep_ms(200)
+        waited_ms += 200
+    end
+    fs::remove(compat::path_join(spool_dir(), id + ".req"))
+    return resp_err("Timed out waiting for hammerd")
+end
+
+pub fn daemon_alive() -> bool is
+    return is_running() && send_request("Status", 0).ok
+end
+
+;; ── Usluga systemd ───────────────────────────────────────────────────────
+
+pub fn install_hammerd_service() -> string is
+    let mut bin: string = str::trim(proc::shell("readlink -f /proc/self/exe 2>/dev/null"))
+    if bin == "" is bin = "/usr/bin/hammer-daemon" end
+    let service: string = "[Unit]\nDescription=Hammer Package Manager Daemon\nDocumentation=https://github.com/HackerOS-Linux-System/hammer\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=" + bin + " daemon start\nExecReload=/bin/kill -HUP $MAINPID\nPIDFile=" + pid_file() + "\nRestart=on-failure\nRestartSec=30\nStandardOutput=journal\nStandardError=journal\n# Security hardening\nNoNewPrivileges=yes\nProtectSystem=strict\nReadWritePaths=/hammer /run /var/log\nPrivateTmp=yes\n\n[Install]\nWantedBy=multi-user.target\n"
+    if !fs::write("/etc/systemd/system/hammerd.service", service) is return "Cannot write /etc/systemd/system/hammerd.service" end
+    sh_ok("systemctl enable hammerd.service --no-reload")
+    sh_ok("systemctl daemon-reload")
+    return ""
+end
+
+pub fn uninstall_hammerd_service() -> string is
+    sh_ok("systemctl disable hammerd.service")
+    fs::remove("/etc/systemd/system/hammerd.service")
+    sh_ok("systemctl daemon-reload")
+    return ""
+end
+
+;; ── hammer daemon <sub> ──────────────────────────────────────────────────
+
+fn format_epoch(ts: int) -> string is
+    return compat::time_format(ts, "%Y-%m-%d %H:%M:%S") + " UTC"
+end
+
+fn show(resp: DaemonResponse) is
+    write("  " + (if resp.ok then "✔" else "✗") + " " + resp.message)
+end
+
+fn status_row(label: string, value: string) is
+    write("  " + ui::bold(fmt::pad_right(label, 22)) + " " + value)
+end
+
+pub fn cmd_daemon(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "status"
+
+    if sub == "start" is
+        if is_running() is
+            write("  " + ui::cyan("ℹ") + " hammerd is already running.")
+            return ""
+        end
+        write("  " + ui::dim("·") + " Starting hammerd…")
+        return run_daemon()
+    end
+
+    if sub == "install-service" is
+        let e: string = install_hammerd_service()
+        if e != "" is return e end
+        write("  " + ui::bright_green("✔") + " hammerd.service installed and enabled.")
+        return ""
+    end
+
+    if sub == "status" is
+        let r: DaemonResponse = send_request("Status", 0)
+        if !r.ok && r.data == "" is return r.message end
+        write("")
+        write("  " + ui::accent_bold("⬡") + "  hammerd status")
+        write("  " + ui::dim(str::repeat("─", 40)))
+        let toks: [string] = jsonlite::tokenize(r.data)
+        if r.ok is
+            let running: string = json_find(toks, "running")
+            status_row("Running:", if running == "true" then ui::green("yes") else ui::red("no"))
+            status_row("Updates available:", ui::yellow(json_find(toks, "n_updates")))
+            let ls: string = json_find(toks, "last_sync")
+            if ls != "null" && ls != "" is status_row("Last sync:", ui::dim(format_epoch(conv::str_to_int(ls)))) end
+            let lc: string = json_find(toks, "last_check")
+            if lc != "null" && lc != "" is status_row("Last check:", ui::dim(format_epoch(conv::str_to_int(lc)))) end
+            let lv: string = json_find(toks, "last_verify")
+            if lv != "null" && lv != "" is status_row("Last verify:", ui::dim(format_epoch(conv::str_to_int(lv)))) end
+        else is
+            write("  " + ui::red("✗") + " Could not reach hammerd: " + r.message)
+        end
+        write("")
+        return ""
+    end
+
+    if sub == "stop" || sub == "reload" || sub == "sync" || sub == "check" || sub == "verify" || sub == "security-upgrade" || sub == "security" || sub == "gc" is
+        let cmd: string = if sub == "stop" then "Shutdown" elsif sub == "reload" then "Reload" elsif sub == "sync" then "Sync" elsif sub == "check" then "Check" elsif sub == "verify" then "Verify" elsif sub == "gc" then "GcGenerations" else "SecurityUpgrade"
+        let mut keep: int = 20
+        if sub == "gc" is
+            let kv: string? = cli_types::flag_value(args, "--keep=")
+            if kv != nil is
+                let kvs: string = kv
+                if str::is_numeric(kvs) is keep = conv::str_to_int(kvs) end
+            end
+        end
+        let r2: DaemonResponse = send_request(cmd, keep)
+        if !r2.ok && string_starts_with(r2.message, "Cannot connect") is return r2.message end
+        show(r2)
+        return ""
+    end
+
+    return "Unknown daemon subcommand: '" + sub + "'\n  Usage: hammer daemon <start|stop|status|reload|sync|check|verify|gc [--keep=N]|security-upgrade|install-service>"
+end
+
+;; ── Testy (czysta logika) ────────────────────────────────────────────────
+
+fn t_text(label: string, got: string, want: string) -> int is
+    if got == want is return 0 end
+    write("hd_daemon::self_test FAIL: " + label + " got [" + got + "] want [" + want + "]")
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow (bez wywolan systemowych).
+pub fn self_test() -> int is
+    let mut f: int = 0
+    f += t_text("resp json ok", resp_to_json(resp_ok("done")), "{{\"ok\":true,\"message\":\"done\"}}")
+    f += t_text("resp json err", resp_to_json(resp_err("bad \"x\"")), "{{\"ok\":false,\"message\":\"bad \\\"x\\\"\"}}")
+    f += t_text("resp json data", resp_to_json(resp_data("ok", "{{\"n\":1}}")), "{{\"ok\":true,\"message\":\"ok\",\"data\":{{\"n\":1}}}}")
+    let p: DaemonResponse = resp_parse("{{\"ok\":true,\"message\":\"Sync completed\"}}")
+    f += t_text("parse ok", if p.ok then "yes" else "no", "yes")
+    f += t_text("parse message", p.message, "Sync completed")
+    let q: DaemonResponse = resp_parse("{{\"ok\":false,\"message\":\"nope\"}}")
+    f += t_text("parse err", if q.ok then "yes" else "no", "no")
+    f += t_text("kv cmd", kv_value("cmd=Sync\nkeep=5\n", "cmd"), "Sync")
+    f += t_text("kv keep", kv_value("cmd=GcGenerations\nkeep=5\n", "keep"), "5")
+    f += t_text("kv missing", kv_value("cmd=Sync\n", "keep"), "")
+
+    ;; zadania bez efektow ubocznych
+    let mut s: hd_state::DaemonState = hd_state::state_blank()
+    s.running = true
+    let st: Handled = handle_request("cmd=Status\n", s)
+    f += t_text("status ok", if st.resp.ok then "yes" else "no", "yes")
+    let toks: [string] = jsonlite::tokenize(st.resp.data)
+    f += t_text("status running", json_find(toks, "running"), "true")
+    f += t_text("status last_sync null", json_find(toks, "last_sync"), "null")
+    let sh: Handled = handle_request("cmd=Shutdown\n", s)
+    f += t_text("shutdown clears running", if sh.state.running then "yes" else "no", "no")
+    let ge: Handled = handle_request("cmd=GetUpdates\n", s)
+    f += t_text("get updates", json_find(jsonlite::tokenize(ge.resp.data), "n_updates"), "0")
+    let rl: Handled = handle_request("cmd=Reload\n", s)
+    f += t_text("reload bumps config_gen", to_string(rl.state.config_gen), "1")
+    let bad: Handled = handle_request("cmd=Nope\n", s)
+    f += t_text("invalid request", if bad.resp.ok then "yes" else "no", "no")
+    return f
+end
