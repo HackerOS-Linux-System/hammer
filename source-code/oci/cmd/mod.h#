@@ -1,0 +1,17 @@
+mod oci_cmd_status
+mod oci_cmd_deploy
+mod oci_cmd_install
+mod oci_cmd_uninstall
+mod oci_cmd_upgrade
+mod oci_cmd_rollback
+mod oci_cmd_rebase
+mod oci_cmd_cleanup
+mod oci_cmd_fsck
+mod oci_cmd_initramfs
+mod oci_cmd_search
+mod oci_cmd_list
+mod oci_cmd_pin
+mod oci_cmd_diff
+mod oci_cmd_update
+mod oci_cmd_autoremove
+mod oci_cmd
