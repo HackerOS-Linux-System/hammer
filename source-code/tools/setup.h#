@@ -1,0 +1,287 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+
+mod internal
+mod ui
+;; [mod db pominiete: source-code/pkg/db.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania db::fn dzialaja bez zmian]
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+;; [mod profile pominiete: source-code/system/profile.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania profile::fn dzialaja bez zmian]
+;; [mod store pominiete: source-code/pkg/store.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania store::fn dzialaja bez zmian]
+;; [mod grub pominiete: source-code/system/grub.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania grub::fn dzialaja bez zmian]
+;; [mod cache pominiete: source-code/pkg/cache.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania cache::fn dzialaja bez zmian]
+mod repo
+mod pending
+mod hk_tools
+
+;; hammer -> tools::setup
+;;
+;; Port of source-code/tools/setup.rs (Rust) to H#: `hammer _import` (import
+;; bazy dpkg do hammera jako generacja 0) i `hammer _setup` (pierwsza
+;; konfiguracja HackerOS w hooku live-build).
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `async fn` -> zwykle funkcje; `anyhow::Result<()>` -> `string`.
+;; 2. Krok 5/6 `_setup` ("Installing HackerOS tools": `hk_tools::load_all_specs`
+;;    + `install_tool`) POMINIETY z komunikatem — `tools/hk_tools.rs` nie jest
+;;    przepisany (`pending::update_all_tools_stub`).
+;; 3. `std::os::unix::fs::symlink` -> `ln -s`; `remove_dir_all`/`remove_file`
+;;    -> `rm -rf`; uprawnienia `0o755` -> `chmod 755`.
+;; 4. `parse_dpkg_status`: `split("\n\n")` + `lines().any(..)` jak w Rust;
+;;    blok parsuje `package::parse_block`.
+;; 5. ZACHOWANE: `_setup` USUWA `apt`, `dpkg` i `/etc/apt` BEZ potwierdzenia i bez
+;;    sprawdzenia, czy hammer dziala; przeznaczone wylacznie do hooka
+;;    live-build. Nie wolac na zywym systemie.
+;; 6. ZACHOWANE: `cmd_import` pomija zapis generacji, jesli gen-0 juz istnieje
+;;    (ale i tak podmienia dowiazanie `active`).
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+fn mkdir_p(p: string) -> bool is
+    proc::shell("mkdir -p " + shq(p))
+    return fs::is_dir(p)
+end
+
+;; ── Parser statusu dpkg ──────────────────────────────────────────────────
+
+fn parse_dpkg_status(content: string) -> [package::Package] is
+    let blocks: [string] = str::split(content, "\n\n")
+    let mut out: [package::Package] = []
+    let mut i: int = 0
+    while i < blocks.len() is
+        let block: string = str::trim(blocks[i])
+        if block != "" is
+            let lines: [string] = str::split(block, "\n")
+            let mut status_ok: bool = false
+            let mut k: int = 0
+            while k < lines.len() is
+                let l: string = str::trim(lines[k])
+                if string_starts_with(l, "Status:") && compat::str_index_of(l, "install ok installed") >= 0 is status_ok = true end
+                k += 1
+            end
+            if status_ok is
+                let po: package::Package? = package::parse_block(block)
+                if po != nil is
+                    let p: package::Package = po
+                    out.push(p)
+                end
+            end
+        end
+        i += 1
+    end
+    return out
+end
+
+;; ── Stub magazynu ────────────────────────────────────────────────────────
+
+;; Dowiazania do plikow z `/var/lib/dpkg/info/<pkg>.list` zamiast kopii.
+fn populate_stub_store(store_path: string, pkg_name: string) -> string is
+    if !mkdir_p(store_path) is return "Cannot create " + store_path end
+    let list_path: string = "/var/lib/dpkg/info/" + pkg_name + ".list"
+    let mut list_content: string = ""
+    if fs::exists(list_path) is
+        list_content = fs::read(list_path)
+    else is
+        let arch_path: string = "/var/lib/dpkg/info/" + pkg_name + "." + cache::detect_arch() + ".list"
+        if fs::exists(arch_path) is list_content = fs::read(arch_path) end
+    end
+    if list_content == "" is return "" end
+
+    let lines: [string] = str::split(list_content, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let fp: string = str::trim(lines[i])
+        if fp != "" && fs::is_file(fp) is
+            let mut a: int = 0
+            while a < string_len(fp) && string_at(fp, a) == "/" is
+                a += 1
+            end
+            let rel: string = str::slice(fp, a, string_len(fp))
+            let dest: string = compat::path_join(store_path, rel)
+            let parent: string = compat::path_parent(dest)
+            if parent != "" && !mkdir_p(parent) is return "Cannot create " + parent end
+            ;; `symlink_metadata().is_ok()` — istnieje (takze zawieszone dowiazanie)
+            if !sh_ok("[ -e " + shq(dest) + " ] || [ -L " + shq(dest) + " ]") is
+                sh_ok("ln -s " + shq(fp) + " " + shq(dest))
+            end
+        end
+        i += 1
+    end
+    return ""
+end
+
+;; ── hammer _import ───────────────────────────────────────────────────────
+
+pub fn cmd_import() -> string is
+    let dpkg_status: string = "/var/lib/dpkg/status"
+    if !fs::exists(dpkg_status) is
+        return "hammer _import: /var/lib/dpkg/status not found.\nThis command is only usable in a live-build hook environment."
+    end
+
+    write("  " + ui::accent_bold("⬡") + "  Importing dpkg database into hammer…")
+    let packages: [package::Package] = parse_dpkg_status(fs::read(dpkg_status))
+    write("  " + ui::dim("·") + " Found " + to_string(packages.len()) + " installed packages in dpkg database.")
+
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    if !mkdir_p(store::store_dir()) is return "Cannot create " + store::store_dir() end
+    if !mkdir_p(store::profiles_dir()) is return "Cannot create " + store::profiles_dir() end
+
+    let mut entries: [store::StoreEntry] = []
+    let mut imported: int = 0
+    let mut skipped: int = 0
+    let hash: string = "import"
+
+    let mut i: int = 0
+    while i < packages.len() is
+        let pkg: package::Package = packages[i]
+        if pkg.name == "" is
+            skipped += 1
+        else is
+            let sp: string = compat::path_join(store::store_dir(), pkg.name + "-" + pkg.version + "-" + hash)
+            if !fs::exists(sp) is
+                let pe: string = populate_stub_store(sp, pkg.name)
+                if pe != "" is log::warn("import: stub for " + pkg.name + " failed: " + pe) end
+            end
+            entries.push(store::StoreEntry { name: pkg.name, version: pkg.version, hash: hash, path: sp,
+                backend: store::StoreBackend::Hardlink })
+            let re: string = idb.record_install(pkg, db::InstallReason::User, hash, 0)
+            if re != "" is log::warn("import: db record for " + pkg.name + " failed: " + re) end
+            imported += 1
+        end
+        i += 1
+    end
+
+    write("  " + ui::dim("·") + " Composing generation 0 (" + to_string(imported) + " packages)…")
+    let cr: profile::ComposeResult = profile::compose_profile(0, entries, "import from dpkg")
+    if cr.err != "" is return "Composing gen-0: " + cr.err end
+
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let mut gdb: profile::GenerationsDb = lr.db
+    if profile::db_get(gdb, 0) == nil is
+        gdb.generations = append_gen(gdb.generations, cr.generation)
+        gdb.current = 0
+        let se: string = profile::db_save(gdb)
+        if se != "" is return se end
+    end
+
+    let gen0: string = compat::path_join(store::profiles_dir(), "gen-0")
+    let active: string = store::active_link()
+    proc::shell("rm -f -- " + shq(active))
+    if !sh_ok("ln -s " + shq(gen0) + " " + shq(active)) is return "Cannot link " + active end
+
+    write("  " + ui::bright_green("✔") + " Imported " + to_string(imported) + " packages (" + to_string(skipped) + " skipped).")
+    log::info("import: imported " + to_string(imported) + " packages from dpkg")
+    return ""
+end
+
+fn append_gen(a: [profile::Generation], g: profile::Generation) -> [profile::Generation] is
+    let mut o: [profile::Generation] = a
+    o.push(g)
+    return o
+end
+
+;; ── hammer _setup ────────────────────────────────────────────────────────
+
+pub fn cmd_setup() -> string is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  hammer _setup — initialising HackerOS package environment")
+    write("  " + ui::dim(str::repeat("─", 60)))
+    write("")
+
+    write("  " + ui::cyan("·") + " Step 1/6: Importing dpkg database…")
+    let e1: string = cmd_import()
+    if e1 != "" is return "hammer _import: " + e1 end
+    write("  " + ui::green("✔") + " Step 1/6 done.")
+
+    write("  " + ui::cyan("·") + " Step 2/6: Checking sources list…")
+    if !fs::exists(repo::sources_hk()) is
+        return "hammer _setup: " + repo::sources_hk() + " not found.\nCreate /etc/hammer/sources-list.hk before running hammer _setup."
+    end
+    write("  " + ui::green("✔") + " " + repo::sources_hk() + " found.")
+
+    write("  " + ui::cyan("·") + " Step 3/6: Creating hammer directories…")
+    let dirs: [string] = ["/hammer/store", "/hammer/profiles", "/hammer/db", "/hammer/db/postinst", "/hammer/hk_store",
+        "/var/cache/hammer/archives", "/var/lib/hammer/lists", "/usr/lib/hammer", "/usr/lib/HackerOS/hammer"]
+    let mut i: int = 0
+    while i < dirs.len() is
+        if !mkdir_p(dirs[i]) is return "Cannot create " + dirs[i] end
+        i += 1
+    end
+    write("  " + ui::green("✔") + " Directories created.")
+
+    write("  " + ui::cyan("·") + " Step 4/6: Removing dpkg/apt toolchain…")
+    remove_apt_dpkg()
+    write("  " + ui::green("✔") + " dpkg/apt removed.")
+
+    write("  " + ui::cyan("·") + " Step 5/6: Installing HackerOS tools…")
+    install_all_hk_tools()
+    write("  " + ui::green("✔") + " Step 5/6 done.")
+
+    write("  " + ui::cyan("·") + " Step 6/6: Installing boot services…")
+    let ae: string = profile::install_activate_service()
+    if ae != "" is return ae end
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return lr.err end
+    let ge: string = grub::update_grub(lr.db)
+    if ge != "" is write("  " + ui::yellow("!") + " GRUB update failed (non-fatal): " + ge) end
+    write("  " + ui::green("✔") + " Boot services installed.")
+
+    if !fs::write("/hammer/db/.setup-complete", "1\n") is return "Cannot write /hammer/db/.setup-complete" end
+
+    write("")
+    write("  " + ui::dim(str::repeat("━", 60)))
+    write("  " + ui::accent_bold("⬡") + "  hammer _setup complete.")
+    write("  " + ui::dim("·") + "  The system is ready. Reboot to activate gen-0.")
+    write("  " + ui::dim(str::repeat("━", 60)))
+    write("")
+    return ""
+end
+
+;; ── Usuwanie dpkg/apt (patrz odejscie 5) ─────────────────────────────────
+
+fn remove_apt_dpkg() is
+    let targets: [string] = ["/usr/bin/apt", "/usr/bin/apt-get", "/usr/bin/apt-cache", "/usr/bin/apt-config", "/usr/bin/apt-key",
+        "/usr/lib/apt", "/etc/apt", "/var/lib/apt", "/var/cache/apt",
+        "/usr/bin/dpkg", "/usr/bin/dpkg-query", "/usr/bin/dpkg-divert", "/usr/bin/dpkg-statoverride", "/usr/bin/dpkg-trigger",
+        "/usr/sbin/dpkg-reconfigure", "/usr/lib/dpkg"]
+    let mut i: int = 0
+    while i < targets.len() is
+        proc::shell("rm -rf -- " + shq(targets[i]))
+        log::info("_setup: removed " + targets[i])
+        i += 1
+    end
+    let cmds: [string] = ["apt", "apt-get", "apt-cache", "dpkg"]
+    let mut k: int = 0
+    while k < cmds.len() is
+        let stub_path: string = "/usr/local/bin/" + cmds[k]
+        let stub: string = "#!/bin/sh\necho 'Error: " + cmds[k] + " is not available. Use hammer instead.' >&2\nexit 127\n"
+        if fs::write(stub_path, stub) is sh_ok("chmod 755 " + shq(stub_path)) end
+        k += 1
+    end
+end
+
+;; Krok 5/6: instaluje narzedzia z /etc/hammer/HackerOS (bledy pojedynczych
+;; narzedzi nie przerywaja — tak jak w Rust).
+fn install_all_hk_tools() is
+    let specs: [hk_tools::HkToolSpec] = hk_tools::load_all_specs()
+    if specs.len() == 0 is
+        write("  " + ui::dim("·") + " No .hk tool specs found in " + hk_tools::hk_tools_dir())
+        return
+    end
+    let mut i: int = 0
+    while i < specs.len() is
+        let e: string = hk_tools::install_tool(specs[i])
+        if e != "" is
+            log::warn("_setup: install " + specs[i].name + " failed: " + e)
+            write("  " + ui::yellow("!") + " " + specs[i].name + " failed: " + e)
+        end
+        i += 1
+    end
+end
