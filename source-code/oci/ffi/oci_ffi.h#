@@ -1,0 +1,405 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod oci_process
+
+;; hammer -> oci::ffi::oci_ffi
+;;
+;; Port of source-code/oci/ffi/{mod.rs,raw.rs,wrapper.h} (Rust) to H#.
+;;
+;; ── ZMIANA ARCHITEKTURY: CLI `ostree` zamiast FFI do libostree ───────────
+;; Rust wola libostree/GLib przez bindgen (`raw.rs` + `wrapper.h` +
+;; `build.rs`) i recznie opakowuje ~25 funkcji. W H# to wymagaloby
+;; `extern static [c]` dla struktur (OstreeRepoCheckoutAtOptions, GError,
+;; GPtrArray...), ktorych ukladu nie da sie tu sprawdzic kompilatorem, a
+;; blad w ukladzie = uszkodzona pamiec na hoscie z rootem. Wersja pierwotna
+;; (przed FFI) tez shellowala do `ostree`. Dlatego: kazda operacja =
+;; polecenie `ostree`, sprawdzone na prawdziwym repo i sysroocie
+;; (ostree 2024.5): init, commit, rev-parse, show, checkout, prune, fsck,
+;; admin deploy/status/pin/undeploy/cleanup. `build.rs`/bindgen/pkg-config
+;; nie sa juz potrzebne.
+;;
+;; Roznice wzgledem FFI:
+;; 1. Brak RAII — uchwyt to tylko sciezka (`FfiRepo`, `FfiSysroot`).
+;; 2. `checkout`: `-U --union`; CLI nie ma `process_whiteouts`. Commity
+;;    powstaja ze splaszczonego drzewa (overlay.h# usuwa `.wh.*`), wiec nie
+;;    ma czego przetwarzac.
+;; 3. `fsck` = `ostree fsck` (sprawdza SUMY kazdego obiektu — wiecej niz
+;;    przejscie `traverse_commit` w Rust). Liczby: refy z `ostree refs`,
+;;    obiekty z ostatniego "(n/n)" w wyjsciu.
+;; 4. `deploy`: `ostree admin deploy --os --origin-file`, a /etc scalany z
+;;    biezacego deploymentu domyslnie (jak `get_merge_deployment` w Rust).
+;;    WYMAGANIA drzewa (sprawdzone): `usr/etc`, `usr/etc/os-release`, jadro
+;;    w `usr/lib/modules/<wersja>/`. Bez nich ostree zglasza blad.
+;; 5. `Sysroot::deployments` parsuje `ostree admin status`: linia
+;;    `* os csum.N` = booted, `Pinned: yes`, `origin refspec: X`.
+;;    `timestamp` zostaje 0 (Rust tez).
+;; 6. `Result<T>` -> struktury z polem `err` ("" = OK).
+
+pub struct FfiRepo is
+    pub path: string
+end
+
+pub struct FfiRepoResult is
+    pub repo: FfiRepo
+    pub err:  string
+end
+
+pub struct StrResult is
+    pub value: string
+    pub err:   string
+end
+
+pub struct ResolveResult is
+    ;; found == false i err == "" => ref nie istnieje (Rust: Ok(None))
+    pub found: bool
+    pub rev:   string
+    pub err:   string
+end
+
+pub struct CommitMetadata is
+    pub checksum:  string
+    pub subject:   string
+    pub body:      string
+    pub timestamp: int
+end
+
+pub struct CommitMetaResult is
+    pub meta: CommitMetadata
+    pub err:  string
+end
+
+pub struct FsckResult is
+    pub refs:    int
+    pub objects: int
+    pub err:     string
+end
+
+pub struct DeploymentInfo is
+    pub osname:         string
+    pub checksum:       string
+    pub serial:         int
+    pub booted:         bool
+    pub pinned:         bool
+    pub origin_refspec: string
+end
+
+pub struct DeploymentsResult is
+    pub items: [DeploymentInfo]
+    pub err:   string
+end
+
+pub struct FfiSysroot is
+    pub path: string
+end
+
+pub struct FfiSysrootResult is
+    pub sysroot: FfiSysroot
+    pub err:     string
+end
+
+fn one_line(s: string) -> string is
+    return str::trim(str::replace_all(s, "\n", " "))
+end
+
+;; Blad polecenia: stderr (a jak pusty — stdout), bez konca linii.
+fn cmd_error(r: oci_process::RunResult) -> string is
+    if r.err != "" is return r.err end
+    let e: string = one_line(r.stderr)
+    if e != "" is return e end
+    return one_line(r.stdout)
+end
+
+fn repo_flag(path: string) -> string is
+    return "--repo=" + path
+end
+
+;; ── Repo ─────────────────────────────────────────────────────────────────
+
+;; Rust: `Repo::open_at` — blad, jesli `path/config` nie istnieje.
+pub fn repo_open_at(path: string) -> FfiRepoResult is
+    let repo: FfiRepo = FfiRepo { path: path }
+    if !fs::is_file(compat::path_join(path, "config")) is
+        return FfiRepoResult { repo: repo, err: "ostree_repo_open(" + path + "): not an OSTree repository (no config file)" }
+    end
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", [repo_flag(path), "refs"])
+    if !r.status_ok is
+        return FfiRepoResult { repo: repo, err: "ostree_repo_open(" + path + "): " + cmd_error(r) }
+    end
+    return FfiRepoResult { repo: repo, err: "" }
+end
+
+;; Rust: `Repo::create_at` — tryb bare-user (bez roota na hoscie).
+pub fn repo_create_at(path: string) -> FfiRepoResult is
+    let repo: FfiRepo = FfiRepo { path: path }
+    proc::shell("mkdir -p -- " + oci_process::shq(path) + " 2>/dev/null")
+    if !fs::is_dir(path) is
+        return FfiRepoResult { repo: repo, err: "mkdir -p " + path }
+    end
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", ["init", repo_flag(path), "--mode=bare-user"])
+    if !r.status_ok is
+        return FfiRepoResult { repo: repo, err: "ostree_repo_create(" + path + "): " + cmd_error(r) }
+    end
+    return FfiRepoResult { repo: repo, err: "" }
+end
+
+pub fn repo_open_or_create(path: string) -> FfiRepoResult is
+    if fs::exists(compat::path_join(path, "config")) is
+        return repo_open_at(path)
+    end
+    return repo_create_at(path)
+end
+
+;; Rust: `resolve_rev` z allow_noent = TRUE.
+pub fn resolve_rev(repo: FfiRepo, refspec: string) -> ResolveResult is
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", [repo_flag(repo.path), "rev-parse", refspec])
+    if r.err != "" is return ResolveResult { found: false, rev: "", err: r.err } end
+    if r.status_ok is
+        return ResolveResult { found: true, rev: str::trim(r.stdout), err: "" }
+    end
+    ;; `ostree rev-parse` zwraca 1 i "not found" dla brakujacego refa.
+    if str::to_lower(r.stderr).contains("not found") is
+        return ResolveResult { found: false, rev: "", err: "" }
+    end
+    return ResolveResult { found: false, rev: "", err: "ostree_repo_resolve_rev(" + refspec + "): " + cmd_error(r) }
+end
+
+;; Rust: `commit_directory` — zwraca checksum nowego commita.
+pub fn commit_directory(repo: FfiRepo, dir_path: string, refspec: string, subject: string, body: string) -> StrResult is
+    let mut args: [string] = ["commit", repo_flag(repo.path), "--branch=" + refspec, "--subject=" + subject]
+    if body != "" is args.push("--body=" + body) end
+    args.push(dir_path)
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", args)
+    if !r.status_ok is
+        return StrResult { value: "", err: "ostree_repo_write_directory_to_mtree(" + dir_path + "): " + cmd_error(r) }
+    end
+    let sum: string = str::trim(r.stdout)
+    if string_len(sum) != 64 is
+        return StrResult { value: "", err: "ostree commit returned unexpected output: " + one_line(sum) }
+    end
+    return StrResult { value: sum, err: "" }
+end
+
+;; Rust: `checkout_at` — usuwa stary katalog, tryb user, union.
+pub fn checkout_at(repo: FfiRepo, checksum: string, dest_dir: string) -> string is
+    if dest_dir == "" || dest_dir == "/" is return "Refusing to check out into '" + dest_dir + "'" end
+    proc::shell("rm -rf -- " + oci_process::shq(dest_dir))
+    let parent: string = compat::path_parent(dest_dir)
+    if parent != "" is proc::shell("mkdir -p -- " + oci_process::shq(parent) + " 2>/dev/null") end
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", ["checkout", repo_flag(repo.path), "-U", "--union", checksum, dest_dir])
+    if !r.status_ok is
+        return "ostree_repo_checkout_at(" + checksum + " -> " + dest_dir + "): " + cmd_error(r)
+    end
+    return ""
+end
+
+;; Rust: `prune` — REFS_ONLY, glebokosc nieograniczona.
+pub fn repo_prune(repo: FfiRepo) -> string is
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", ["prune", repo_flag(repo.path), "--refs-only"])
+    if !r.status_ok is return "ostree_repo_prune: " + cmd_error(r) end
+    return ""
+end
+
+;; Ostatnie "(n/n)" z wyjscia `ostree fsck` -> n.
+fn last_object_count(out: string) -> int is
+    let lines: [string] = str::split(str::replace_all(out, "\r", "\n"), "\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() is
+        let l: string = lines[i]
+        i += 1
+        let a: int = compat::str_index_of(l, "(")
+        let b: int = compat::str_index_of(l, "/")
+        if a >= 0 && b > a is
+            let num: string = str::slice(l, a + 1, b)
+            if str::is_numeric(num) is n = conv::str_to_int(num) end
+        end
+    end
+    return n
+end
+
+;; Rust: `fsck` -> (refs, objects).
+pub fn repo_fsck(repo: FfiRepo) -> FsckResult is
+    let refs: oci_process::RunResult = oci_process::run_capture("ostree", ["refs", repo_flag(repo.path)])
+    if !refs.status_ok is
+        return FsckResult { refs: 0, objects: 0, err: "ostree_repo_list_refs: " + cmd_error(refs) }
+    end
+    let mut nrefs: int = 0
+    let rl: [string] = str::split(refs.stdout, "\n")
+    let mut i: int = 0
+    while i < rl.len() is
+        if str::trim(rl[i]) != "" is nrefs += 1 end
+        i += 1
+    end
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", ["fsck", repo_flag(repo.path)])
+    if !r.status_ok is
+        return FsckResult { refs: nrefs, objects: 0, err: "ostree fsck: " + cmd_error(r) }
+    end
+    return FsckResult { refs: nrefs, objects: last_object_count(r.stdout + "\n" + r.stderr), err: "" }
+end
+
+;; "2026-10-11 05:51:14 +0000" -> sekundy unix (0 gdy nieczytelne).
+fn date_to_epoch(d: string) -> int is
+    let t: string = str::trim(proc::shell("date -u -d " + oci_process::shq(d) + " +%s 2>/dev/null"))
+    if str::is_numeric(t) is return conv::str_to_int(t) end
+    return 0
+end
+
+;; Rust: `load_commit_metadata` — z wyjscia `ostree show`.
+;; Format: `commit <sum>`, naglowki (`Date:  ...`), pusta linia, tresc
+;; wciety o 4 spaces: pierwsza linia = subject, reszta (po pustej) = body.
+pub fn load_commit_metadata(repo: FfiRepo, checksum: string) -> CommitMetaResult is
+    let empty: CommitMetadata = CommitMetadata { checksum: checksum, subject: "", body: "", timestamp: 0 }
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", ["show", repo_flag(repo.path), checksum])
+    if !r.status_ok is
+        return CommitMetaResult { meta: empty, err: "ostree_repo_load_commit(" + checksum + "): " + cmd_error(r) }
+    end
+    let lines: [string] = str::split(r.stdout, "\n")
+    let mut ts: int = 0
+    let mut subject: string = ""
+    let mut body: string = ""
+    let mut have_subject: bool = false
+    let mut i: int = 0
+    while i < lines.len() is
+        let l: string = lines[i]
+        i += 1
+        if l.starts_with("Date:") is
+            ts = date_to_epoch(str::trim(str::slice(l, 5, string_len(l))))
+        elsif l.starts_with("    ") is
+            let text: string = str::slice(l, 4, string_len(l))
+            if !have_subject is
+                subject = text
+                have_subject = true
+            elsif body == "" is
+                body = text
+            else
+                body = body + "\n" + text
+            end
+        end
+    end
+    return CommitMetaResult { meta: CommitMetadata { checksum: checksum, subject: subject, body: str::trim(body), timestamp: ts }, err: "" }
+end
+
+;; ── Sysroot ──────────────────────────────────────────────────────────────
+
+pub fn sysroot_flag(path: string) -> string is
+    return "--sysroot=" + path
+end
+
+;; Rust: `Sysroot::load`.
+pub fn sysroot_load(path: string) -> FfiSysrootResult is
+    let s: FfiSysroot = FfiSysroot { path: path }
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", ["admin", "status", sysroot_flag(path)])
+    if !r.status_ok is
+        return FfiSysrootResult { sysroot: s, err: "ostree_sysroot_load(" + path + "): " + cmd_error(r) }
+    end
+    return FfiSysrootResult { sysroot: s, err: "" }
+end
+
+;; `<os> <hex64>.<n>` (opcjonalnie z sufiksem w nawiasach) -> DeploymentInfo?
+fn parse_dep_line(body: string, booted: bool) -> DeploymentInfo? is
+    let parts: [string] = str::split_whitespace(body)
+    if parts.len() < 2 is return nil end
+    let ref_: string = parts[1]
+    let dot: int = compat::str_index_of(ref_, ".")
+    if dot != 64 is return nil end
+    let serial_txt: string = str::slice(ref_, dot + 1, string_len(ref_))
+    if !str::is_numeric(serial_txt) is return nil end
+    return DeploymentInfo {
+        osname: parts[0], checksum: str::slice(ref_, 0, dot), serial: conv::str_to_int(serial_txt),
+        booted: booted, pinned: false, origin_refspec: ""
+    }
+end
+
+;; Rust: `Sysroot::deployments` — kolejnosc jak w ostree (0 = najnowszy).
+pub fn sysroot_deployments(s: FfiSysroot) -> DeploymentsResult is
+    let mut out: [DeploymentInfo] = []
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", ["admin", "status", sysroot_flag(s.path)])
+    if !r.status_ok is
+        return DeploymentsResult { items: out, err: "ostree_sysroot_get_deployments: " + cmd_error(r) }
+    end
+    let lines: [string] = str::split(r.stdout, "\n")
+    let mut cur: DeploymentInfo? = nil
+    let mut i: int = 0
+    while i < lines.len() is
+        let l: string = lines[i]
+        i += 1
+        let mut head: string? = nil
+        let mut is_booted: bool = false
+        if l.starts_with("* ") is
+            head = str::slice(l, 2, string_len(l))
+            is_booted = true
+        elsif l.starts_with("  ") && !l.starts_with("   ") is
+            head = str::slice(l, 2, string_len(l))
+        end
+        if head != nil is
+            let d: DeploymentInfo? = parse_dep_line(head, is_booted)
+            if d != nil is
+                if cur != nil is
+                    let done: DeploymentInfo = cur
+                    out.push(done)
+                end
+                cur = d
+                continue
+            end
+        end
+        if cur != nil is
+            let t: string = str::trim(l)
+            let mut c: DeploymentInfo = cur
+            if t == "Pinned: yes" is
+                c.pinned = true
+                cur = c
+            elsif t.starts_with("origin refspec:") is
+                c.origin_refspec = str::trim(str::slice(t, 15, string_len(t)))
+                cur = c
+            end
+        end
+    end
+    if cur != nil is
+        let last: DeploymentInfo = cur
+        out.push(last)
+    end
+    return DeploymentsResult { items: out, err: "" }
+end
+
+;; Rust: `Sysroot::deploy` — origin: `[origin]\nrefspec=...`.
+pub fn sysroot_deploy(s: FfiSysroot, osname: string, checksum: string, origin_refspec: string) -> string is
+    let origin_file: string = fs::temp_file("hammer-oci-origin")
+    fs::write(origin_file, "[origin]\nrefspec=" + origin_refspec + "\n")
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", ["admin", "deploy", sysroot_flag(s.path), "--os=" + osname, "--origin-file=" + origin_file, checksum])
+    proc::shell("rm -f -- " + oci_process::shq(origin_file))
+    if !r.status_ok is return "ostree_sysroot_deploy_tree: " + cmd_error(r) end
+    return ""
+end
+
+;; Rust: `undeploy(index)`.
+pub fn sysroot_undeploy(s: FfiSysroot, index: int) -> string is
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", ["admin", "undeploy", sysroot_flag(s.path), to_string(index)])
+    if !r.status_ok is return "ostree_sysroot_write_deployments: " + cmd_error(r) end
+    return ""
+end
+
+pub fn sysroot_cleanup(s: FfiSysroot) -> string is
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", ["admin", "cleanup", sysroot_flag(s.path)])
+    if !r.status_ok is return "ostree_sysroot_cleanup: " + cmd_error(r) end
+    return ""
+end
+
+pub fn sysroot_set_pinned(s: FfiSysroot, index: int, pinned: bool) -> string is
+    let mut args: [string] = ["admin", "pin", sysroot_flag(s.path)]
+    if !pinned is args.push("--unpin") end
+    args.push(to_string(index))
+    let r: oci_process::RunResult = oci_process::run_capture("ostree", args)
+    if !r.status_ok is
+        return "ostree_sysroot_deployment_set_pinned(" + to_string(index) + ", " + to_string(pinned) + "): " + cmd_error(r)
+    end
+    return ""
+end
+
+;; Rust: `Sysroot::repo` — repo wbudowane w sysroot.
+pub fn sysroot_repo_path(s: FfiSysroot) -> string is
+    return compat::path_join(s.path, "ostree/repo")
+end
