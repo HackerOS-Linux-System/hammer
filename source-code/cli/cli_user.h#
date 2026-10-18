@@ -1,0 +1,293 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> fmt"     from "fmt"
+
+mod internal
+mod cli
+mod pkg
+mod ui
+mod system
+mod userenv
+
+;; hammer -> cli::cli_user
+;;
+;; Port of the user-mode part of source-code/cli/pkg.rs (Rust) to H#:
+;; `hammer --user install|remove|list|status|init` (bez roota, w ~/.hammer).
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `async` -> zwykle funkcje; `anyhow::Result<()>` -> `string`.
+;; 2. `let _lock = lock::user_lock(..)?` (Drop) -> blokada zwalniana na kazdej
+;;    sciezce przez otoczke `with_user_lock`.
+;; 3. `std::fs::read(path)` + `DebPackage::parse(&bytes)` -> `deb::parse_file(sciezka)`
+;;    (hammerowy `deb.h#` pracuje na plikach, nie na buforach).
+;; 4. ZACHOWANY BLAD ORYGINALU w `cmd_user_remove`: lista pozostalych wpisow
+;;    szuka katalogow w SYSTEMOWYM `store::store_dir()`, a nie w
+;;    `~/.hammer/store` (`crate::store::STORE_DIR`) — pakiety zainstalowane
+;;    tylko w trybie uzytkownika nie zostana znalezione i znikna z nowej
+;;    generacji. Poprawka to `env.store_dir`; nie zmieniam bez decyzji.
+;; 5. ZACHOWANE: `cmd_user_install` nie zapisuje pakietow w bazie `hammer.db`
+;;    uzytkownika (tylko generacje w `generations.json`), wiec `--user remove`
+;;    i `--user list` opieraja sie na tym, co widza (`list` — generacje,
+;;    `remove` — baza, ktora instalacja nie wypelnia). Nie naprawiam.
+;; 6. `chrono::Utc::now()` -> `profile::now_rfc3339()`.
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ── Router ───────────────────────────────────────────────────────────────
+
+pub fn run_user(cmd: string, args: [string], flags: cli_types::GlobalFlags) -> string is
+    let er: userenv::EnvResult = userenv::user_env_current()
+    if er.err != "" is return er.err end
+    let env: userenv::UserEnv = er.env
+    if cmd == "install" || cmd == "in" is return cmd_user_install(env, args, flags) end
+    if cmd == "remove" || cmd == "rm" is return cmd_user_remove(env, args) end
+    if cmd == "list" || cmd == "ls" is return cmd_user_list(env) end
+    if cmd == "status" || cmd == "st" is return cmd_user_status(env) end
+    if cmd == "init" is
+        let ie: string = userenv::user_env_init(env)
+        if ie != "" is return ie end
+        return cmd_user_shell_init(env)
+    end
+    return "hammer --user: unknown command '" + cmd + "'. Try: install, remove, list, status, init"
+end
+
+;; Aktywuje profil `profile_path` (atomowo) i zapisuje generacje.
+fn activate_profile(env: userenv::UserEnv, profile_path: string) -> string is
+    let tmp: string = compat::path_join(env.hammer_dir, ".active.tmp")
+    proc::shell("rm -f -- " + shq(tmp))
+    if !sh_ok("ln -s " + shq(profile_path) + " " + shq(tmp)) is return "Cannot link " + tmp end
+    if !sh_ok("mv -Tf " + shq(tmp) + " " + shq(env.active_link)) is return "Cannot replace " + env.active_link end
+    return ""
+end
+
+fn gen_packages_of(entries: [store::StoreEntry]) -> [profile::GenPackage] is
+    let mut out: [profile::GenPackage] = []
+    let mut i: int = 0
+    while i < entries.len() is
+        out.push(profile::GenPackage { name: entries[i].name, version: entries[i].version, store_hash: entries[i].hash })
+        i += 1
+    end
+    return out
+end
+
+fn append_gen(a: [profile::Generation], g: profile::Generation) -> [profile::Generation] is
+    let mut o: [profile::Generation] = a
+    o.push(g)
+    return o
+end
+
+;; Zapisuje nowa generacje jako aktywna.
+fn push_generation(env: userenv::UserEnv, gdb0: profile::GenerationsDb, gen_num: int, entries: [store::StoreEntry], note: string) -> string is
+    let mut gdb: profile::GenerationsDb = gdb0
+    let g: profile::Generation = profile::Generation { number: gen_num, timestamp: profile::now_rfc3339(),
+        packages: gen_packages_of(entries), note: note, state: "Active" }
+    gdb.generations = append_gen(gdb.generations, g)
+    gdb.current = gen_num
+    return profile::db_save_to(gdb, env.gens_file)
+end
+
+;; ── install ──────────────────────────────────────────────────────────────
+
+pub fn cmd_user_install(env: userenv::UserEnv, args: [string], flags: cli_types::GlobalFlags) -> string is
+    let yes: bool = cli_types::has_flag(args, "-y") || flags.yes
+    let names: [string] = cli_types::non_flag_args(args)
+    if names.len() == 0 is return "Usage: hammer --user install <package...>" end
+    let mut arch: string = cache::detect_arch()
+    if flags.arch != nil is
+        let a: string = flags.arch
+        let r: userenv::ArchResult = userenv::normalise_arch(a)
+        if !r.ok is return r.err end
+        arch = r.arch
+    end
+
+    let lk: lock::LockResult = lock::user_lock(env.hammer_dir)
+    if lk.err != "" is return lk.err end
+    let e: string = user_install_inner(env, names, arch, yes)
+    lock::lock_release(lk.lock)
+    return e
+end
+
+fn user_install_inner(env: userenv::UserEnv, names: [string], arch: string, yes: bool) -> string is
+    let c: cache::PackageCache = cache::cache_load_for_arch(arch)
+    let idb: db::InstalledDb = db::InstalledDb::open_at(env.db_path)
+    let s: solver::Solver = solver::solver_new(c, idb)
+    let pr: solver::PlanResult = solver::solver_resolve_install(s, names, false)
+    if pr.err != "" is return pr.err end
+    let plan: solver::TransactionPlan = pr.plan
+    if solver::plan_is_empty(plan) is
+        ui::nothing_to_do()
+        return ""
+    end
+    ui::print_transaction_table(plan, arch)
+    if !yes && !ui::confirm("Install to user profile?") is
+        write("  Aborted.")
+        return ""
+    end
+
+    let dl: download::DownloadOutcome = download::download_packages(download::client_new(), plan.to_install)
+    if !dl.ok is return dl.err end
+
+    let mut entries: [store::StoreEntry] = []
+    let mut i: int = 0
+    while i < dl.results.len() is
+        let d: download::DownloadResult = dl.results[i]
+        let pr2: deb::ParseResult = deb::parse_file(d.path)
+        if pr2.err != "" is return pr2.err end
+        let dpkg: deb::DebPackage = pr2.deb
+        let sr: userenv::UserStoreResult = userenv::user_install_deb(env, d.package, dpkg)
+        deb::cleanup(dpkg)
+        if sr.err != "" is return sr.err end
+        entries.push(sr.entry)
+        i += 1
+    end
+
+    let gdb: profile::GenerationsDb = profile::db_load_from(env.gens_file)
+    let gen_num: int = profile::db_next_number(gdb)
+    let pf: userenv::ProfileResult = userenv::compose_user_profile(env, gen_num, entries)
+    if pf.err != "" is return pf.err end
+    let ae: string = activate_profile(env, pf.path)
+    if ae != "" is return ae end
+    let ge: string = push_generation(env, gdb, gen_num, entries, "install " + str::join(names, " "))
+    if ge != "" is return ge end
+    write("  " + ui::bright_green("✔") + " Installed " + ui::bold(to_string(entries.len())) + " package(s) to user profile.")
+    return ""
+end
+
+;; ── remove ───────────────────────────────────────────────────────────────
+
+pub fn cmd_user_remove(env: userenv::UserEnv, args: [string]) -> string is
+    let yes: bool = cli_types::has_flag(args, "-y")
+    let names: [string] = cli_types::non_flag_args(args)
+    if names.len() == 0 is return "Usage: hammer --user remove <package...> [-y]" end
+
+    let lk: lock::LockResult = lock::user_lock(env.hammer_dir)
+    if lk.err != "" is return lk.err end
+    let e: string = user_remove_inner(env, names, yes)
+    lock::lock_release(lk.lock)
+    return e
+end
+
+fn user_remove_inner(env: userenv::UserEnv, names: [string], yes: bool) -> string is
+    let idb: db::InstalledDb = db::InstalledDb::open_at(env.db_path)
+    let mut not_found: [string] = []
+    let mut i: int = 0
+    while i < names.len() is
+        if idb.get(names[i]) == nil is not_found.push(names[i]) end
+        i += 1
+    end
+    if not_found.len() > 0 is return "Not installed in user profile: " + str::join(not_found, ", ") end
+
+    write("  " + ui::cyan_bold("⬡") + " Removing: " + ui::bold(str::join(names, ", ")))
+    if !yes && !ui::confirm("Proceed?") is
+        write("  Aborted.")
+        return ""
+    end
+
+    let gdb: profile::GenerationsDb = profile::db_load_from(env.gens_file)
+    let mut k: int = 0
+    while k < names.len() is
+        let io: db::InstalledPackage? = idb.get(names[k])
+        if io != nil is
+            let inst: db::InstalledPackage = io
+            let re: string = idb.record_remove(names[k], inst.version, gdb.current)
+            if re != "" is return re end
+        end
+        k += 1
+    end
+
+    ;; pozostale wpisy (patrz odejscie 4: STORE_DIR systemowy)
+    let mut remaining: [store::StoreEntry] = []
+    let all: [db::InstalledPackage] = idb.list_all()
+    let mut m: int = 0
+    while m < all.len() is
+        let p: db::InstalledPackage = all[m]
+        if !contains_str(names, p.name) is
+            let path: string = compat::path_join(store::store_dir(), p.name + "-" + p.version + "-" + p.store_hash)
+            if fs::exists(path) is
+                remaining.push(store::StoreEntry { name: p.name, version: p.version, hash: p.store_hash, path: path,
+                    backend: store::StoreBackend::Hardlink })
+            end
+        end
+        m += 1
+    end
+
+    let gen_num: int = profile::db_next_number(gdb)
+    let pf: userenv::ProfileResult = userenv::compose_user_profile(env, gen_num, remaining)
+    if pf.err != "" is return pf.err end
+    let ae: string = activate_profile(env, pf.path)
+    if ae != "" is return ae end
+    let ge: string = push_generation(env, gdb, gen_num, remaining, "remove " + str::join(names, " "))
+    if ge != "" is return ge end
+
+    ;; wrappery z ~/.hammer/bin
+    let bin_dir: string = compat::path_join(env.hammer_dir, "bin")
+    let mut w: int = 0
+    while w < names.len() is
+        proc::shell("rm -f -- " + shq(compat::path_join(bin_dir, names[w])))
+        w += 1
+    end
+    write("  " + ui::bright_green("✔") + " Removed " + ui::bold(to_string(names.len())) + " package(s) from user profile.")
+    return ""
+end
+
+;; ── list / status / init ─────────────────────────────────────────────────
+
+pub fn cmd_user_list(env: userenv::UserEnv) -> string is
+    write("  " + ui::cyan_bold("⬡") + " User packages at " + env.hammer_dir)
+    if !fs::exists(env.gens_file) is
+        write("  " + ui::dim("·") + " No user packages. Run: " + ui::cyan("hammer init --user"))
+        return ""
+    end
+    let gdb: profile::GenerationsDb = profile::db_load_from(env.gens_file)
+    let go: profile::Generation? = profile::db_current_gen(gdb)
+    if go != nil is
+        let gen: profile::Generation = go
+        write("  Active: gen-" + to_string(gen.number) + " (" + to_string(profile::gen_package_count(gen)) + " packages)")
+        let mut i: int = 0
+        while i < gen.packages.len() is
+            write("    " + ui::dim("·") + " " + ui::bold(gen.packages[i].name) + " " + ui::dim(gen.packages[i].version))
+            i += 1
+        end
+    end
+    return ""
+end
+
+pub fn cmd_user_status(env: userenv::UserEnv) -> string is
+    write("  " + ui::bold("User hammer environment"))
+    write("  " + ui::bold(fmt::pad_right("Location:", 26)) + " " + env.hammer_dir)
+    let active: bool = sh_ok("[ -e " + shq(env.active_link) + " ] || [ -L " + shq(env.active_link) + " ]")
+    let active_str: string = if active then ui::bright_green("yes") else ui::yellow("no — run hammer init --user")
+    write("  " + ui::bold(fmt::pad_right("Initialised:", 26)) + " " + active_str)
+    return ""
+end
+
+pub fn cmd_user_shell_init(env: userenv::UserEnv) -> string is
+    let rr: userenv::RcResult = userenv::install_shell_rc(env)
+    if rr.err != "" is return rr.err end
+    if rr.modified.len() == 0 is
+        write("  " + ui::dim("·") + " Shell integration already installed.")
+    else is
+        let mut i: int = 0
+        while i < rr.modified.len() is
+            write("       " + ui::dim(rr.modified[i]))
+            i += 1
+        end
+    end
+    return ""
+end
