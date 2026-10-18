@@ -1,0 +1,684 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+use "std -> fmt"     from "fmt"
+
+mod internal
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+;; [mod db pominiete: source-code/pkg/db.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania db::fn dzialaja bez zmian]
+;; [mod profile pominiete: source-code/system/profile.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania profile::fn dzialaja bez zmian]
+;; [mod cache pominiete: source-code/pkg/cache.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania cache::fn dzialaja bez zmian]
+;; [mod solver pominiete: source-code/pkg/solver/mod.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania solver::fn dzialaja bez zmian]
+;; [mod store pominiete: source-code/pkg/store.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania store::fn dzialaja bez zmian]
+mod ui
+
+;; hammer -> ui::json_output
+;;
+;; Port of source-code/ui/json_output.rs (Rust) to H#: koperta JSON
+;; (`--json`) i komendy search/list/status/history.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. BRAK serde. Dane buduje sie jako ZWARTY JSON (`jstr`, `jint`, `jobj`,
+;;    `jarr`…), a `pretty()` formatuje go dokladnie jak
+;;    `serde_json::to_string_pretty` (2 spacje, `"k": v`, puste `[]`/`{}`
+;;    w jednej linii). Kolejnosc pol = kolejnosc deklaracji struktur w Rust.
+;;    Wypisywanie robi tablica kawalkow + jedno `join` (nie `s = s + c` po
+;;    znaku — przy liscie ~60 tys. pakietow byloby to O(n^2)).
+;; 2. Typy `JsonPackage`, `JsonStatus`… sa funkcjami budujacymi tekst
+;;    (`package_to_json` itd.); nie ma ich jako struktur (Deserialize nie
+;;    jest nigdzie uzywane w hammerze).
+;; 3. `JsonResponse<T>` -> `json_ok(command, data)` / `json_err(command, msg)`;
+;;    `skip_serializing_if = "Option::is_none"` zachowane (brak pola
+;;    `error`/`data` zamiast `null`).
+;; 4. `anyhow::Result<()>` -> `string` ("" = OK).
+;; 5. `TransactionPlan.upgrade_from: HashMap` -> rownolegle tablice
+;;    (`solver::plan_upgrade_from`).
+;; 6. `{:<28}` -> `fmt::pad_right` na tekscie BEZ kolorow (Rust `{:<N}` na
+;;    wartosci opakowanej w `owo_colors` dopelnia po wypisaniu kodow ANSI,
+;;    wiec szerokosc kolumn w Rust jest o dlugosc kodow mniejsza; tu kolumny
+;;    sa rowne — swiadoma poprawka kosmetyczna).
+;; 7. ZACHOWANE: `-nN` w `history` rozpoznaje tylko forme zlepiona (`-n20`);
+;;    `-n 20` daje domyslne 20 (jak `a[2..].trim().parse()` w Rust).
+;; 8. `is_etc_immutable` / `grub_status_summary`: `MetadataExt::dev` ->
+;;    `stat -c %d`; `which grub-mkconfig` -> `proc::which`.
+;; 9. `print_search_json` / `print_package_json`: pola jak w `serde_json::json!`
+;;    (kolejnosc ALFABETYCZNA kluczy — domyslna mapa serde_json bez
+;;    `preserve_order` sortuje klucze!), a nie jak w literale.
+;;    To ta sama zasada co przy `diff.h#`.
+
+pub fn schema_version() -> string is return "1" end
+
+;; ── Budowanie zwartego JSON-a ────────────────────────────────────────────
+
+pub fn jstr(s: string) -> string is
+    return "\"" + jsonlite::escape(s) + "\""
+end
+
+pub fn jstr_opt(s: string?) -> string is
+    if s == nil is return "null" end
+    let v: string = s
+    return jstr(v)
+end
+
+pub fn jint(n: int) -> string is return to_string(n) end
+
+pub fn jint_opt(n: int?) -> string is
+    if n == nil is return "null" end
+    let v: int = n
+    return to_string(v)
+end
+
+pub fn jbool(b: bool) -> string is
+    if b is return "true" end
+    return "false"
+end
+
+;; `"klucz":wartosc` (wartosc juz jako JSON).
+pub fn jfield(k: string, v: string) -> string is
+    return jstr(k) + ":" + v
+end
+
+pub fn jobj(fields: [string]) -> string is
+    return "{" + str::join(fields, ",") + "}"
+end
+
+pub fn jarr(items: [string]) -> string is
+    return "[" + str::join(items, ",") + "]"
+end
+
+pub fn jstr_arr(items: [string]) -> string is
+    let mut q: [string] = []
+    let mut i: int = 0
+    while i < items.len() is
+        q.push(jstr(items[i]))
+        i += 1
+    end
+    return jarr(q)
+end
+
+fn pad_n(n: int) -> string is
+    return str::repeat("  ", n)
+end
+
+;; Zwarty JSON -> uklad `serde_json::to_string_pretty`.
+pub fn pretty(s: string) -> string is
+    let n: int = string_len(s)
+    let mut parts: [string] = []
+    let mut i: int = 0
+    let mut run: int = 0
+    let mut indent: int = 0
+    let mut in_str: bool = false
+    while i < n is
+        let c: string = string_at(s, i)
+        if in_str is
+            if c == "\\" is
+                i += 2
+            else is
+                if c == "\"" is in_str = false end
+                i += 1
+            end
+        else is
+            if c == "\"" is
+                in_str = true
+                i += 1
+            elsif c == "{" || c == "[" is
+                if i > run is parts.push(str::slice(s, run, i)) end
+                let closer: string = if c == "{" then "}" else "]"
+                if i + 1 < n && string_at(s, i + 1) == closer is
+                    parts.push(c + closer)
+                    i += 2
+                else is
+                    indent += 1
+                    parts.push(c + "\n" + pad_n(indent))
+                    i += 1
+                end
+                run = i
+            elsif c == "}" || c == "]" is
+                if i > run is parts.push(str::slice(s, run, i)) end
+                indent -= 1
+                parts.push("\n" + pad_n(indent) + c)
+                i += 1
+                run = i
+            elsif c == "," is
+                if i > run is parts.push(str::slice(s, run, i)) end
+                parts.push(",\n" + pad_n(indent))
+                i += 1
+                run = i
+            elsif c == ":" is
+                if i > run is parts.push(str::slice(s, run, i)) end
+                parts.push(": ")
+                i += 1
+                run = i
+            else is
+                i += 1
+            end
+        end
+    end
+    if n > run is parts.push(str::slice(s, run, n)) end
+    return str::join(parts, "")
+end
+
+;; ── Koperta ──────────────────────────────────────────────────────────────
+
+pub fn json_ok(command: string, data: string) -> string is
+    return jobj([jfield("schema_version", jstr(schema_version())), jfield("command", jstr(command)),
+        jfield("ok", "true"), jfield("data", data)])
+end
+
+pub fn json_err(command: string, msg: string) -> string is
+    return jobj([jfield("schema_version", jstr(schema_version())), jfield("command", jstr(command)),
+        jfield("ok", "false"), jfield("error", jstr(msg))])
+end
+
+pub fn is_json_mode(args: [string]) -> bool is
+    let mut i: int = 0
+    while i < args.len() is
+        if args[i] == "--json" is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn print_json(command: string, data: string) is
+    write(pretty(json_ok(command, data)))
+end
+
+pub fn print_json_error(command: string, err: string) is
+    write(pretty(json_err(command, err)))
+end
+
+;; ── Konwersje ────────────────────────────────────────────────────────────
+
+pub fn package_to_json(pkg: package::Package, installed: bool, inst_ver: string?) -> string is
+    return jobj([
+        jfield("name", jstr(pkg.name)),
+        jfield("version", jstr(pkg.version)),
+        jfield("architecture", jstr(pkg.architecture)),
+        jfield("installed", jbool(installed)),
+        jfield("installed_ver", jstr_opt(inst_ver)),
+        jfield("size_bytes", jint_opt(pkg.download_size)),
+        jfield("section", jstr_opt(pkg.section)),
+        jfield("description", jstr_opt(pkg.description_short)),
+        jfield("repo", jstr_opt(pkg.repo_base_uri))])
+end
+
+pub fn plan_to_json(plan: solver::TransactionPlan) -> string is
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let mut inst: [string] = []
+    let mut i: int = 0
+    while i < plan.to_install.len() is
+        let p: package::Package = plan.to_install[i]
+        let io: db::InstalledPackage? = idb.get(p.name)
+        if io != nil is
+            let ip: db::InstalledPackage = io
+            inst.push(package_to_json(p, true, ip.version))
+        else is
+            inst.push(package_to_json(p, false, nil))
+        end
+        i += 1
+    end
+
+    let mut upg: [string] = []
+    let mut u: int = 0
+    while u < plan.to_upgrade.len() is
+        let p: package::Package = plan.to_upgrade[u]
+        let old: string? = solver::plan_upgrade_from(plan, p.name)
+        let old_v: string = if old == nil then "" else old
+        upg.push(jobj([
+            jfield("name", jstr(p.name)),
+            jfield("old_version", jstr(old_v)),
+            jfield("new_version", jstr(p.version)),
+            jfield("size_bytes", jint_opt(p.download_size))]))
+        u += 1
+    end
+
+    return jobj([
+        jfield("to_install", jarr(inst)),
+        jfield("to_upgrade", jarr(upg)),
+        jfield("to_remove", jstr_arr(plan.to_remove)),
+        jfield("to_autoremove", jstr_arr(plan.to_autoremove)),
+        jfield("download_bytes", jint(plan.download_bytes)),
+        jfield("install_bytes", jint(plan.install_bytes)),
+        jfield("freed_bytes", jint(plan.freed_bytes)),
+        jfield("warnings", jstr_arr(plan.warnings)),
+        jfield("conflicts", jstr_arr(plan.conflicts))])
+end
+
+pub fn history_to_json(entries: [db::HistoryEntry]) -> string is
+    let mut items: [string] = []
+    let mut i: int = 0
+    while i < entries.len() is
+        let e: db::HistoryEntry = entries[i]
+        items.push(jobj([
+            jfield("id", jint(e.id)),
+            jfield("action", jstr(e.action)),
+            jfield("package", jstr(e.package)),
+            jfield("old_ver", jstr_opt(e.old_ver)),
+            jfield("new_ver", jstr_opt(e.new_ver)),
+            jfield("generation", jint(e.generation)),
+            jfield("timestamp", jstr(e.timestamp))]))
+        i += 1
+    end
+    return jarr(items)
+end
+
+pub fn generations_to_json(gdb: profile::GenerationsDb) -> string is
+    let mut items: [string] = []
+    let mut i: int = 0
+    while i < gdb.generations.len() is
+        let g: profile::Generation = gdb.generations[i]
+        let is_pending: bool = gdb.pending != nil && gdb.pending == g.number
+        items.push(jobj([
+            jfield("number", jint(g.number)),
+            jfield("timestamp", jstr(g.timestamp)),
+            jfield("packages", jint(g.packages.len())),
+            jfield("note", jstr_opt(g.note)),
+            jfield("active", jbool(g.number == gdb.current)),
+            jfield("pending", jbool(is_pending))]))
+        i += 1
+    end
+    return jarr(items)
+end
+
+;; ── Pomocnicze ───────────────────────────────────────────────────────────
+
+fn take_chars(s: string, n: int) -> string is
+    if string_len(s) <= n is return s end
+    return str::slice(s, 0, n)
+end
+
+fn count_entries(dir: string) -> int is
+    if !fs::is_dir(dir) is return 0 end
+    return fs::list_dir(dir).len()
+end
+
+fn first_nonflag(args: [string], prefix: string) -> string? is
+    let mut i: int = 0
+    while i < args.len() is
+        if str::slice(args[i], 0, string_len(prefix)) != prefix is return args[i] end
+        i += 1
+    end
+    return nil
+end
+
+fn has_arg(args: [string], a: string) -> bool is
+    let mut i: int = 0
+    while i < args.len() is
+        if args[i] == a is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ── hammer search <query> [--json] ───────────────────────────────────────
+
+pub fn cmd_search(args: [string]) -> string is
+    let qo: string? = first_nonflag(args, "--")
+    if qo == nil is return "Usage: hammer search <query> [--json]" end
+    let query: string = qo
+
+    let c: cache::PackageCache = cache::cache_load()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let results: [package::Package] = cache::cache_search(c, query)
+
+    if is_json_mode(args) is
+        let mut items: [string] = []
+        let mut i: int = 0
+        while i < results.len() is
+            let p: package::Package = results[i]
+            let io: db::InstalledPackage? = idb.get(p.name)
+            if io != nil is
+                let ip: db::InstalledPackage = io
+                items.push(package_to_json(p, true, ip.version))
+            else is
+                items.push(package_to_json(p, false, nil))
+            end
+            i += 1
+        end
+        print_json("search", jobj([
+            jfield("packages", jarr(items)),
+            jfield("total", jint(items.len())),
+            jfield("query", jstr(query))]))
+        return ""
+    end
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Search results for '" + ui::bold(query) + "'")
+    write("  " + ui::dim(str::repeat("─", 60)))
+    if results.len() == 0 is
+        write("  " + ui::dim("·") + " No packages found.")
+    end
+    let mut k: int = 0
+    while k < results.len() && k < 50 is
+        let p: package::Package = results[k]
+        let mark: string = if idb.is_installed(p.name) then ui::bright_green("●") else ui::dim("○")
+        let desc: string = if p.description_short == nil then "" else p.description_short
+        write("  " + mark + " " + ui::bold(fmt::pad_right(p.name, 28)) + " " + ui::cyan(fmt::pad_right(p.version, 12)) + " " + ui::dim(desc))
+        k += 1
+    end
+    if results.len() > 50 is
+        write("  … " + to_string(results.len() - 50) + " more results. Refine your query.")
+    end
+    return ""
+end
+
+;; ── hammer list [--installed] [--upgrades] [--json] ──────────────────────
+
+pub struct ListRow is
+    pub name:          string
+    pub version:       string
+    pub installed:     bool
+    pub installed_ver: string?
+    pub json:          string
+end
+
+fn list_row(p: package::Package, installed: bool, inst_ver: string?) -> ListRow is
+    return ListRow { name: p.name, version: p.version, installed: installed,
+        installed_ver: inst_ver, json: package_to_json(p, installed, inst_ver) }
+end
+
+pub fn cmd_list(args: [string]) -> string is
+    let installed_only: bool = has_arg(args, "--installed")
+    let upgrades_only: bool = has_arg(args, "--upgrades")
+
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+    let mut rows: [ListRow] = []
+
+    if upgrades_only is
+        let all: [db::InstalledPackage] = idb.list_all()
+        let mut i: int = 0
+        while i < all.len() is
+            let inst: db::InstalledPackage = all[i]
+            let av: package::Package? = cache::cache_get(c, inst.name)
+            if av != nil is
+                let avail: package::Package = av
+                if package::version_cmp(avail.version, inst.version) > 0 is
+                    rows.push(list_row(avail, true, inst.version))
+                end
+            end
+            i += 1
+        end
+    elsif installed_only is
+        let all: [db::InstalledPackage] = idb.list_all()
+        let mut i: int = 0
+        while i < all.len() is
+            let inst: db::InstalledPackage = all[i]
+            let co: package::Package? = cache::cache_get(c, inst.name)
+            let mut pkg: package::Package = package::empty_package()
+            if co != nil is
+                pkg = co
+            else is
+                pkg.name = inst.name
+                pkg.version = inst.version
+                pkg.architecture = inst.architecture
+            end
+            rows.push(list_row(pkg, true, inst.version))
+            i += 1
+        end
+    else is
+        let pkgs: [package::Package] = cache::cache_all_packages(c)
+        let mut i: int = 0
+        while i < pkgs.len() is
+            let p: package::Package = pkgs[i]
+            let io: db::InstalledPackage? = idb.get(p.name)
+            if io != nil is
+                let ip: db::InstalledPackage = io
+                rows.push(list_row(p, true, ip.version))
+            else is
+                rows.push(list_row(p, false, nil))
+            end
+            i += 1
+        end
+    end
+
+    if is_json_mode(args) is
+        let mut items: [string] = []
+        let mut j: int = 0
+        while j < rows.len() is
+            items.push(rows[j].json)
+            j += 1
+        end
+        print_json("list", jarr(items))
+        return ""
+    end
+
+    write("")
+    let title: string = if upgrades_only then "Available upgrades" elsif installed_only then "Installed packages" else "All packages"
+    write("  " + ui::accent_bold("⬡") + "  " + title)
+    write("  " + ui::dim(str::repeat("─", 60)))
+
+    let mut k: int = 0
+    while k < rows.len() && k < 200 is
+        let r: ListRow = rows[k]
+        let mark: string = if r.installed then ui::bright_green("✔") else ui::dim("○")
+        let mut ver_str: string = r.version
+        if upgrades_only && r.installed_ver != nil is
+            let iv: string = r.installed_ver
+            ver_str = ui::dim(iv) + " → " + ui::cyan(r.version)
+        end
+        write("  " + mark + " " + ui::bold(fmt::pad_right(r.name, 28)) + " " + ver_str)
+        k += 1
+    end
+    if rows.len() > 200 is
+        write("  … " + to_string(rows.len() - 200) + " more. Use --json for full output.")
+    end
+    if rows.len() == 0 is
+        write("  " + ui::dim("·") + " Nothing to show.")
+    end
+    return ""
+end
+
+;; ── Pomocnicze dla status ────────────────────────────────────────────────
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn dev_of(p: string) -> string is
+    return str::trim(proc::shell("stat -c %d " + shq(p) + " 2>/dev/null"))
+end
+
+;; /etc ma inne `st_dev` niz / (bind-mount/overlay).
+fn is_etc_immutable() -> bool is
+    let r: string = dev_of("/")
+    let e: string = dev_of("/etc")
+    if r == "" || e == "" is return false end
+    return r != e
+end
+
+fn grub_status_summary() -> string is
+    let candidates: [string] = ["/etc/grub.d/09_hammer", "/boot/grub/hammer.cfg", "/boot/grub2/hammer.cfg"]
+    let mut i: int = 0
+    while i < candidates.len() is
+        if fs::exists(candidates[i]) && fs::size(candidates[i]) > 0 is
+            return "configured (" + candidates[i] + ")"
+        end
+        i += 1
+    end
+    if proc::which("grub-mkconfig") != "" is return "not configured" end
+    return "unknown"
+end
+
+;; ── hammer status [--json] ───────────────────────────────────────────────
+
+pub fn cmd_status(args: [string]) -> string is
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let all: [db::InstalledPackage] = idb.list_all()
+    let total: int = all.len()
+    let mut user: int = 0
+    let mut i: int = 0
+    while i < total is
+        if db::reason_to_str(all[i].reason) == "user" is user += 1 end
+        i += 1
+    end
+    let dep: int = total - user
+
+    let loaded: profile::LoadResult = profile::db_load()
+    let gdb: profile::GenerationsDb = if loaded.err == "" then loaded.db else profile::db_empty()
+    let store_entries: int = count_entries(build_mode::store_dir())
+    let immutable: bool = is_etc_immutable()
+    let grub_status: string = grub_status_summary()
+    let active_bins: int = count_entries("/usr/local/bin")
+
+    if is_json_mode(args) is
+        print_json("status", jobj([
+            jfield("installed_packages", jint(total)),
+            jfield("user_packages", jint(user)),
+            jfield("dep_packages", jint(dep)),
+            jfield("current_gen", jint(gdb.current)),
+            jfield("pending_gen", jint_opt(gdb.pending)),
+            jfield("total_gens", jint(gdb.generations.len())),
+            jfield("active_bins", jint(active_bins)),
+            jfield("store_entries", jint(store_entries)),
+            jfield("immutable_enabled", jbool(immutable)),
+            jfield("grub_status", jstr(grub_status))]))
+        return ""
+    end
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  hammer status")
+    write("  " + ui::dim(str::repeat("─", 50)))
+    write("  " + ui::bold(fmt::pad_right("Installed packages:", 24)) + " " + ui::cyan(to_string(total)))
+    write("  " + ui::bold(fmt::pad_right("  breakdown:", 24)) + " " + ui::dim("") + " (" + to_string(user) + " user, " + to_string(dep) + " deps)")
+    write("  " + ui::bold(fmt::pad_right("Current generation:", 24)) + " gen-" + ui::bright_green(to_string(gdb.current)))
+    if gdb.pending != nil is
+        let p: int = gdb.pending
+        write("  " + ui::bold(fmt::pad_right("Pending generation:", 24)) + " gen-" + ui::yellow(to_string(p)) + " " + ui::dim("(reboot to activate)"))
+    end
+    write("  " + ui::bold(fmt::pad_right("Total generations:", 24)) + " " + to_string(gdb.generations.len()))
+    write("  " + ui::bold(fmt::pad_right("Store entries:", 24)) + " " + ui::cyan(to_string(store_entries)))
+    write("  " + ui::bold(fmt::pad_right("Immutable /etc:", 24)) + " " + (if immutable then ui::bright_green("enabled") else ui::dim("disabled")))
+    write("  " + ui::bold(fmt::pad_right("GRUB:", 24)) + " " + ui::dim(grub_status))
+    write("")
+    return ""
+end
+
+;; ── hammer history [-nN] [--json] ────────────────────────────────────────
+
+pub fn cmd_history(args: [string]) -> string is
+    let mut limit: int = 20
+    let mut i: int = 0
+    while i < args.len() is
+        if str::slice(args[i], 0, 2) == "-n" is
+            ;; patrz odejscie 7: tylko forma zlepiona (-n20); pierwszy `-n*` rozstrzyga
+            let rest: string = str::trim(str::slice(args[i], 2, string_len(args[i])))
+            if str::is_numeric(rest) is limit = conv::str_to_int(rest) end
+            i = args.len()
+        else is
+            i += 1
+        end
+    end
+
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let entries: [db::HistoryEntry] = idb.history(limit)
+
+    if is_json_mode(args) is
+        print_json("history", history_to_json(entries))
+        return ""
+    end
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Transaction history")
+    write("  " + ui::dim(str::repeat("─", 70)))
+    write("  " + ui::bold(fmt::pad_right("Gen", 6)) + " " + ui::bold(fmt::pad_right("Timestamp", 22)) + " " + ui::bold(fmt::pad_right("Action", 10)) + " " + ui::bold(fmt::pad_right("Package", 28)) + " " + ui::bold("Version"))
+    write("  " + ui::dim(str::repeat("─", 70)))
+
+    let mut k: int = 0
+    while k < entries.len() is
+        let e: db::HistoryEntry = entries[k]
+        let ts: string = take_chars(e.timestamp, 19)
+        let mut action_col: string = ui::cyan(fmt::pad_right(e.action, 10))
+        if e.action == "install" is action_col = ui::bright_green(fmt::pad_right(e.action, 10)) end
+        if e.action == "remove" is action_col = ui::red(fmt::pad_right(e.action, 10)) end
+        if e.action == "upgrade" is action_col = ui::yellow(fmt::pad_right(e.action, 10)) end
+        let mut ver: string = ""
+        if e.new_ver != nil is
+            let n: string = e.new_ver
+            ver = ui::cyan(n)
+            if e.old_ver != nil is
+                let o: string = e.old_ver
+                if o != n is ver = ui::dim(o) + " → " + ui::cyan(n) end
+            end
+        elsif e.old_ver != nil is
+            let o2: string = e.old_ver
+            ver = ui::dim(o2)
+        end
+        write("  gen-" + fmt::pad_right(to_string(e.generation), 3) + " " + ui::dim(fmt::pad_right(ts, 22)) + " " + action_col + " " + ui::bold(fmt::pad_right(e.package, 28)) + " " + ver)
+        k += 1
+    end
+    if entries.len() == 0 is
+        write("  " + ui::dim("·") + " No history recorded yet.")
+    end
+    write("")
+    return ""
+end
+
+;; ── Pojedyncze wypisywanie JSON ──────────────────────────────────────────
+
+;; Klucze w kolejnosci alfabetycznej (patrz odejscie 9).
+pub fn print_search_json(pkgs: [package::Package], idb: db::InstalledDb) is
+    let mut items: [string] = []
+    let mut i: int = 0
+    while i < pkgs.len() is
+        let p: package::Package = pkgs[i]
+        items.push(jobj([
+            jfield("architecture", jstr(p.architecture)),
+            jfield("installed", jbool(idb.is_installed(p.name))),
+            jfield("name", jstr(p.name)),
+            jfield("section", jstr_opt(p.section)),
+            jfield("summary", jstr_opt(p.description_short)),
+            jfield("version", jstr(p.version))]))
+        i += 1
+    end
+    write(pretty(jarr(items)))
+end
+
+pub fn print_package_json(pkg: package::Package, inst: db::InstalledPackage?) is
+    let desc: string? = if pkg.description_long != nil then pkg.description_long else pkg.description_short
+    let mut iv: string? = nil
+    let mut ia: string? = nil
+    if inst != nil is
+        let ip: db::InstalledPackage = inst
+        iv = ip.version
+        ia = ip.installed_at
+    end
+    write(pretty(jobj([
+        jfield("architecture", jstr(pkg.architecture)),
+        jfield("depends", jstr_opt(pkg.depends)),
+        jfield("description", jstr_opt(desc)),
+        jfield("homepage", jstr_opt(pkg.homepage)),
+        jfield("installed", jbool(inst != nil)),
+        jfield("installed_at", jstr_opt(ia)),
+        jfield("installed_version", jstr_opt(iv)),
+        jfield("maintainer", jstr_opt(pkg.maintainer)),
+        jfield("name", jstr(pkg.name)),
+        jfield("recommends", jstr_opt(pkg.recommends)),
+        jfield("section", jstr_opt(pkg.section)),
+        jfield("suggests", jstr_opt(pkg.suggests)),
+        jfield("version", jstr(pkg.version))])))
+end
+
+;; ── Testy ────────────────────────────────────────────────────────────────
+
+fn t_json(label: string, got: string, want: string) -> int is
+    if got == want is return 0 end
+    write("json_output::self_test FAIL: " + label + "\n--- got ---\n" + got + "\n--- want ---\n" + want)
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow. Wzorzec: `serde_json::to_string_pretty`.
+pub fn self_test() -> int is
+    let mut f: int = 0
+    f += t_json("empty obj", pretty("{{}}"), "{{}}")
+    f += t_json("empty arr", pretty("[]"), "[]")
+    f += t_json("scalar fields", pretty("{{\"a\":1,\"b\":\"x\"}}"), "{{\n  \"a\": 1,\n  \"b\": \"x\"\n}}")
+    f += t_json("nested", pretty("{{\"l\":[1,2],\"o\":{{\"k\":true}},\"e\":[]}}"),
+        "{{\n  \"l\": [\n    1,\n    2\n  ],\n  \"o\": {{\n    \"k\": true\n  }},\n  \"e\": []\n}}")
+    f += t_json("string with delimiters", pretty("{{\"s\":\"a,b:{{c}}[d]\"}}"), "{{\n  \"s\": \"a,b:{{c}}[d]\"\n}}")
+    f += t_json("escaped quote", pretty("{{\"s\":\"q\\\"x\"}}"), "{{\n  \"s\": \"q\\\"x\"\n}}")
+    f += t_json("builders", jobj([jfield("n", jint(3)), jfield("o", jstr_opt(nil)), jfield("b", jbool(false))]), "{{\"n\":3,\"o\":null,\"b\":false}}")
+    f += t_json("escape control", jstr("a\nb\tc"), "\"a\\nb\\tc\"")
+    return f
+end
