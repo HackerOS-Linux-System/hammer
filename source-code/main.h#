@@ -1,0 +1,21 @@
+use "std -> env" from "env"
+
+mod internal
+mod cli
+mod hammerd
+mod pkg
+mod repo
+mod system
+mod tools
+mod ui
+mod oci
+mod userenv
+
+fn main() is
+    log::session_start()
+    let err: string = cli_main::run(env::args())
+    if err != "" is
+        ui::fatal(err)
+        exit(1)
+    end
+end
