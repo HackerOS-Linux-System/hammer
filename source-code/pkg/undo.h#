@@ -1,0 +1,381 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod ui
+mod db
+;; [mod profile pominiete: source-code/system/profile.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania profile::fn dzialaja bez zmian]
+
+;; hammer -> pkg::undo
+;;
+;; Port of source-code/pkg/undo.rs (Rust) to H#: `hammer undo [--to <N>] [-y]`
+;; i alias `hammer rollback`.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `anyhow::Result<()>` -> `string`: "" = Ok, niepusty tekst = blad
+;;    (konwencja jak w `build_mode.h#`). Wolajacy wypisuje blad i konczy
+;;    proces kodem != 0.
+;; 2. `GenerationsDb::load()?` -> `profile::db_load()` (`LoadResult`).
+;; 3. `timestamp.format("%Y-%m-%d %H:%M")` -> `ui::format_ts` (timestamp to
+;;    juz tekst RFC3339).
+;; 4. `HashSet::difference` -> petle po tablicach; wyniki sortowane jak w
+;;    Rust (`sort()` na `&str` = porzadek bajtowy; tu porownanie `<`).
+;; 5. Hash conffile: `Sha256::digest(bytes)` -> `sha256sum` powloki, zeby
+;;    nie przepuszczac binarnych plikow przez `string` (patrz uwaga o
+;;    conffiles w PORT_STATUS.md). Plik nieczytelny = "nie zmodyfikowany".
+;; 6. `ui::confirm(..)?` -> `ui::confirm(..)` (bool).
+;; 7. ZACHOWANE ZACHOWANIE ORYGINALU: `is_conffile_modified` (lista przed
+;;    potwierdzeniem) sprawdza tylko ISTNIENIE pliku, a nie zmiane tresci
+;;    — w liscie znacznik `M` pojawia sie wiec przy kazdym istniejacym
+;;    pliku. Prawdziwa weryfikacja (`is_conffile_user_modified`) dziala
+;;    dopiero przy czyszczeniu.
+;; 8. ZACHOWANE: sciezki `/hammer/db/conffiles` sa na stale (Rust tez nie
+;;    uzywa `build_mode`); w normal-mode ten katalog nie istnieje i undo
+;;    po prostu nic nie czysci.
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn conffiles_dir() -> string is return "/hammer/db/conffiles" end
+
+;; `path.replace('/', "_").trim_start_matches('_')`.
+fn path_key(p: string) -> string is
+    let s: string = str::replace_all(p, "/", "_")
+    let mut a: int = 0
+    let n: int = string_len(s)
+    while a < n && string_at(s, a) == "_" is
+        a += 1
+    end
+    return str::slice(s, a, n)
+end
+
+fn sorted_copy(xs: [string]) -> [string] is
+    let mut a: [string] = xs
+    let mut i: int = 1
+    while i < a.len() is
+        let cur: string = a[i]
+        let mut j: int = i - 1
+        while j >= 0 && a[j] > cur is
+            a[j + 1] = a[j]
+            j -= 1
+        end
+        a[j + 1] = cur
+        i += 1
+    end
+    return a
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+fn names_of(g: profile::Generation) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < g.packages.len() is
+        out.push(g.packages[i].name)
+        i += 1
+    end
+    return out
+end
+
+;; Niepuste, przyciete linie pliku (Rust: `content.lines()` + `trim`).
+fn nonempty_lines(content: string) -> [string] is
+    let mut out: [string] = []
+    let lines: [string] = str::split(content, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let l: string = str::trim(lines[i])
+        if l != "" is out.push(l) end
+        i += 1
+    end
+    return out
+end
+
+;; Lista conffiles zapisana dla pakietu; pusta gdy brak pliku.
+fn conffile_list(pkg: string) -> [string] is
+    let list_path: string = compat::path_join(compat::path_join(conffiles_dir(), pkg), "list")
+    if !fs::exists(list_path) is
+        let none: [string] = []
+        return none
+    end
+    return nonempty_lines(fs::read(list_path))
+end
+
+fn collect_conffiles_for_packages(pkgs: [string]) -> [string] is
+    let mut result: [string] = []
+    let mut i: int = 0
+    while i < pkgs.len() is
+        let l: [string] = conffile_list(pkgs[i])
+        let mut j: int = 0
+        while j < l.len() is
+            result.push(l[j])
+            j += 1
+        end
+        i += 1
+    end
+    return result
+end
+
+;; Rust: tylko `Path::exists` (patrz odejscie 7).
+fn is_conffile_modified(p: string) -> bool is
+    return fs::exists(p)
+end
+
+fn file_sha256(p: string) -> string is
+    let out: string = str::trim(proc::shell("sha256sum -- " + shq(p) + " 2>/dev/null"))
+    if out == "" is return "" end
+    return str::slice(out, 0, compat::str_index_of(out, " "))
+end
+
+fn is_conffile_user_modified(pkg: string, p: string) -> bool is
+    let orig_path: string = compat::path_join(compat::path_join(compat::path_join(conffiles_dir(), pkg), "orig"), path_key(p))
+    if !fs::exists(orig_path) || !fs::exists(p) is return false end
+    let a: string = file_sha256(orig_path)
+    let b: string = file_sha256(p)
+    if a == "" || b == "" is return false end
+    return a != b
+end
+
+;; Zwraca liczbe usunietych conffiles.
+fn clean_postinst_conffiles(pkg: string) -> int is
+    let list_path: string = compat::path_join(compat::path_join(conffiles_dir(), pkg), "list")
+    if !fs::exists(list_path) is return 0 end
+    let files: [string] = nonempty_lines(fs::read(list_path))
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < files.len() is
+        let target: string = files[i]
+        if fs::exists(target) is
+            if is_conffile_user_modified(pkg, target) is
+                let backup_dir: string = compat::path_join("/hammer/db/conffiles-backup", pkg)
+                proc::shell("mkdir -p -- " + shq(backup_dir))
+                let backup_path: string = compat::path_join(backup_dir, path_key(target))
+                let rc: string = str::trim(proc::shell("cp -- " + shq(target) + " " + shq(backup_path) + " 2>/dev/null && echo ok"))
+                if rc == "ok" is
+                    log::info("undo: backup zmodyfikowanego conffile " + target + " → " + backup_path)
+                end
+            end
+            let rm: string = str::trim(proc::shell("rm -f -- " + shq(target) + " 2>/dev/null && echo ok"))
+            if rm == "ok" is
+                log::info("undo: usunięto conffile " + target)
+                count += 1
+                ;; Rust: `remove_dir(parent)` — tylko pusty katalog.
+                proc::shell("rmdir -- " + shq(compat::path_parent(target)) + " 2>/dev/null")
+            end
+        end
+        i += 1
+    end
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    idb.remove_conffiles_for_package(pkg)
+    return count
+end
+
+;; `--to N` albo `--to gen-N`; -1 gdy brak/niepoprawne (Rust: `Option<u32>`).
+fn parse_explicit_target(args: [string]) -> int is
+    let mut i: int = 0
+    while i + 1 < args.len() is
+        if args[i] == "--to" is
+            let raw: string = args[i + 1]
+            let v: string = if str::slice(raw, 0, 4) == "gen-" then str::slice(raw, 4, string_len(raw)) else raw
+            if str::is_numeric(v) is return conv::str_to_int(v) end
+            return -1
+        end
+        i += 1
+    end
+    return -1
+end
+
+fn has_flag(args: [string], a: string, b: string) -> bool is
+    return contains_str(args, a) || contains_str(args, b)
+end
+
+fn gen_ts(g: profile::Generation) -> string is
+    return ui::format_ts(g.timestamp)
+end
+
+;; hammer undo [--to <N>] [-y/--yes]. Zwraca "" gdy OK, inaczej tresc bledu.
+pub fn cmd_undo(args: [string]) -> string is
+    let yes: bool = has_flag(args, "-y", "--yes")
+    let explicit_target: int = parse_explicit_target(args)
+    let has_explicit: bool = explicit_target >= 0
+
+    let loaded: profile::LoadResult = profile::db_load()
+    if loaded.err != "" is return loaded.err end
+    let gdb: profile::GenerationsDb = loaded.db
+    let current: int = gdb.current
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  hammer undo")
+    write("  " + ui::dim(str::repeat("─", 65)))
+
+    if current == 0 is
+        write("  " + ui::dim("·") + " Nie ma poprzedniej generacji do cofnięcia.")
+        return ""
+    end
+
+    ;; Cel cofniecia
+    let mut target_gen: int = current - 1
+    if has_explicit is
+        if explicit_target >= current is
+            return "Cel cofnięcia gen-" + to_string(explicit_target) + " musi być mniejszy niż aktualna gen-" + to_string(current)
+        end
+        target_gen = explicit_target
+    end
+
+    ;; Walidacja istnienia generacji
+    let cur_o: profile::Generation? = profile::db_get(gdb, current)
+    if cur_o == nil is
+        return "Nie znaleziono aktywnej generacji " + to_string(current)
+    end
+    let current_gen: profile::Generation = cur_o
+    let tgt_o: profile::Generation? = profile::db_get(gdb, target_gen)
+    if tgt_o == nil is
+        let mut available: [string] = []
+        let mut gi: int = 0
+        while gi < gdb.generations.len() is
+            let g: profile::Generation = gdb.generations[gi]
+            available.push("gen-" + to_string(g.number) + " (" + gen_ts(g) + ")")
+            gi += 1
+        end
+        let shown: string = if available.len() == 0 then "brak" else str::join(available, ", ")
+        return "Nie znaleziono generacji " + to_string(target_gen) + ".\nDostępne: " + shown
+    end
+    let target: profile::Generation = tgt_o
+
+    ;; Plan
+    if has_explicit is
+        write("  " + ui::dim("·") + " Cofanie do konkretnej generacji: " + ui::bright_yellow("gen-" + to_string(target_gen)))
+        if target_gen + 1 < current is
+            let mut skipped: [string] = []
+            let mut n: int = target_gen + 1
+            while n < current is
+                skipped.push("gen-" + to_string(n))
+                n += 1
+            end
+            write("  " + ui::yellow_bold("⚠") + " Pomijane generacje: " + ui::dim(str::join(skipped, ", ")))
+        end
+    end
+
+    write("  " + ui::dim("·") + " Aktualna generacja: " + ui::cyan("gen-" + to_string(current)) + "  (" + ui::dim(gen_ts(current_gen)) + ")")
+    write("  " + ui::dim("·") + " Cel cofnięcia:      " + ui::bright_green("gen-" + to_string(target_gen)) + "  (" + ui::dim(gen_ts(target)) + ")")
+    write("")
+
+    ;; Roznica zbiorow pakietow
+    let current_pkgs: [string] = names_of(current_gen)
+    let target_pkgs: [string] = names_of(target)
+    let mut remove_raw: [string] = []
+    let mut restore_raw: [string] = []
+    let mut a: int = 0
+    while a < current_pkgs.len() is
+        if !contains_str(target_pkgs, current_pkgs[a]) && !contains_str(remove_raw, current_pkgs[a]) is
+            remove_raw.push(current_pkgs[a])
+        end
+        a += 1
+    end
+    let mut b: int = 0
+    while b < target_pkgs.len() is
+        if !contains_str(current_pkgs, target_pkgs[b]) && !contains_str(restore_raw, target_pkgs[b]) is
+            restore_raw.push(target_pkgs[b])
+        end
+        b += 1
+    end
+    let will_remove: [string] = sorted_copy(remove_raw)
+    let will_restore: [string] = sorted_copy(restore_raw)
+
+    if will_remove.len() > 0 is
+        write("  " + ui::red("✘") + " Zostaną cofnięte (usunięte z aktywnego profilu):")
+        let mut i: int = 0
+        while i < will_remove.len() is
+            write("    " + ui::dim("·") + " " + ui::red(will_remove[i]))
+            i += 1
+        end
+    end
+    if will_restore.len() > 0 is
+        write("  " + ui::bright_green("✔") + " Zostaną przywrócone:")
+        let mut i: int = 0
+        while i < will_restore.len() is
+            write("    " + ui::dim("·") + " " + ui::cyan(will_restore[i]))
+            i += 1
+        end
+    end
+    if will_remove.len() == 0 && will_restore.len() == 0 is
+        write("  " + ui::dim("·") + " Generacje są identyczne — nic do cofnięcia.")
+        return ""
+    end
+
+    ;; Ostrzezenie o conffiles
+    write("")
+    let conffiles_to_clean: [string] = collect_conffiles_for_packages(will_remove)
+    if conffiles_to_clean.len() > 0 is
+        write("  " + ui::yellow_bold("⚠") + " Pliki konfiguracyjne stworzone przez cofnięte paczki:")
+        let mut i: int = 0
+        while i < conffiles_to_clean.len() is
+            let cf: string = conffiles_to_clean[i]
+            let marker: string = if is_conffile_modified(cf) then ui::yellow("M") else " "
+            write("    " + marker + " " + ui::dim(cf))
+            i += 1
+        end
+        write("  " + ui::dim("·") + " Zmodyfikowane conffiles zostaną " + ui::yellow("przeniesione do .hammer-backup") + " — oryginały zachowane w " + ui::dim("/hammer/db/conffiles/"))
+        write("")
+    end
+
+    if !yes && !ui::confirm("Cofnąć operację?") is
+        write("  Anulowano.")
+        return ""
+    end
+
+    ;; Czyszczenie conffiles
+    let mut cleaned_confs: int = 0
+    let mut r: int = 0
+    while r < will_remove.len() is
+        cleaned_confs += clean_postinst_conffiles(will_remove[r])
+        r += 1
+    end
+    if cleaned_confs > 0 is
+        write("  " + ui::bright_green("✔") + " Wyczyszczono " + to_string(cleaned_confs) + " conffiles postinst.")
+    end
+
+    ;; Aktywacja docelowej generacji
+    write("  " + ui::dim("·") + " Przełączam na gen-" + to_string(target_gen) + "…")
+
+    let reloaded: profile::LoadResult = profile::db_load()
+    if reloaded.err != "" is return reloaded.err end
+    let tg_o: profile::Generation? = profile::db_get(reloaded.db, target_gen)
+    if tg_o == nil is
+        return "Generacja " + to_string(target_gen) + " nie istnieje"
+    end
+    let target_generation: profile::Generation = tg_o
+
+    let serr: string = profile::set_pending(target_generation)
+    if serr != "" is return serr end
+    let outcome: profile::ActivateOutcome = profile::activate_pending()
+    if !outcome.ok is return outcome.err end
+    let result: profile::ActivationResult = outcome.result
+
+    if result.already_active is
+        write("  " + ui::dim("·") + " Generacja " + to_string(target_gen) + " jest już aktywna.")
+    else is
+        write("  " + ui::bright_green("✔") + " Cofnięto do generacji " + ui::cyan("gen-" + to_string(target_gen)) + ".")
+        write("  " + ui::dim("·") + " Zmiany wejdą w życie po restarcie.")
+        if result.scripts_failed.len() > 0 is
+            write("  " + ui::yellow_bold("⚠") + " Ostrzeżenie: postinst nieudane dla: " + str::join(result.scripts_failed, ", "))
+        end
+    end
+
+    write("")
+    return ""
+end
+
+;; hammer rollback (alias dla undo)
+pub fn cmd_rollback(args: [string]) -> string is
+    return cmd_undo(args)
+end
