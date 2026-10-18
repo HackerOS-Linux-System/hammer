@@ -1,0 +1,72 @@
+use "bit -> colors"
+mod internal
+mod cli
+mod hammerd
+mod pkg
+mod ui
+mod repo
+mod system
+mod tools
+
+;; Testy jednostkowe portu uruchamiane W INTERPRETERZE H# (nie kompilowane):
+;;
+;;     h# preview source-code/selftest.h#        (albo: h# run ...)
+;;
+;; Interpreter nie ma wbudowanych map (`map_new`/`map_set`/...), dlatego testy
+;; obejmuja tylko kod bez `std -> collections`: `version`, `provides`
+;; (tylko `strip_arch_suffix`), `sat`, `compat` (sciezki), `sorting`, `json_output`
+;; (`pretty`) i `boot_fallback` (baza + JSON). Reszta jest weryfikowana
+;; typecheckerem (`h# compile`). Wynik 0 = wszystko dobrze.
+
+fn ui_colors_test() -> int is
+    let mut f: int = 0
+    colors::support::set_level(3)
+    if ui::strip_colors(ui::red_bold("błąd")) != "błąd" is f += 1 write("ui: strip_colors FAIL") end
+        ;; UWAGA: liczenie znakow UTF-8 (`colors::util::char_count`) dziala poprawnie
+    ;; tylko pod LLVM — interpreter H# ma inna semantyke `string_slice` (wlasny
+    ;; selftest biblioteki `colors` tez tu pada na "héllo"). Dlatego tylko ASCII.
+    if ui::vis_len(ui::cyan("hello")) != 5 is f += 1 write("ui: vis_len FAIL") end
+    if ui::vis_len(ui::pad_vis(ui::cyan("hello"), 10)) != 10 is f += 1 write("ui: pad_vis FAIL") end
+    if ui::strip_colors(ui::brand()) != "⬡ hammer" is f += 1 write("ui: brand FAIL") end
+    if ui::strip_colors(ui::msg_ok("ok")) != "✔ ok" is f += 1 write("ui: msg_ok FAIL") end
+    colors::support::set_level(0)
+    if ui::red("x") != "x" || ui::c("1", "x") != "x" is f += 1 write("ui: NO_COLOR/level 0 FAIL") end
+    colors::support::auto()
+    return f
+end
+
+fn main() is
+    let v: int = version::self_test()
+    write("version::self_test failures = " + to_string(v))
+    let p: int = provides::self_test()
+    write("provides::self_test failures = " + to_string(p))
+    let s: int = sat::self_test()
+    write("sat::self_test failures = " + to_string(s))
+    let c: int = compat::self_test()
+    write("compat::self_test failures = " + to_string(c))
+    let so: int = sorting::self_test()
+    write("sorting::self_test failures = " + to_string(so))
+    let j: int = json_output::self_test()
+    write("json_output::self_test failures = " + to_string(j))
+    let b: int = boot_fallback::self_test()
+    write("boot_fallback::self_test failures = " + to_string(b))
+    let uc: int = ui_colors_test()
+    write("ui colors failures = " + to_string(uc))
+    let st: int = tests::sat_tests(false, false)
+    write("tests::sat_tests failures = " + to_string(st))
+    let u: int = selfupdate::self_test()
+    write("selfupdate::self_test failures = " + to_string(u))
+    let ct: int = cli_types::self_test()
+    write("cli_types::self_test failures = " + to_string(ct))
+    let hk: int = hk_tools::self_test()
+    write("hk_tools::self_test failures = " + to_string(hk))
+    let bd: int = build_dep::self_test()
+    write("build_dep::self_test failures = " + to_string(bd))
+    let hc: int = hd_config::self_test()
+    write("hd_config::self_test failures = " + to_string(hc))
+    let hs: int = hd_state::self_test()
+    write("hd_state::self_test failures = " + to_string(hs))
+    let hdn: int = hd_daemon::self_test()
+    write("hd_daemon::self_test failures = " + to_string(hdn))
+    write("TOTAL FAILURES = " + to_string(v + p + s + uc + st + c + so + j + b + u + ct + hk + bd + hc + hs + hdn))
+end
