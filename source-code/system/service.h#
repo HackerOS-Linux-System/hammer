@@ -1,0 +1,381 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> fmt"     from "fmt"
+
+mod internal
+mod ui
+;; [mod db pominiete: source-code/pkg/db.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania db::fn dzialaja bez zmian]
+
+;; hammer -> system::service
+;;
+;; Port of source-code/system/service.rs (Rust) to H#: `hammer service ...`
+;; (list/start/stop/restart/reload/enable/disable/status/log) oraz
+;; `list_all`, `log_filtered`, `preset`.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `anyhow::Result<()>` -> `string` ("" = OK).
+;; 2. `Command::new("systemctl").status()` (dziedziczy terminal) ->
+;;    `system(cmd)` (deklaracja `extern` w `internal/compat.h#`); kod wyjscia
+;;    = `status / 256` (`system` zwraca status oczekiwania). Kod 127
+;;    (nie znaleziono polecenia) daje komunikat "systemctl not available".
+;; 3. `Command::...output()` (stdout przechwycony) -> `proc::shell`.
+;; 4. `read_dir` + `read_link` + `read_to_string` -> `ls -1`, `readlink`,
+;;    `fs::read`.
+;; 5. Sortowanie/`dedup_by` po nazwie jednostki: nazwy unikalne (pierwsze
+;;    znalezione, kolejnosc katalogow jak w Rust), potem `sorting::sorted`;
+;;    stan z `systemctl show` pobierany raz na unikalna jednostke.
+;; 6. `desc.chars().take(40)` -> `str::slice(desc, 0, 40)` — liczy BAJTY, wiec
+;;    opis z wieloma wielobajtowymi znakami moze zostac uciety w srodku
+;;    znaku (rzadkie dla opisow jednostek systemd).
+;; 7. `{:<36} {:<20}` z kolorami -> `fmt::pad_right` na tekscie bez kolorow;
+;;    kolumna stanu ma stala szerokosc 12 (Rust: 20 po doliczeniu kodow ANSI).
+;; 8. ZACHOWANE: filtr `--package` w `cmd_service_list_all` wymaga rownosci
+;;    `p.name == pkg` ORAZ (`p.name == bare` lub `p.name` zawiera `bare`),
+;;    wiec dziala tylko dla jednostek nazwanych jak pakiet.
+
+pub struct ServiceInfo is
+    pub unit:         string
+    pub package:      string?
+    pub active_state: string
+    pub sub_state:    string
+    pub load_state:   string
+    pub description:  string
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn rule(n: int) -> string is
+    return "  " + ui::dim(str::repeat("─", n))
+end
+
+;; Kod wyjscia polecenia z terminalem; -1 gdy nie dalo sie uruchomic.
+fn run_code(cmd: string) -> int is
+    let rc: int = system(cmd)
+    if rc < 0 is return -1 end
+    return rc / 256
+end
+
+fn ensure_service_suffix(name: string) -> string is
+    if compat::str_index_of(name, ".") >= 0 is return name end
+    return name + ".service"
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ── Wejscie ──────────────────────────────────────────────────────────────
+
+pub fn cmd_service(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "list"
+    let mut units: [string] = []
+    let mut i: int = 1
+    while i < args.len() is
+        if string_slice(args[i], 0, 1) != "-" is units.push(args[i]) end
+        i += 1
+    end
+
+    if sub == "list" || sub == "ls" is return cmd_service_list() end
+    if sub == "start" || sub == "stop" || sub == "restart" || sub == "reload" || sub == "enable" || sub == "disable" is
+        return cmd_service_op(sub, units)
+    end
+    if sub == "status" is return cmd_service_status(units) end
+    if sub == "log" || sub == "logs" is return cmd_service_log(units) end
+    return "Unknown service subcommand: '" + sub + "'\n  Usage: hammer service [list|start|stop|restart|reload|enable|disable|status|log] [unit...]"
+end
+
+;; ── list ─────────────────────────────────────────────────────────────────
+
+fn state_col(state: string) -> string is
+    let padded: string = fmt::pad_right(state, 12)
+    if state == "active" is return ui::bright_green(padded) end
+    if state == "failed" is return ui::red_bold(padded) end
+    if state == "inactive" is return ui::dim(padded) end
+    return padded
+end
+
+fn cmd_service_list() -> string is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Services installed by hammer packages")
+    write(rule(70))
+    write("  " + ui::bold(fmt::pad_right("Unit", 36)) + " " + ui::bold(fmt::pad_right("State", 12)) + " " + ui::bold(fmt::pad_right("Load", 12)) + " " + ui::bold("Package"))
+    write(rule(70))
+
+    let services: [ServiceInfo] = find_hammer_services()
+    if services.len() == 0 is
+        write("  " + ui::dim("·") + " No services found.")
+        write("")
+        write("  Services appear here after installing packages that ship systemd units.")
+        write("  Example: " + ui::cyan("hammer install nginx"))
+        return ""
+    end
+
+    let mut i: int = 0
+    while i < services.len() is
+        let svc: ServiceInfo = services[i]
+        let pkg_name: string = if svc.package == nil then "unknown" else svc.package
+        write("  " + ui::bold(fmt::pad_right(svc.unit, 36)) + " " + state_col(svc.active_state) + " " + ui::dim(fmt::pad_right(svc.load_state, 12)) + " " + ui::cyan(pkg_name))
+        i += 1
+    end
+
+    write(rule(70))
+    write("  " + to_string(services.len()) + " service(s) found.")
+    write("")
+    write("  Start:  " + ui::cyan("hammer service start <unit>") + "   Stop: " + ui::cyan("hammer service stop <unit>"))
+    write("  Enable: " + ui::cyan("hammer service enable <unit>") + "   Logs: " + ui::cyan("hammer service log <unit>"))
+    return ""
+end
+
+;; ── start / stop / restart / reload / enable / disable ───────────────────
+
+fn cmd_service_op(op: string, units: [string]) -> string is
+    if units.len() == 0 is return "Usage: hammer service " + op + " <unit...>" end
+    let mut i: int = 0
+    while i < units.len() is
+        let unit_name: string = ensure_service_suffix(units[i])
+        write("  " + ui::cyan_bold("⬡") + " " + op + " " + ui::bold(unit_name) + "…")
+        let extra: string = if op == "enable" then " --no-reload" else ""
+        let code: int = run_code("systemctl " + op + " " + shq(unit_name) + extra)
+        if code == 0 is
+            write("  " + ui::bright_green("✔") + " " + op + " " + ui::bold(unit_name) + " ok.")
+            log::info("service: " + op + " " + unit_name + " ok")
+        elsif code == 127 || code < 0 is
+            write("  " + ui::yellow_bold("!") + " systemctl not available: command not found")
+        else is
+            write("  " + ui::red_bold("✗") + " " + op + " " + ui::bold(unit_name) + " failed (exit " + to_string(code) + "). Logs: " + ui::cyan("hammer service log " + unit_name))
+        end
+        i += 1
+    end
+    if op == "enable" || op == "disable" is
+        run_code("systemctl daemon-reload")
+    end
+    return ""
+end
+
+;; ── status ───────────────────────────────────────────────────────────────
+
+fn cmd_service_status(units: [string]) -> string is
+    if units.len() == 0 is return cmd_service_list() end
+    let mut i: int = 0
+    while i < units.len() is
+        let unit_name: string = ensure_service_suffix(units[i])
+        write("  " + ui::cyan_bold("⬡") + "  " + ui::bold(unit_name))
+        write(rule(60))
+        run_code("systemctl status --no-pager " + shq(unit_name))
+        write("")
+        i += 1
+    end
+    return ""
+end
+
+;; ── logs ─────────────────────────────────────────────────────────────────
+
+fn cmd_service_log(units: [string]) -> string is
+    if units.len() == 0 is return "Usage: hammer service log <unit>" end
+    let mut i: int = 0
+    while i < units.len() is
+        let unit_name: string = ensure_service_suffix(units[i])
+        write("  " + ui::cyan_bold("⬡") + "  Logs for " + ui::bold(unit_name) + " (last 50 lines)")
+        write(rule(60))
+        run_code("journalctl -u " + shq(unit_name) + " -n 50 --no-pager")
+        write("")
+        i += 1
+    end
+    return ""
+end
+
+;; ── Wyszukiwanie uslug zainstalowanych przez hammera ─────────────────────
+
+fn is_hammer_installed_unit(p: string) -> bool is
+    let target: string = str::trim(proc::shell("readlink -- " + shq(p) + " 2>/dev/null"))
+    if target != "" && compat::str_index_of(target, "/hammer/") >= 0 is return true end
+    if fs::exists(p) && fs::is_file(p) is
+        let content: string = fs::read(p)
+        if compat::str_index_of(content, "/hammer/active") >= 0 || compat::str_index_of(content, "X-Hammer-Package") >= 0 is
+            return true
+        end
+    end
+    return false
+end
+
+fn find_unit_package(unit: string) -> string? is
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let bare: string = if string_ends_with(unit, ".service") then str::slice(unit, 0, string_len(unit) - 8) else unit
+    let all: [db::InstalledPackage] = idb.list_all()
+    let mut i: int = 0
+    while i < all.len() is
+        if all[i].name == bare || compat::str_index_of(all[i].name, bare) >= 0 is return all[i].name end
+        i += 1
+    end
+    return nil
+end
+
+fn get_service_status(unit: string) -> ServiceInfo is
+    let mut info: ServiceInfo = ServiceInfo { unit: unit, package: nil, active_state: "unknown",
+        sub_state: "unknown", load_state: "unknown", description: "" }
+    let text: string = proc::shell("systemctl show --no-pager --property=ActiveState,SubState,LoadState,Description " + shq(unit) + " 2>/dev/null")
+    let lines: [string] = str::split(text, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let l: string = lines[i]
+        if string_starts_with(l, "ActiveState=") is info.active_state = str::slice(l, 12, string_len(l)) end
+        if string_starts_with(l, "SubState=") is info.sub_state = str::slice(l, 9, string_len(l)) end
+        if string_starts_with(l, "LoadState=") is info.load_state = str::slice(l, 10, string_len(l)) end
+        if string_starts_with(l, "Description=") is info.description = str::slice(l, 12, string_len(l)) end
+        i += 1
+    end
+    info.package = find_unit_package(unit)
+    return info
+end
+
+fn find_hammer_services() -> [ServiceInfo] is
+    let dirs: [string] = ["/etc/systemd/system", "/usr/lib/systemd/system",
+        "/hammer/active/lib/systemd/system", "/hammer/active/usr/lib/systemd/system"]
+    let mut names: [string] = []
+    let mut paths: [string] = []
+    let mut d: int = 0
+    while d < dirs.len() is
+        if fs::is_dir(dirs[d]) is
+            let entries: [string] = str::split(proc::shell("ls -1 " + shq(dirs[d]) + " 2>/dev/null"), "\n")
+            let mut e: int = 0
+            while e < entries.len() is
+                let name: string = entries[e]
+                if string_ends_with(name, ".service") && !string_starts_with(name, "hammer") && !string_starts_with(name, "systemd-") is
+                    let full: string = dirs[d] + "/" + name
+                    if is_hammer_installed_unit(full) && !contains_str(names, name) is
+                        names.push(name)
+                        paths.push(full)
+                    end
+                end
+                e += 1
+            end
+        end
+        d += 1
+    end
+
+    let sorted_names: [string] = sorting::sorted(names)
+    let mut out: [ServiceInfo] = []
+    let mut i: int = 0
+    while i < sorted_names.len() is
+        out.push(get_service_status(sorted_names[i]))
+        i += 1
+    end
+    return out
+end
+
+;; ── list --all ───────────────────────────────────────────────────────────
+
+pub fn cmd_service_list_all(filter_pkg: string?) -> string is
+    let suffix: string = if filter_pkg == nil then "" else " — package: " + ui::cyan(filter_pkg)
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  All systemd units" + suffix)
+    write(rule(80))
+    write("  " + ui::bold(fmt::pad_right("Unit", 40)) + " " + ui::bold(fmt::pad_right("Active", 14)) + " " + ui::bold(fmt::pad_right("Load", 12)) + " " + ui::bold("Description"))
+    write(rule(80))
+
+    let text: string = proc::shell("systemctl list-units --all --no-legend --no-pager --type=service,socket,timer,path 2>/dev/null")
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let installed: [db::InstalledPackage] = idb.list_all()
+
+    let mut count: int = 0
+    let lines: [string] = str::split(text, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let parts: [string] = str::split_whitespace(lines[i])
+        if parts.len() >= 4 is
+            let unit: string = parts[0]
+            let load: string = parts[1]
+            let active: string = parts[2]
+            let mut desc: string = ""
+            let mut k: int = 4
+            while k < parts.len() is
+                desc = if k == 4 then parts[k] else desc + " " + parts[k]
+                k += 1
+            end
+
+            let mut keep: bool = true
+            if filter_pkg != nil is
+                let pkg: string = filter_pkg
+                let dot: int = compat::str_index_of(unit, ".")
+                let bare: string = if dot >= 0 then str::slice(unit, 0, dot) else unit
+                keep = false
+                let mut p: int = 0
+                while p < installed.len() is
+                    if installed[p].name == pkg && (installed[p].name == bare || compat::str_index_of(installed[p].name, bare) >= 0) is keep = true end
+                    p += 1
+                end
+            end
+
+            if keep is
+                let shown: string = if string_len(desc) > 40 then str::slice(desc, 0, 40) else desc
+                write("  " + ui::bold(fmt::pad_right(unit, 40)) + " " + state_col(active) + "   " + ui::dim(fmt::pad_right(load, 12)) + " " + ui::dim(shown))
+                count += 1
+            end
+        end
+        i += 1
+    end
+    write(rule(80))
+    write("  " + to_string(count) + " unit(s).")
+    return ""
+end
+
+;; ── journal z --since / --until ──────────────────────────────────────────
+
+pub fn cmd_service_log_filtered(units: [string], since: string?, until: string?, lines: int, follow: bool) -> string is
+    if units.len() == 0 is return "Usage: hammer service log <unit> [--since=...] [--until=...]" end
+    let mut i: int = 0
+    while i < units.len() is
+        let unit_name: string = ensure_service_suffix(units[i])
+        write("  " + ui::cyan_bold("⬡") + "  Logs for " + ui::bold(unit_name))
+        if since != nil is
+            write("  " + ui::dim("·") + " Since: " + ui::cyan(since))
+        end
+        if until != nil is
+            write("  " + ui::dim("·") + " Until: " + ui::cyan(until))
+        end
+        write(rule(60))
+
+        let mut cmd: string = "journalctl -u " + shq(unit_name) + " --no-pager"
+        if !follow is cmd = cmd + " -n " + to_string(lines) end
+        if since != nil is
+            let s: string = since
+            cmd = cmd + " --since " + shq(s)
+        end
+        if until != nil is
+            let u: string = until
+            cmd = cmd + " --until " + shq(u)
+        end
+        if follow is cmd = cmd + " --follow" end
+        run_code(cmd)
+        write("")
+        i += 1
+    end
+    return ""
+end
+
+;; ── preset ───────────────────────────────────────────────────────────────
+
+pub fn cmd_service_preset(units: [string]) -> string is
+    write("  " + ui::accent_bold("⬡") + "  Applying service presets…")
+    if units.len() == 0 is
+        run_code("systemctl preset-all --no-reload")
+    else is
+        let mut i: int = 0
+        while i < units.len() is
+            let uname: string = ensure_service_suffix(units[i])
+            run_code("systemctl preset --no-reload " + shq(uname))
+            write("  " + ui::bright_green("✔") + " preset applied: " + ui::cyan(uname))
+            i += 1
+        end
+    end
+    run_code("systemctl daemon-reload")
+    return ""
+end
