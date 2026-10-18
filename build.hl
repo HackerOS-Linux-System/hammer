@@ -1,6 +1,3 @@
-// cargo
-// rustc
+|| H#
 
-> cargo build --release
-;; for normal version: > cargo build --release --features normal-mode
-;; for oci version: > cargo build --release --features oci-mode
+> bit
