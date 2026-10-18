@@ -1,0 +1,89 @@
+mod internal
+mod ui
+mod pkg
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_autoremove   (port cmd/autoremove.rs)
+
+fn in_list(items: [string], n: string) -> bool is
+    let mut i: int = 0
+    while i < items.len() is
+        if items[i] == n is return true end
+        i += 1
+    end
+    return false
+end
+
+fn add_refs(referenced: [string], field: string) -> [string] is
+    let mut out: [string] = referenced
+    if field == "" is return out end
+    let groups: [package::DepGroup] = package::parse_dep_field(field)
+    let mut g: int = 0
+    while g < groups.len() is
+        let mut a: int = 0
+        while a < groups[g].alternatives.len() is
+            out.push(groups[g].alternatives[a].name)
+            a += 1
+        end
+        g += 1
+    end
+    return out
+end
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    let sr: oci_sysroot::SysrootResult = oci_sysroot::sysroot_open(cfg.sysroot_path, cfg.ostree_repo_path, cfg.osname)
+    if sr.err != "" is return sr.err end
+    let sysroot: oci_sysroot::Sysroot = sr.sysroot
+    let booted: oci_sysroot::BootedResult = oci_sysroot::booted_deployment(sysroot)
+    if booted.err != "" is return booted.err end
+    if !booted.found is return "No booted deployment." end
+    let layers: [oci_types::PackageLayer] = oci_sysroot::read_layer_metadata(sysroot, booted.dep.checksum).layers
+    if layers.len() == 0 is
+        write("  Nothing to autoremove — no layered packages installed.")
+        return ""
+    end
+
+    let checkout: string = compat::path_join(cfg.overlay_work_dir, "autoremove-inspect")
+    let rr: oci_ostree_repo::RepoResult = oci_ostree_repo::repo_open(cfg.ostree_repo_path)
+    if rr.err != "" is return rr.err end
+    let ce: string = oci_ostree_repo::checkout_commit(rr.repo, booted.dep.checksum, checkout)
+    if ce != "" is return ce end
+    let installed: oci_status_db::StatusLoad = oci_status_db::load_all(checkout)
+    let auto_installed: [string] = oci_status_db::load_auto_installed(checkout)
+    oci_process::run_capture("rm", ["-rf", checkout])
+    if installed.err != "" is return installed.err end
+
+    let mut referenced: [string] = []
+    let mut i: int = 0
+    while i < installed.pkgs.len() is
+        referenced = add_refs(referenced, installed.pkgs[i].depends)
+        referenced = add_refs(referenced, installed.pkgs[i].pre_depends)
+        i += 1
+    end
+
+    let mut candidates: [string] = []
+    let mut k: int = 0
+    while k < layers.len() is
+        let n: string = layers[k].name
+        if in_list(auto_installed, n) && !in_list(referenced, n) is candidates.push(n) end
+        k += 1
+    end
+
+    if candidates.len() == 0 is
+        write("  No auto-installed, unreferenced layered packages found.")
+        return ""
+    end
+    write("  Candidates for removal (auto-installed, no longer required by anything):")
+    let mut c: int = 0
+    while c < candidates.len() is
+        write("    - " + candidates[c])
+        c += 1
+    end
+
+    if !in_list(args, "--yes") && !in_list(args, "-y") is
+        write("")
+        write("  Re-run with " + ui::cyan("hammer oci autoremove --yes") + " to remove them.")
+        return ""
+    end
+    return oci_cmd_uninstall::run(candidates, cfg)
+end
