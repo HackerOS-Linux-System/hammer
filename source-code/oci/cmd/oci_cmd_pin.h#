@@ -1,0 +1,18 @@
+mod internal
+mod ui
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_pin   (port cmd/pin.rs; `pin` i `unpin`)
+
+pub fn run(args: [string], cfg: oci_types::Config, pinned: bool) -> string is
+    if args.len() == 0 is
+        return "Usage: hammer oci " + (if pinned then "pin" else "unpin") + " <deployment-id>"
+    end
+    let id: string = args[0]
+    let sr: oci_sysroot::SysrootResult = oci_sysroot::sysroot_open(cfg.sysroot_path, cfg.ostree_repo_path, cfg.osname)
+    if sr.err != "" is return sr.err end
+    let result: oci_types::TransactionResult = oci_sysroot::set_pinned(sr.sysroot, id, pinned)
+    if !result.success is return result.error_message end
+    write("  " + ui::bright_green_bold("✔") + " " + (if pinned then "Pinned" else "Unpinned") + " deployment " + id)
+    return ""
+end
