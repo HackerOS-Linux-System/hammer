@@ -1,0 +1,51 @@
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+use "std -> fs"      from "fs"
+
+mod internal
+mod ui
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_cleanup   (port cmd/cleanup.rs)
+
+;; `--keep N` (domyslnie 2; nieliczba -> 2, jak `parse().ok()` w Rust).
+fn keep_count(args: [string]) -> int is
+    let mut i: int = 0
+    while i < args.len() is
+        if args[i] == "--keep" && i + 1 < args.len() is
+            if str::is_numeric(args[i + 1]) is return conv::str_to_int(args[i + 1]) end
+            return 2
+        end
+        i += 1
+    end
+    return 2
+end
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    let mut repair: bool = false
+    let mut a: int = 0
+    while a < args.len() is
+        if args[a] == "--repair" is repair = true end
+        a += 1
+    end
+    if repair is
+        let orphan: string = oci_overlay::detect_orphaned_session(cfg.overlay_work_dir)
+        if orphan != "" is
+            let re: string = oci_overlay::repair_orphaned_session(orphan)
+            if re != "" is return re end
+            write("  " + ui::bright_green_bold("✔") + " Removed orphaned overlay session at " + orphan + ".")
+        else
+            write("  Nothing to repair.")
+        end
+        let incomplete: string = compat::path_join(cfg.overlay_work_dir, ".incomplete")
+        if fs::exists(incomplete) is fs::remove(incomplete) end
+    end
+
+    let keep: int = keep_count(args)
+    let sr: oci_sysroot::SysrootResult = oci_sysroot::sysroot_open(cfg.sysroot_path, cfg.ostree_repo_path, cfg.osname)
+    if sr.err != "" is return sr.err end
+    let result: oci_types::TransactionResult = oci_sysroot::cleanup(sr.sysroot, keep)
+    if !result.success is return "Cleanup failed: " + result.error_message end
+    write("  " + ui::bright_green_bold("✔") + " Cleaned up old deployments (kept last " + to_string(keep) + ").")
+    return ""
+end
