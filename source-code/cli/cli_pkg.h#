@@ -1,0 +1,653 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> fmt"     from "fmt"
+use "std -> conv"    from "conv"
+
+mod internal
+mod cli
+mod pkg
+mod ui
+mod tools
+mod system
+mod userenv
+
+;; hammer -> cli::cli_pkg
+;;
+;; Port of source-code/cli/pkg.rs (Rust) to H#: komendy pakietowe w trybie
+;; systemowym — install, reinstall, remove, upgrade, dist-upgrade, autoremove,
+;; fix-broken, sync, self-update, search, info, list, mark, download.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `async fn` -> zwykle funkcje; `anyhow::Result<()>` -> `string` ("" = OK).
+;; 2. `let _lock = lock::system_lock()?` (zwalniany przez `Drop`) -> kazda
+;;    komenda to cienka otoczka (`lock_then`), ktora bierze blokade, wola
+;;    wlasciwa funkcje `*_inner` i ZAWSZE zwalnia blokade. Kolejnosc jak w
+;;    Rust: sprawdzenie uzycia -> blokada -> `print_header`.
+;; 3. Tryb `--user` (`run_user`, `cmd_user_*`) jest w `cli/cli_user.h#`.
+;; 4. Krok "HackerOS tools" w `cmd_upgrade` (`hk_tools::update_all_tools`)
+;;    wola `pending::update_all_tools_stub()` (wypisuje, ze pominieto).
+;; 5. `serde_json::json!` w `cmd_list --json` -> `json_output::{jobj,jfield}` z
+;;    kluczami ALFABETYCZNIE (serde_json: BTreeMap) i `json_output::pretty`.
+;; 6. `cmd_download`: pobieranie `curl -fsSL --retry 3` do pliku (bez
+;;    wczytywania calosci w pamiec), skrot `sha256sum`, rozmiar z `fs::size`.
+;;    `{:.1}` -> jedno miejsce po przecinku liczone na calkowitych.
+;; 7. `results.sort_by(name)` -> `sort_pkgs` (scalanie, stabilne).
+;; 8. ZACHOWANE: `cmd_list` bez flag wypisuje WSZYSTKIE pakiety z cache (setki
+;;    tysiecy wierszy dla pelnego indeksu Debiana) — bez stronicowania.
+
+fn append_str(a: [string], x: string) -> [string] is
+    let mut o: [string] = a
+    o.push(x)
+    return o
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn joined(xs: [string], sep: string) -> string is
+    return str::join(xs, sep)
+end
+
+;; Architektura: `--arch=...` (znormalizowana) albo wykryta.
+pub struct ArchPick is
+    pub arch: string
+    pub err:  string
+end
+
+fn pick_arch(flags: cli_types::GlobalFlags) -> ArchPick is
+    if flags.arch != nil is
+        let a: string = flags.arch
+        let r: userenv::ArchResult = userenv::normalise_arch(a)
+        if !r.ok is return ArchPick { arch: "", err: r.err } end
+        return ArchPick { arch: r.arch, err: "" }
+    end
+    return ArchPick { arch: cache::detect_arch(), err: "" }
+end
+
+;; Wola `body(...)` pod systemowa blokada hammera. Zwalnia ja ZAWSZE.
+fn with_lock_result(err_before: string, lr: lock::LockResult, body_err: string) -> string is
+    lock::lock_release(lr.lock)
+    return body_err
+end
+
+;; ── Sortowanie ───────────────────────────────────────────────────────────
+
+fn sort_pkgs(items: [package::Package]) -> [package::Package] is
+    let n: int = items.len()
+    if n < 2 is return items end
+    let mut src: [package::Package] = items
+    let mut width: int = 1
+    while width < n is
+        let mut dst: [package::Package] = []
+        let mut i: int = 0
+        while i < n is
+            let mid: int = if i + width < n then i + width else n
+            let hi: int = if i + 2 * width < n then i + 2 * width else n
+            let mut l: int = i
+            let mut r: int = mid
+            while l < mid && r < hi is
+                if src[r].name < src[l].name is
+                    dst.push(src[r])
+                    r += 1
+                else is
+                    dst.push(src[l])
+                    l += 1
+                end
+            end
+            while l < mid is
+                dst.push(src[l])
+                l += 1
+            end
+            while r < hi is
+                dst.push(src[r])
+                r += 1
+            end
+            i += 2 * width
+        end
+        src = dst
+        width = width * 2
+    end
+    return src
+end
+
+;; ── Wspolny krok: pokaz plan, potwierdz, wykonaj ─────────────────────────
+
+fn run_plan(plan: solver::TransactionPlan, idb: db::InstalledDb, arch: string, confirm_msg: string,
+        yes: bool, explicit: [string], is_upgrade: bool, note: string) -> string is
+    ui::print_transaction_table(plan, arch)
+    ui::print_transaction_summary(plan)
+    if !yes && !ui::confirm(confirm_msg) is
+        write("  Aborted.")
+        return ""
+    end
+    let ctx: transaction::TransactionContext = transaction::context_system(plan, idb, explicit, is_upgrade)
+    return transaction::run_transaction(ctx, note)
+end
+
+;; ── install ──────────────────────────────────────────────────────────────
+
+pub fn cmd_install(args: [string], flags: cli_types::GlobalFlags) -> string is
+    let yes: bool = cli_types::has_flag(args, "-y") || cli_types::has_flag(args, "--yes") || flags.yes
+    let names: [string] = cli_types::non_flag_args(args)
+    if names.len() == 0 is
+        return "Usage: hammer install <package...> [-y] [--arch=ARCH] [--no-recommends]"
+    end
+    let no_recomm: bool = cli_types::has_flag(args, "--no-recommends")
+    let ap: ArchPick = pick_arch(flags)
+    if ap.err != "" is return ap.err end
+
+    let lr: lock::LockResult = lock::system_lock()
+    if lr.err != "" is return lr.err end
+    let e: string = install_inner(names, yes, no_recomm, ap.arch)
+    return with_lock_result("", lr, e)
+end
+
+fn install_inner(names: [string], yes: bool, no_recomm: bool, arch: string) -> string is
+    ui::print_header()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load_for_arch(arch)
+    let s: solver::Solver = solver::solver_new(c, idb)
+    let pr: solver::PlanResult = solver::solver_resolve_install(s, names, no_recomm)
+    if pr.err != "" is return pr.err end
+    let plan: solver::TransactionPlan = pr.plan
+    if solver::plan_is_empty(plan) is
+        ui::nothing_to_do()
+        return ""
+    end
+
+    let mut i: int = 0
+    while i < plan.conflicts.len() is
+        write("  " + ui::yellow_bold("warn:") + " " + ui::yellow(plan.conflicts[i]))
+        i += 1
+    end
+    ui::deps_resolved()
+    return run_plan(plan, idb, arch, "Proceed with installation?", yes, names, false, "install " + joined(names, " "))
+end
+
+;; ── reinstall ────────────────────────────────────────────────────────────
+
+pub fn cmd_reinstall(args: [string]) -> string is
+    let yes: bool = cli_types::has_flag(args, "-y")
+    let names: [string] = cli_types::non_flag_args(args)
+    if names.len() == 0 is return "Usage: hammer reinstall <package...> [-y]" end
+
+    let lr: lock::LockResult = lock::system_lock()
+    if lr.err != "" is return lr.err end
+    ui::print_header()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load_for_arch(cache::detect_arch())
+    let s: solver::Solver = solver::solver_new(c, idb)
+    let pr: solver::PlanResult = solver::solver_resolve_reinstall(s, names)
+    if pr.err != "" is return with_lock_result("", lr, pr.err) end
+    if solver::plan_is_empty(pr.plan) is
+        ui::nothing_to_do()
+        return with_lock_result("", lr, "")
+    end
+    let e: string = run_plan(pr.plan, idb, cache::detect_arch(), "Proceed with reinstallation?", yes, names, false, "reinstall " + joined(names, " "))
+    return with_lock_result("", lr, e)
+end
+
+;; ── remove ───────────────────────────────────────────────────────────────
+
+pub fn cmd_remove(args: [string], flags: cli_types::GlobalFlags) -> string is
+    let yes: bool = cli_types::has_flag(args, "-y") || flags.yes
+    let names: [string] = cli_types::non_flag_args(args)
+    if names.len() == 0 is return "Usage: hammer remove <package...> [-y]" end
+
+    let lr: lock::LockResult = lock::system_lock()
+    if lr.err != "" is return lr.err end
+    ui::print_header()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+    let s: solver::Solver = solver::solver_new(c, idb)
+    let pr: solver::PlanResult = solver::solver_resolve_remove(s, names)
+    if pr.err != "" is return with_lock_result("", lr, pr.err) end
+    let plan: solver::TransactionPlan = pr.plan
+    if solver::plan_is_empty(plan) is
+        ui::nothing_to_do()
+        return with_lock_result("", lr, "")
+    end
+
+    let mut w: int = 0
+    while w < plan.warnings.len() is
+        write("  " + ui::yellow_bold("warn:") + " " + ui::yellow(plan.warnings[w]))
+        w += 1
+    end
+    let e: string = run_plan(plan, idb, cache::detect_arch(), "Proceed with removal?", yes, names, false, "remove " + joined(names, " "))
+    return with_lock_result("", lr, e)
+end
+
+;; ── upgrade ──────────────────────────────────────────────────────────────
+
+pub fn cmd_upgrade(args: [string], flags: cli_types::GlobalFlags) -> string is
+    let yes: bool = cli_types::has_flag(args, "-y") || flags.yes
+    let only_system: bool = cli_types::has_flag(args, "--system")
+    let only_hackeros: bool = cli_types::has_flag(args, "--hackeros")
+    let only_hammer: bool = cli_types::has_flag(args, "--hammer")
+    let pkgs: [string] = cli_types::non_flag_args(args)
+
+    let do_system: bool = only_system || (!only_hackeros && !only_hammer)
+    let do_hackeros: bool = only_hackeros || (!only_system && !only_hammer)
+    let do_hammer: bool = only_hammer || (!only_system && !only_hackeros)
+
+    ui::print_header()
+
+    if do_system is
+        let lr: lock::LockResult = lock::system_lock()
+        if lr.err != "" is return lr.err end
+        let e: string = upgrade_system(pkgs, yes, flags)
+        lock::lock_release(lr.lock)
+        if e != "" is return e end
+    end
+
+    if do_hackeros is
+        let e2: string = hk_tools::update_all_tools()
+        if e2 != "" is return e2 end
+    end
+
+    if do_hammer is
+        write("  " + ui::cyan_bold("⬡") + "  Checking for hammer self-update…")
+        let chk: selfupdate::UpdateCheck = selfupdate::check_for_update()
+        if chk.err != "" is
+            write("  " + ui::yellow("!") + " Self-update check failed: " + chk.err)
+        elsif chk.newer != "" is
+            write("  " + ui::yellow_bold("↑") + " New hammer version: " + ui::bright_cyan(chk.newer))
+            write("  Run " + ui::cyan("hammer self-update") + " to update.")
+        else is
+            write("  " + ui::bright_green("✔") + " hammer is up to date.")
+        end
+    end
+    return ""
+end
+
+fn upgrade_system(pkgs: [string], yes: bool, flags: cli_types::GlobalFlags) -> string is
+    let ap: ArchPick = pick_arch(flags)
+    if ap.err != "" is return ap.err end
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load_for_arch(ap.arch)
+    let s: solver::Solver = solver::solver_new(c, idb)
+    let pr: solver::PlanResult = if pkgs.len() == 0 then solver::solver_resolve_upgrade(s) else solver::solver_resolve_install(s, pkgs, false)
+    if pr.err != "" is return pr.err end
+    let plan: solver::TransactionPlan = pr.plan
+
+    if solver::plan_is_empty(plan) is
+        write("  " + ui::bright_green("✔") + " All Debian packages up to date.")
+        return ""
+    end
+    ui::deps_resolved()
+    let mut explicit: [string] = []
+    let mut i: int = 0
+    while i < plan.to_upgrade.len() is
+        explicit.push(plan.to_upgrade[i].name)
+        i += 1
+    end
+    return run_plan(plan, idb, ap.arch, "Proceed with upgrade?", yes, explicit, true, "upgrade")
+end
+
+;; ── dist-upgrade ─────────────────────────────────────────────────────────
+
+pub fn cmd_dist_upgrade(args: [string]) -> string is
+    let yes: bool = cli_types::has_flag(args, "-y")
+    let lr: lock::LockResult = lock::system_lock()
+    if lr.err != "" is return lr.err end
+    ui::print_header()
+    write("  " + ui::accent_bold("⬡") + "  dist-upgrade — aggressive upgrade")
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+    let s: solver::Solver = solver::solver_new(c, idb)
+    let pr: solver::PlanResult = solver::solver_resolve_dist_upgrade(s)
+    if pr.err != "" is return with_lock_result("", lr, pr.err) end
+    let plan: solver::TransactionPlan = pr.plan
+    if solver::plan_is_empty(plan) is
+        write("  " + ui::bright_green("✔") + " System is up to date.")
+        return with_lock_result("", lr, "")
+    end
+    let mut w: int = 0
+    while w < plan.warnings.len() is
+        write("  " + ui::yellow_bold("!") + " " + ui::yellow(plan.warnings[w]))
+        w += 1
+    end
+    let none: [string] = []
+    let e: string = run_plan(plan, idb, cache::detect_arch(), "Proceed with dist-upgrade?", yes, none, true, "dist-upgrade")
+    return with_lock_result("", lr, e)
+end
+
+;; ── autoremove / fix-broken ──────────────────────────────────────────────
+
+pub fn cmd_autoremove(args: [string]) -> string is
+    let yes: bool = cli_types::has_flag(args, "-y")
+    let lr: lock::LockResult = lock::system_lock()
+    if lr.err != "" is return lr.err end
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+    let s: solver::Solver = solver::solver_new(c, idb)
+    let pr: solver::PlanResult = solver::solver_resolve_autoremove(s)
+    if pr.err != "" is return with_lock_result("", lr, pr.err) end
+    if solver::plan_is_empty(pr.plan) is
+        ui::nothing_to_do()
+        return with_lock_result("", lr, "")
+    end
+    let e: string = run_plan(pr.plan, idb, cache::detect_arch(), "Remove unused dependencies?", yes, pr.plan.to_autoremove, false, "autoremove")
+    return with_lock_result("", lr, e)
+end
+
+pub fn cmd_fix_broken(args: [string]) -> string is
+    let yes: bool = cli_types::has_flag(args, "-y")
+    let lr: lock::LockResult = lock::system_lock()
+    if lr.err != "" is return lr.err end
+    ui::print_header()
+    write("  " + ui::accent_bold("⬡") + "  Checking for broken dependencies…")
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+    let s: solver::Solver = solver::solver_new(c, idb)
+    let pr: solver::PlanResult = solver::solver_resolve_fix_broken(s)
+    if pr.err != "" is return with_lock_result("", lr, pr.err) end
+    let plan: solver::TransactionPlan = pr.plan
+    let mut w: int = 0
+    while w < plan.warnings.len() is
+        write("  " + ui::dim("·") + " " + ui::yellow(plan.warnings[w]))
+        w += 1
+    end
+    if solver::plan_is_empty(plan) is
+        write("  " + ui::bright_green("✔") + " No broken dependencies.")
+        return with_lock_result("", lr, "")
+    end
+    let none: [string] = []
+    let e: string = run_plan(plan, idb, cache::detect_arch(), "Fix broken dependencies?", yes, none, false, "fix-broken")
+    return with_lock_result("", lr, e)
+end
+
+;; ── sync / self-update ───────────────────────────────────────────────────
+
+pub fn cmd_sync() -> string is
+    ui::trace("cmd_sync: start")
+    ui::print_header()
+    let e: string = cache::sync_all()
+    ui::trace("cmd_sync: sync_all returned: " + e)
+    if e != "" is return e end
+    write("  " + ui::bright_green("✔") + " Package index updated.")
+    return ""
+end
+
+pub fn cmd_self_update() -> string is
+    ui::print_header()
+    return selfupdate::self_update()
+end
+
+;; ── search / info / list ─────────────────────────────────────────────────
+
+pub fn cmd_search(args: [string], flags: cli_types::GlobalFlags) -> string is
+    let installed_only: bool = cli_types::has_flag(args, "--installed")
+    let query: string = joined(cli_types::non_flag_args(args), " ")
+    if query == "" is return "Usage: hammer search <query> [--installed] [--json]" end
+    let ap: ArchPick = pick_arch(flags)
+    if ap.err != "" is return ap.err end
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load_for_arch(ap.arch)
+
+    let found: [package::Package] = cache::cache_search(c, query)
+    let mut filtered: [package::Package] = []
+    let mut i: int = 0
+    while i < found.len() is
+        if !installed_only || idb.is_installed(found[i].name) is filtered.push(found[i]) end
+        i += 1
+    end
+    let results: [package::Package] = sort_pkgs(filtered)
+
+    if flags.json is
+        json_output::print_search_json(results, idb)
+        return ""
+    end
+    ui::print_search_header(query, results.len())
+    let mut k: int = 0
+    while k < results.len() is
+        ui::print_search_result(results[k], idb.is_installed(results[k].name))
+        k += 1
+    end
+    return ""
+end
+
+pub fn cmd_info(args: [string], flags: cli_types::GlobalFlags) -> string is
+    if args.len() == 0 is return "Usage: hammer info <package>" end
+    let name: string = args[0]
+    let ap: ArchPick = pick_arch(flags)
+    if ap.err != "" is return ap.err end
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load_for_arch(ap.arch)
+    let po: package::Package? = cache::cache_get(c, name)
+    if po == nil is return "Package '" + name + "' not found. Run `hammer sync`." end
+    let pkg: package::Package = po
+    let inst: db::InstalledPackage? = idb.get(name)
+    if flags.json is
+        json_output::print_package_json(pkg, inst)
+        return ""
+    end
+    let iv: string? = if inst == nil then nil else inst.version
+    ui::print_package_info(pkg, inst != nil, iv)
+    return ""
+end
+
+fn repo_label(p: package::Package, fallback: string) -> string is
+    if p.repo_base_uri == nil is return fallback end
+    let uri: string = p.repo_base_uri
+    let i: int = string_rfind(uri, "/")
+    if i < 0 is return uri end
+    let last: string = str::slice(uri, i + 1, string_len(uri))
+    if last == "" is return fallback end
+    return last
+end
+
+pub fn cmd_list(args: [string]) -> string is
+    let json_mode: bool = cli_types::has_flag(args, "--json")
+    let installed_only: bool = cli_types::has_flag(args, "--installed") || cli_types::has_flag(args, "-i")
+    let upgrades_only: bool = cli_types::has_flag(args, "--upgrades") || cli_types::has_flag(args, "-u") || cli_types::has_flag(args, "--upgradable")
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+
+    if json_mode is
+        let mut out: [string] = []
+        if installed_only || upgrades_only is
+            let all: [db::InstalledPackage] = idb.list_all()
+            let mut i: int = 0
+            while i < all.len() is
+                let inst: db::InstalledPackage = all[i]
+                let av: package::Package? = cache::cache_get(c, inst.name)
+                let mut new_ver: string? = nil
+                if av != nil is
+                    let ap: package::Package = av
+                    if package::version_cmp(ap.version, inst.version) > 0 is new_ver = ap.version end
+                end
+                if !(upgrades_only && new_ver == nil) is
+                    out.push(json_output::jobj([
+                        json_output::jfield("arch", json_output::jstr(inst.architecture)),
+                        json_output::jfield("installed", "true"),
+                        json_output::jfield("name", json_output::jstr(inst.name)),
+                        json_output::jfield("new_version", json_output::jstr_opt(new_ver)),
+                        json_output::jfield("reason", json_output::jstr(db::reason_to_str(inst.reason))),
+                        json_output::jfield("section", json_output::jstr_opt(inst.section)),
+                        json_output::jfield("version", json_output::jstr(inst.version))]))
+                end
+                i += 1
+            end
+        else is
+            let pkgs: [package::Package] = cache::cache_all_packages(c)
+            let mut j: int = 0
+            while j < pkgs.len() is
+                let p: package::Package = pkgs[j]
+                out.push(json_output::jobj([
+                    json_output::jfield("arch", json_output::jstr(p.architecture)),
+                    json_output::jfield("description", json_output::jstr_opt(p.description_short)),
+                    json_output::jfield("installed", json_output::jbool(idb.is_installed(p.name))),
+                    json_output::jfield("name", json_output::jstr(p.name)),
+                    json_output::jfield("new_version", "null"),
+                    json_output::jfield("section", json_output::jstr_opt(p.section)),
+                    json_output::jfield("version", json_output::jstr(p.version))]))
+                j += 1
+            end
+        end
+        write(json_output::pretty(json_output::jarr(out)))
+        return ""
+    end
+
+    if installed_only || upgrades_only is
+        let all2: [db::InstalledPackage] = idb.list_all()
+        let mut k: int = 0
+        while k < all2.len() is
+            let inst2: db::InstalledPackage = all2[k]
+            let ao: package::Package? = cache::cache_get(c, inst2.name)
+            let mut nv: string? = nil
+            let mut repo: string = "installed"
+            if ao != nil is
+                let a2: package::Package = ao
+                if package::version_cmp(a2.version, inst2.version) > 0 is nv = a2.version end
+                repo = repo_label(a2, "installed")
+            end
+            if !(upgrades_only && nv == nil) is
+                ui::print_list_entry(inst2.name, inst2.version, inst2.architecture, true, repo, nv)
+            end
+            k += 1
+        end
+    else is
+        let pkgs2: [package::Package] = cache::cache_all_packages(c)
+        let mut m: int = 0
+        while m < pkgs2.len() is
+            let p2: package::Package = pkgs2[m]
+            ui::print_list_entry(p2.name, p2.version, p2.architecture, idb.is_installed(p2.name), repo_label(p2, ""), nil)
+            m += 1
+        end
+    end
+    return ""
+end
+
+;; ── tryb --user: patrz `cli/cli_user.h#` ───────────────────────────────
+
+;; ── mark ─────────────────────────────────────────────────────────────────
+
+pub fn cmd_mark(args: [string]) -> string is
+    let reason_str: string = if args.len() > 0 then args[0] else "manual"
+    let mut reason: db::InstallReason = db::InstallReason::User
+    if reason_str == "auto" || reason_str == "automatic" is
+        reason = db::InstallReason::Dependency
+    elsif reason_str == "manual" || reason_str == "user" is
+        reason = db::InstallReason::User
+    else is
+        return "Unknown reason '" + reason_str + "'. Use: hammer mark [auto|manual] <pkg…>"
+    end
+
+    let mut names: [string] = []
+    let mut i: int = 1
+    while i < args.len() is
+        if string_slice(args[i], 0, 1) != "-" is names.push(args[i]) end
+        i += 1
+    end
+    if names.len() == 0 is return "Usage: hammer mark [auto|manual] <package…>" end
+
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let mut k: int = 0
+    while k < names.len() is
+        if idb.get(names[k]) == nil is
+            ui::eprint_line("  " + ui::yellow("!") + " '" + names[k] + "' is not installed.")
+        else is
+            let e: string = idb.set_reason(names[k], reason)
+            if e != "" is return e end
+            audit::record_mark(names[k], reason_str)
+            log::info("mark: " + names[k] + " set to " + reason_str)
+            write("  " + ui::bright_green("✔") + " " + ui::bold(names[k]) + " → " + ui::cyan(reason_str))
+        end
+        k += 1
+    end
+    return ""
+end
+
+;; ── download ─────────────────────────────────────────────────────────────
+
+fn format_bytes(b: int) -> string is
+    if b < 1024 is return to_string(b) + " B" end
+    if b < 1024 * 1024 is return fixed1(b, 1024) + " KiB" end
+    if b < 1024 * 1024 * 1024 is return fixed1(b, 1024 * 1024) + " MiB" end
+    let hundredths: int = (b * 100) / (1024 * 1024 * 1024)
+    return to_string(hundredths / 100) + "." + pad2(hundredths % 100) + " GiB"
+end
+
+fn pad2(n: int) -> string is
+    if n < 10 is return "0" + to_string(n) end
+    return to_string(n)
+end
+
+;; `b / unit` z jednym miejscem po przecinku (zaokraglenie jak `{:.1}`).
+fn fixed1(b: int, unit: int) -> string is
+    let tenths: int = (b * 10 + unit / 2) / unit
+    return to_string(tenths / 10) + "." + to_string(tenths % 10)
+end
+
+pub fn cmd_download(args: [string]) -> string is
+    let names: [string] = cli_types::non_flag_args(args)
+    if names.len() == 0 is return "Usage: hammer download <package> [--arch=ARCH] [--no-verify]" end
+    let name: string = names[0]
+    let no_verify: bool = cli_types::has_flag(args, "--no-verify")
+    let arch: string = cache::detect_arch()
+
+    let c: cache::PackageCache = cache::cache_load_for_arch(arch)
+    let po: package::Package? = cache::cache_get(c, name)
+    if po == nil is return "Package '" + name + "' not found. Run 'hammer sync'." end
+    let pkg: package::Package = po
+    if pkg.filename == nil is return "No Filename field for '" + name + "'" end
+    if pkg.repo_base_uri == nil is return "No base URI known for '" + name + "'" end
+    let filename: string = pkg.filename
+    let base_uri: string = pkg.repo_base_uri
+
+    let mut url: string = ""
+    if string_starts_with(filename, "http://") || string_starts_with(filename, "https://") is
+        url = filename
+    else is
+        let mut b: int = string_len(base_uri)
+        while b > 0 && string_at(base_uri, b - 1) == "/" is
+            b -= 1
+        end
+        let mut f: int = 0
+        while f < string_len(filename) && string_at(filename, f) == "/" is
+            f += 1
+        end
+        url = str::slice(base_uri, 0, b) + "/" + str::slice(filename, f, string_len(filename))
+    end
+
+    let out_file: string = name + "_" + str::replace_all(pkg.version, ":", "_") + ".deb"
+    write("  " + ui::accent_bold("⬡") + "  Downloading " + ui::bold(out_file) + "…")
+    write("  " + ui::dim("·") + "  URL: " + ui::dim(url))
+
+    let dl: string = str::trim(proc::shell("curl -fsSL --retry 3 -o " + shq(out_file) + " " + shq(url) + " >/dev/null 2>&1; echo $?"))
+    if dl != "0" is
+        fs::remove(out_file)
+        return "Downloading " + url + " failed (curl exit " + dl + ")"
+    end
+
+    ;; SHA-256
+    if pkg.sha256 != nil is
+        let expected: string = pkg.sha256
+        let out: string = str::trim(proc::shell("sha256sum -- " + shq(out_file) + " 2>/dev/null"))
+        let actual: string = if out == "" then "" else str::slice(out, 0, compat::str_index_of(out, " "))
+        if actual != expected is
+            return "SHA-256 mismatch for '" + name + "'!\n  Expected: " + expected + "\n  Got:      " + actual
+        end
+        write("  " + ui::bright_green("✔") + " SHA-256 verified.")
+    else is
+        write("  " + ui::yellow("⚠") + " No expected checksum in cache — skipping verification.")
+    end
+    write("  " + ui::bright_green_bold("✔") + " Saved: " + ui::cyan(out_file))
+
+    if !no_verify is
+        let se: string = audit::verify_package_signature(out_file)
+        if se == "" is
+            write("  " + ui::bright_green("✔") + " Signature OK.")
+        else is
+            ui::eprint_line("  " + ui::yellow("⚠") + " Signature warning: " + se)
+            ui::eprint_line("  " + ui::dim("·") + " Use " + ui::cyan("--no-verify") + " to skip.")
+        end
+    end
+
+    write("")
+    write("  " + ui::bold("Size:") + "  " + ui::dim(format_bytes(fs::size(out_file))))
+    return ""
+end
