@@ -1,0 +1,846 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> fmt"     from "fmt"
+
+mod internal
+mod ui
+
+;; hammer -> system::immutable
+;;
+;; Port of source-code/system/immutable.rs (Rust) to H#: tryb "immutable
+;; filesystem" (read-only /usr itd.) z backendami remount / btrfs / zfs /
+;; sysext, migawki i weryfikacja.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `anyhow::Result<T>` -> `string` ("" = OK) albo struktury z polem `err`.
+;; 2. `libc::mount(NULL, path, NULL, MS_REMOUNT|MS_BIND[|MS_RDONLY], NULL)` ->
+;;    `mount -o remount,bind[,ro] <path>` (te same flagi; H# nie ma
+;;    bezpiecznego bindingu do `mount(2)` z pustymi wskaznikami). Blad
+;;    remount nie przerywa (jak w Rust — tylko wpis w logu); w logu jest
+;;    kod wyjscia `mount`, nie `errno`.
+;; 3. `nix::unistd::geteuid()` -> `compat::os_is_root()` (`id -u`).
+;; 4. `impl Drop for ImmutableGuard` — H# nie ma `Drop`: `guard_release(g)`
+;;    jest OBOWIAZKOWE na kazdej sciezce wyjscia z transakcji, ktora wziela
+;;    `unlock_for_transaction()` (jak `lock_release` w `internal/lock.h#`).
+;; 5. `cfg!(feature = "normal-mode")` -> `build_mode::normal_mode()` (czas
+;;    dzialania, nie kompilacji).
+;; 6. `chrono::Local::now().format("%Y%m%d-%H%M%S")` -> `date +%Y%m%d-%H%M%S`.
+;; 7. `env!("CARGO_PKG_VERSION")` -> `build_mode::hammer_version()`.
+;; 8. `Command::new(..).output()` z ignorowanym wynikiem (`let _ =`) ->
+;;    `proc::shell` z `2>&1` (stdout/stderr polecenia nie trafiaja na
+;;    terminal). `btrfs`/`zfs`/`systemd-sysext` ze statusem -> `sh_ok`.
+;; 9. ZACHOWANE: `path_is_ro` dopasowuje punkt montowania tylko gdy sciezka
+;;    ROWNA sie punktowi lub zaczyna sie od `punkt + "/"`. Dla punktu "/"
+;;    wzorzec to "//", wiec `/usr` bez wlasnego montowania NIE dziedziczy
+;;    stanu z "/" i jest uznawany za zapisywalny (`unwrap_or(false)`).
+;;    Na systemie z jednym wspolnym `/` status zawsze wyjdzie UNLOCKED.
+;; 10. ZACHOWANE: `list_snapshots_raw` dla backendu remount nie sortuje
+;;     (kolejnosc `read_dir`); tu: kolejnosc `ls`, czyli alfabetyczna.
+;; 11. `unlock_remount` — kolejnosc odwrocona (RO_PATHS + "/" odwrocone),
+;;     wiec "/" jest pierwszy; "/" nie jest w `RW_ALWAYS` jako dokladna
+;;     sciezka, ale `is_always_rw("/")` jest `false` (nie zaczyna sie od
+;;     `rw + "/"`), wiec "/" tez jest remountowany rw.
+
+;; ── Stale ────────────────────────────────────────────────────────────────
+
+fn ro_paths_all() -> [string] is
+    return ["/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/libx32",
+        "/opt", "/srv", "/boot", "/hammer/store", "/hammer/profiles", "/snap"]
+end
+
+fn rw_always() -> [string] is
+    return ["/var", "/home", "/tmp", "/run", "/proc", "/sys", "/dev",
+        "/root", "/media", "/mnt", "/etc", "/hammer/db", "/hammer/tmp"]
+end
+
+pub fn overlay_upper_paths() -> [string] is
+    return ["/var/lib/overlayfs/upper", "/var/lib/overlayfs/work"]
+end
+
+fn flag_file() -> string is return "/hammer/db/.immutable-enabled" end
+fn backend_file() -> string is return "/hammer/db/.immutable-backend" end
+fn snapshots_dir() -> string is return "/hammer/snapshots" end
+
+;; ── Typy ─────────────────────────────────────────────────────────────────
+
+pub enum FsType is
+    Ext4
+    Btrfs
+    Overlay
+    Tmpfs
+    Zfs
+    F2fs
+    Xfs
+    Other(string)
+end
+
+pub fn fs_to_string(t: FsType) -> string is
+    match t is
+        FsType::Ext4     => is return "ext4" end
+        FsType::Btrfs    => is return "btrfs" end
+        FsType::Overlay  => is return "overlayfs" end
+        FsType::Tmpfs    => is return "tmpfs" end
+        FsType::Zfs      => is return "zfs" end
+        FsType::F2fs     => is return "f2fs" end
+        FsType::Xfs      => is return "xfs" end
+        FsType::Other(s) => is return s end
+    end
+end
+
+;; Backend jako tekst: remount | btrfs | zfs | chattr | sysext | auto.
+;; (Enum bez danych porownujemy po tekscie.)
+pub fn backend_from_str(s: string) -> string is
+    if s == "remount" || s == "btrfs" || s == "zfs" || s == "chattr" || s == "sysext" is return s end
+    return "auto"
+end
+
+pub struct MountPoint is
+    pub path:      string
+    pub fs_type:   FsType
+    pub is_ro:     bool
+    pub is_subvol: bool
+    pub subvol:    string?
+    pub source:    string
+end
+
+pub struct ImmutableStatus is
+    ;; LOCKED | UNLOCKED | PARTIAL | UNKNOWN
+    pub status:       string
+    pub ro_paths:     [string]
+    pub rw_paths:     [string]
+    pub fs_type:      FsType
+    pub btrfs_native: bool
+    pub backend:      string
+    pub overlay_mode: bool
+end
+
+;; Wynik z mozliwym bledem.
+pub struct StatusResult is
+    pub status: ImmutableStatus
+    pub err:    string
+end
+
+;; Zamiennik `ImmutableGuard` (patrz odejscie 4).
+pub struct ImmutableGuard is
+    pub was_locked: bool
+end
+
+pub struct GuardResult is
+    pub guard: ImmutableGuard
+    pub err:   string
+end
+
+;; ── Narzedzia ────────────────────────────────────────────────────────────
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+fn timestamp() -> string is
+    return str::trim(proc::shell("date +%Y%m%d-%H%M%S"))
+end
+
+fn ensure_root(ctx: string) -> string is
+    if !compat::os_is_root() is return ctx + " requires root." end
+    return ""
+end
+
+fn is_always_rw(p: string) -> bool is
+    let rw: [string] = rw_always()
+    let mut i: int = 0
+    while i < rw.len() is
+        if p == rw[i] || string_starts_with(p, rw[i] + "/") is return true end
+        i += 1
+    end
+    return false
+end
+
+fn should_be_ro(p: string) -> bool is
+    return !is_always_rw(p)
+end
+
+fn nonempty_lines(text: string) -> [string] is
+    let mut out: [string] = []
+    let ls: [string] = str::split(text, "\n")
+    let mut i: int = 0
+    while i < ls.len() is
+        let l: string = str::trim(ls[i])
+        if l != "" is out.push(l) end
+        i += 1
+    end
+    return out
+end
+
+;; ── Montowania ───────────────────────────────────────────────────────────
+
+fn parse_fs_type(s: string) -> FsType is
+    if s == "ext4" is return FsType::Ext4 end
+    if s == "btrfs" is return FsType::Btrfs end
+    if s == "overlay" || s == "overlayfs" is return FsType::Overlay end
+    if s == "tmpfs" is return FsType::Tmpfs end
+    if s == "zfs" is return FsType::Zfs end
+    if s == "f2fs" is return FsType::F2fs end
+    if s == "xfs" is return FsType::Xfs end
+    return FsType::Other(s)
+end
+
+fn fs_is(t: FsType, label: string) -> bool is
+    return fs_to_string(t) == label
+end
+
+pub struct MountsResult is
+    pub mounts: [MountPoint]
+    pub err:    string
+end
+
+fn parse_mounts() -> MountsResult is
+    let none: [MountPoint] = []
+    if !fs::exists("/proc/mounts") is
+        return MountsResult { mounts: none, err: "/proc/mounts" }
+    end
+    let lines: [string] = str::split(fs::read("/proc/mounts"), "\n")
+    let mut out: [MountPoint] = []
+    let mut i: int = 0
+    while i < lines.len() is
+        let p: [string] = str::split_whitespace(lines[i])
+        if p.len() >= 4 is
+            let opts: [string] = str::split(p[3], ",")
+            let mut is_ro: bool = false
+            let mut subvol: string? = nil
+            let mut k: int = 0
+            while k < opts.len() is
+                if opts[k] == "ro" is is_ro = true end
+                if subvol == nil && string_starts_with(opts[k], "subvol=") is
+                    subvol = str::slice(opts[k], 7, string_len(opts[k]))
+                end
+                k += 1
+            end
+            out.push(MountPoint { source: p[0], path: p[1], fs_type: parse_fs_type(p[2]), is_ro: is_ro,
+                is_subvol: subvol != nil, subvol: subvol })
+        end
+        i += 1
+    end
+    return MountsResult { mounts: out, err: "" }
+end
+
+;; Typ FS dla /usr, a gdy brak — dla /; domyslnie ext4.
+pub struct FsResult is
+    pub fs_type: FsType
+    pub err:     string
+end
+
+pub fn detect_root_fs_type() -> FsResult is
+    let mr: MountsResult = parse_mounts()
+    if mr.err != "" is return FsResult { fs_type: FsType::Ext4, err: mr.err } end
+    let targets: [string] = ["/usr", "/"]
+    let mut t: int = 0
+    while t < targets.len() is
+        let mut i: int = 0
+        while i < mr.mounts.len() is
+            if mr.mounts[i].path == targets[t] is
+                return FsResult { fs_type: mr.mounts[i].fs_type, err: "" }
+            end
+            i += 1
+        end
+        t += 1
+    end
+    return FsResult { fs_type: FsType::Ext4, err: "" }
+end
+
+;; Patrz odejscie 9.
+fn path_is_ro(p: string, mounts: [MountPoint]) -> bool is
+    let mut best: int = -1
+    let mut best_len: int = -1
+    let mut i: int = 0
+    while i < mounts.len() is
+        let m: MountPoint = mounts[i]
+        if p == m.path || string_starts_with(p, m.path + "/") is
+            if string_len(m.path) > best_len is
+                best_len = string_len(m.path)
+                best = i
+            end
+        end
+        i += 1
+    end
+    if best < 0 is return false end
+    return mounts[best].is_ro
+end
+
+fn choose_backend(t: FsType) -> string is
+    if fs_is(t, "btrfs") is return "btrfs" end
+    if fs_is(t, "zfs") is return "zfs" end
+    return "remount"
+end
+
+fn saved_backend() -> string is
+    if !fs::exists(backend_file()) is return "remount" end
+    return backend_from_str(str::trim(fs::read(backend_file())))
+end
+
+pub fn is_immutable_enabled() -> bool is
+    return fs::exists(flag_file())
+end
+
+;; ── Backend: remount ─────────────────────────────────────────────────────
+
+fn do_remount(p: string, ro: bool) is
+    let opts: string = if ro then "remount,bind,ro" else "remount,bind"
+    let rc: string = str::trim(proc::shell("mount -o " + opts + " " + shq(p) + " >/dev/null 2>&1; echo $?"))
+    if rc == "0" is
+        log::info("immutable: remounted " + p + " as " + (if ro then "ro" else "rw"))
+    else is
+        log::warn("immutable: remount " + p + " failed rc=" + rc)
+    end
+end
+
+fn enable_remount_immutable() -> string is
+    let paths: [string] = ro_paths_all()
+    let mut i: int = 0
+    while i < paths.len() is
+        if fs::exists(paths[i]) && !is_always_rw(paths[i]) is do_remount(paths[i], true) end
+        i += 1
+    end
+    return ""
+end
+
+fn unlock_remount() -> string is
+    ;; RO_PATHS + "/", odwrocone (patrz odejscie 11)
+    let mut paths: [string] = ro_paths_all()
+    paths.push("/")
+    let mut i: int = paths.len() - 1
+    while i >= 0 is
+        if fs::exists(paths[i]) && !is_always_rw(paths[i]) is do_remount(paths[i], false) end
+        i -= 1
+    end
+    return ""
+end
+
+;; ── Backend: btrfs ───────────────────────────────────────────────────────
+
+fn find_btrfs_subvolumes() -> [string] is
+    let out: string = proc::shell("btrfs subvolume list / 2>/dev/null")
+    let lines: [string] = str::split(out, "\n")
+    let mut subs: [string] = []
+    let mut i: int = 0
+    while i < lines.len() is
+        let segs: [string] = str::split(lines[i], "path ")
+        if segs.len() > 1 is subs.push("/" + str::trim(segs[1])) end
+        i += 1
+    end
+    return subs
+end
+
+fn enable_btrfs_immutable() -> string is
+    let subs: [string] = find_btrfs_subvolumes()
+    let mut i: int = 0
+    while i < subs.len() is
+        if should_be_ro(subs[i]) is
+            sh_ok("btrfs property set -ts " + shq(subs[i]) + " ro true")
+            log::info("immutable: btrfs ro on " + subs[i])
+        end
+        i += 1
+    end
+    return enable_remount_immutable()
+end
+
+fn disable_btrfs_immutable() -> string is
+    let subs: [string] = find_btrfs_subvolumes()
+    let mut i: int = 0
+    while i < subs.len() is
+        sh_ok("btrfs property set -ts " + shq(subs[i]) + " ro false")
+        i += 1
+    end
+    return unlock_remount()
+end
+
+fn unlock_btrfs() -> string is
+    return disable_btrfs_immutable()
+end
+
+;; Zwraca sciezke migawki albo "" i ustawia blad w `err`.
+pub struct SnapResult is
+    pub name: string
+    pub err:  string
+end
+
+fn make_btrfs_snapshot(label: string) -> SnapResult is
+    let dest: string = snapshots_dir() + "/snap-" + label + "-" + timestamp()
+    proc::shell("mkdir -p " + shq(snapshots_dir()))
+    let out: string = proc::shell("btrfs subvolume snapshot -r / " + shq(dest) + " 2>&1; echo \"rc=$?\"")
+    if !string_ends_with(str::trim(out), "rc=0") is
+        return SnapResult { name: "", err: "btrfs snapshot: " + str::trim(out) }
+    end
+    log::info("immutable: btrfs snapshot " + dest)
+    return SnapResult { name: dest, err: "" }
+end
+
+;; ── Backend: zfs ─────────────────────────────────────────────────────────
+
+fn detect_zfs_pool() -> string? is
+    let out: string = str::trim(proc::shell("zfs list -H -o name / 2>/dev/null"))
+    if out == "" is return nil end
+    return out
+end
+
+fn zfs_ro_datasets(pool: string) -> [string] is
+    let lines: [string] = nonempty_lines(proc::shell("zfs list -H -o name -r " + shq(pool) + " 2>/dev/null"))
+    let paths: [string] = ro_paths_all()
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < lines.len() is
+        let mut hit: bool = false
+        let mut k: int = 0
+        while k < paths.len() is
+            let suffix: string = if string_starts_with(paths[k], "/") then str::slice(paths[k], 1, string_len(paths[k])) else paths[k]
+            if string_ends_with(lines[i], suffix) is hit = true end
+            k += 1
+        end
+        if hit is out.push(lines[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn enable_zfs_immutable() -> string is
+    let po: string? = detect_zfs_pool()
+    if po == nil is return "ZFS pool for / not found" end
+    let pool: string = po
+    let ds: [string] = zfs_ro_datasets(pool)
+    let mut i: int = 0
+    while i < ds.len() is
+        sh_ok("zfs set readonly=on " + shq(ds[i]))
+        log::info("immutable: zfs readonly=on " + ds[i])
+        i += 1
+    end
+    return ""
+end
+
+fn disable_zfs_immutable() -> string is
+    let po: string? = detect_zfs_pool()
+    if po != nil is
+        let pool: string = po
+        let ds: [string] = zfs_ro_datasets(pool)
+        let mut i: int = 0
+        while i < ds.len() is
+            sh_ok("zfs set readonly=off " + shq(ds[i]))
+            i += 1
+        end
+    end
+    return ""
+end
+
+fn unlock_zfs() -> string is
+    return disable_zfs_immutable()
+end
+
+fn make_zfs_snapshot(pool: string, label: string) -> SnapResult is
+    let snap: string = pool + "@snap-" + label + "-" + timestamp()
+    let out: string = proc::shell("zfs snapshot -r " + shq(snap) + " 2>&1; echo \"rc=$?\"")
+    if !string_ends_with(str::trim(out), "rc=0") is
+        return SnapResult { name: "", err: "zfs snapshot: " + str::trim(out) }
+    end
+    log::info("immutable: zfs snapshot " + snap)
+    return SnapResult { name: snap, err: "" }
+end
+
+;; ── Backend: systemd-sysext ──────────────────────────────────────────────
+
+fn enable_sysext() -> string is
+    let out: string = proc::shell("systemd-sysext merge 2>&1; echo \"rc=$?\"")
+    if !string_ends_with(str::trim(out), "rc=0") is
+        return "sysext merge: " + str::trim(out)
+    end
+    log::info("immutable: sysext merge")
+    return ""
+end
+
+fn disable_sysext() -> string is
+    sh_ok("systemd-sysext unmerge")
+    return ""
+end
+
+fn unmerge_sysext() -> string is
+    return disable_sysext()
+end
+
+;; ── Dispatch po backendzie ───────────────────────────────────────────────
+
+fn lock_by_backend(b: string) -> string is
+    if b == "btrfs" is return enable_btrfs_immutable() end
+    if b == "zfs" is return enable_zfs_immutable() end
+    if b == "sysext" is return enable_sysext() end
+    return enable_remount_immutable()
+end
+
+fn unlock_by_backend(b: string) -> string is
+    if b == "btrfs" is return unlock_btrfs() end
+    if b == "zfs" is return unlock_zfs() end
+    if b == "sysext" is return unmerge_sysext() end
+    return unlock_remount()
+end
+
+;; ── Publiczne API ────────────────────────────────────────────────────────
+
+pub fn enable_immutable() -> string is
+    if build_mode::normal_mode() is
+        write("  " + ui::cyan("ℹ") + " Normal-mode build — immutable filesystem disabled.")
+        return ""
+    end
+    if livecheck::is_live_system() is
+        log::info("immutable: live system — skipping")
+        write("  " + ui::dim("·") + " Live system detected — immutable mode not activated.")
+        return ""
+    end
+    let e: string = ensure_root("hammer immutable enable")
+    if e != "" is return e end
+
+    let fr: FsResult = detect_root_fs_type()
+    if fr.err != "" is return fr.err end
+    let backend: string = choose_backend(fr.fs_type)
+
+    write("  " + ui::accent_bold("⬡") + "  Enabling immutable filesystem mode…")
+    write("  " + ui::dim("·") + " Filesystem : " + ui::cyan(fs_to_string(fr.fs_type)))
+    write("  " + ui::dim("·") + " Backend    : " + ui::cyan(backend))
+
+    let r: string = lock_by_backend(backend)
+    if r != "" is return r end
+
+    proc::shell("mkdir -p /hammer/db")
+    if !fs::write(flag_file(), "1\n") is return "Cannot write " + flag_file() end
+    if !fs::write(backend_file(), backend + "\n") is return "Cannot write " + backend_file() end
+
+    write("  " + ui::bright_green_bold("✔") + " Immutable filesystem mode enabled.")
+    log::info("immutable: enabled (backend=" + backend + ")")
+    return ""
+end
+
+pub fn disable_immutable() -> string is
+    if build_mode::normal_mode() is
+        write("  " + ui::cyan("ℹ") + " Normal-mode build — immutable filesystem not active.")
+        return ""
+    end
+    let e: string = ensure_root("hammer immutable disable")
+    if e != "" is return e end
+    write("  " + ui::accent_bold("⬡") + "  Disabling immutable filesystem mode…")
+    let r: string = unlock_by_backend(saved_backend())
+    if r != "" is return r end
+    fs::remove(flag_file())
+    fs::remove(backend_file())
+    write("  " + ui::bright_green("✔") + " Immutable mode disabled.")
+    log::info("immutable: disabled")
+    return ""
+end
+
+;; Czasowe odblokowanie na czas transakcji. Zwolnienie: `guard_release`.
+pub fn unlock_for_transaction() -> GuardResult is
+    let off: ImmutableGuard = ImmutableGuard { was_locked: false }
+    if build_mode::normal_mode() is return GuardResult { guard: off, err: "" } end
+    if livecheck::is_live_system() || !is_immutable_enabled() is
+        return GuardResult { guard: off, err: "" }
+    end
+    log::info("immutable: unlocking for transaction")
+    let r: string = unlock_by_backend(saved_backend())
+    if r != "" is return GuardResult { guard: off, err: r } end
+    return GuardResult { guard: ImmutableGuard { was_locked: true }, err: "" }
+end
+
+pub fn relock() -> string is
+    if build_mode::normal_mode() is return "" end
+    if livecheck::is_live_system() || !is_immutable_enabled() is return "" end
+    log::info("immutable: relocking after transaction")
+    return lock_by_backend(saved_backend())
+end
+
+;; Zamiennik `Drop`: relock, jesli guard odblokowal system. Blad = ostrzezenie.
+pub fn guard_release(g: ImmutableGuard) is
+    if g.was_locked is
+        let e: string = relock()
+        if e != "" is
+            log::warn("immutable: relock failed on drop: " + e)
+            ui::eprint_line("  " + ui::red_bold("!") + " WARNING: failed to re-lock filesystem: " + e)
+        end
+    end
+end
+
+pub fn get_status() -> StatusResult is
+    let fr: FsResult = detect_root_fs_type()
+    let empty_p: [string] = []
+    let blank: ImmutableStatus = ImmutableStatus { status: "UNKNOWN", ro_paths: empty_p, rw_paths: empty_p,
+        fs_type: FsType::Ext4, btrfs_native: false, backend: "auto", overlay_mode: false }
+    if fr.err != "" is return StatusResult { status: blank, err: fr.err } end
+    let mr: MountsResult = parse_mounts()
+    if mr.err != "" is return StatusResult { status: blank, err: mr.err } end
+    let backend: string = saved_backend()
+
+    let mut ro: [string] = []
+    let mut rw: [string] = []
+    let paths: [string] = ro_paths_all()
+    let mut i: int = 0
+    while i < paths.len() is
+        if fs::exists(paths[i]) is
+            if path_is_ro(paths[i], mr.mounts) is ro.push(paths[i]) else is rw.push(paths[i]) end
+        end
+        i += 1
+    end
+    let status: string = if rw.len() == 0 && ro.len() > 0 then "LOCKED" elsif ro.len() == 0 then "UNLOCKED" else "PARTIAL"
+    let mut overlay: bool = false
+    let mut m: int = 0
+    while m < mr.mounts.len() is
+        if fs_is(mr.mounts[m].fs_type, "overlayfs") is overlay = true end
+        m += 1
+    end
+    return StatusResult { status: ImmutableStatus { status: status, ro_paths: ro, rw_paths: rw,
+        fs_type: fr.fs_type, btrfs_native: fs_is(fr.fs_type, "btrfs"), backend: backend, overlay_mode: overlay }, err: "" }
+end
+
+;; ── Migawki ──────────────────────────────────────────────────────────────
+
+pub fn create_snapshot(label: string) -> string is
+    let e: string = ensure_root("hammer immutable snapshot")
+    if e != "" is return e end
+    let backend: string = saved_backend()
+    let mut result: string = ""
+    if backend == "btrfs" is
+        let r: SnapResult = make_btrfs_snapshot(label)
+        if r.err != "" is return r.err end
+        result = r.name
+    elsif backend == "zfs" is
+        let po: string? = detect_zfs_pool()
+        if po == nil is return "ZFS pool not found" end
+        let pool: string = po
+        let r2: SnapResult = make_zfs_snapshot(pool, label)
+        if r2.err != "" is return r2.err end
+        result = r2.name
+    else is
+        let ts: string = timestamp()
+        let name: string = "snap-" + label + "-" + ts
+        proc::shell("mkdir -p " + shq(snapshots_dir()))
+        let body: string = "label=" + label + "\ntime=" + ts + "\nbackend=remount\n"
+        if !fs::write(snapshots_dir() + "/" + name + ".snap", body) is
+            return "Cannot write snapshot in " + snapshots_dir()
+        end
+        result = name
+    end
+    write("  " + ui::bright_green_bold("✔") + " Snapshot created: " + ui::cyan(result))
+    return ""
+end
+
+pub fn list_snapshots_raw() -> [string] is
+    let backend: string = saved_backend()
+    if backend == "btrfs" is
+        let lines: [string] = str::split(proc::shell("btrfs subvolume list -r " + shq(snapshots_dir()) + " 2>/dev/null"), "\n")
+        let mut out: [string] = []
+        let mut i: int = 0
+        while i < lines.len() is
+            let segs: [string] = str::split(lines[i], "path ")
+            if segs.len() > 1 is out.push(str::trim(segs[1])) end
+            i += 1
+        end
+        return out
+    end
+    if backend == "zfs" is
+        let po: string? = detect_zfs_pool()
+        if po != nil is
+            let pool: string = po
+            return nonempty_lines(proc::shell("zfs list -H -t snapshot -o name -r " + shq(pool) + " 2>/dev/null"))
+        end
+        let none: [string] = []
+        return none
+    end
+    if !fs::is_dir(snapshots_dir()) is
+        let none2: [string] = []
+        return none2
+    end
+    return nonempty_lines(proc::shell("ls -1 " + shq(snapshots_dir()) + " 2>/dev/null"))
+end
+
+pub fn list_snapshots() -> string is
+    let snaps: [string] = list_snapshots_raw()
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Snapshots")
+    write("  " + ui::dim(str::repeat("─", 50)))
+    if snaps.len() == 0 is
+        write("  " + ui::dim("·") + " No snapshots found.")
+    else is
+        let mut i: int = 0
+        while i < snaps.len() is
+            write("    " + ui::dim("·") + " " + ui::cyan(snaps[i]))
+            i += 1
+        end
+    end
+    return ""
+end
+
+;; ── Weryfikacja ──────────────────────────────────────────────────────────
+
+pub fn verify_integrity() -> string is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Verifying filesystem integrity…")
+    let mr: MountsResult = parse_mounts()
+    if mr.err != "" is return mr.err end
+    let mut ok: int = 0
+    let mut fail: int = 0
+    let paths: [string] = ro_paths_all()
+    let mut i: int = 0
+    while i < paths.len() is
+        if fs::exists(paths[i]) is
+            if path_is_ro(paths[i], mr.mounts) is
+                write("  " + ui::bright_green("✔") + " " + paths[i] + " — read-only")
+                ok += 1
+            else is
+                write("  " + ui::red_bold("!") + " " + ui::red(paths[i]) + " — WRITABLE ✗")
+                fail += 1
+            end
+        end
+        i += 1
+    end
+    write("")
+    if fail == 0 is
+        write("  " + ui::bright_green_bold("✔") + " All " + to_string(ok) + " protected paths are read-only.")
+    else is
+        write("  " + ui::red_bold("✗") + " " + to_string(fail) + " path(s) should be read-only. Run: " + ui::cyan("hammer immutable lock"))
+    end
+    return ""
+end
+
+;; ── Usluga systemd ───────────────────────────────────────────────────────
+
+pub fn install_immutable_service() -> string is
+    let mut bin: string = str::trim(proc::shell("readlink -f /proc/self/exe 2>/dev/null"))
+    if bin == "" is bin = "/usr/bin/hammer" end
+    let unit: string = "[Unit]\nDescription=Hammer Immutable Filesystem\nDefaultDependencies=no\nAfter=local-fs.target\nBefore=sysinit.target\nConditionVirtualization=no\nConditionPathExists=!/run/live\nConditionPathExists=" + flag_file() + "\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=" + bin + " immutable enable\nExecStop=" + bin + " immutable disable\nTimeoutSec=60\n\n[Install]\nWantedBy=sysinit.target\n"
+    if !fs::write("/etc/systemd/system/hammer-immutable.service", unit) is
+        return "Cannot write /etc/systemd/system/hammer-immutable.service"
+    end
+    sh_ok("systemctl enable hammer-immutable.service --no-reload")
+    sh_ok("systemctl daemon-reload")
+    log::info("immutable: service installed")
+    return ""
+end
+
+;; ── CLI ──────────────────────────────────────────────────────────────────
+
+fn print_immutable_status() -> string is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Filesystem Immutability — hammer v" + build_mode::hammer_version())
+    write("  " + ui::dim(str::repeat("─", 60)))
+
+    if livecheck::is_live_system() is
+        write("  " + ui::cyan_bold("ℹ") + "  Running as " + ui::yellow("live system") + " — immutable mode inactive")
+        return ""
+    end
+    if build_mode::normal_mode() is
+        write("  " + ui::cyan_bold("ℹ") + "  Built in " + ui::yellow("normal-mode") + " — immutable FS subsystem disabled.")
+        return ""
+    end
+
+    let enabled: bool = is_immutable_enabled()
+    write("  " + ui::bold(fmt::pad_right("Configured:", 32)) + " " + (if enabled then ui::bright_green("yes") else ui::yellow("no  (hammer immutable enable)")))
+
+    let sr: StatusResult = get_status()
+    if sr.err != "" is return sr.err end
+    let s: ImmutableStatus = sr.status
+    let status_str: string = if s.status == "LOCKED" then ui::bright_green("LOCKED (read-only)") elsif s.status == "UNLOCKED" then ui::yellow("UNLOCKED") elsif s.status == "PARTIAL" then ui::yellow_bold("PARTIAL — some paths writable!") else ui::dim("UNKNOWN")
+    write("  " + ui::bold(fmt::pad_right("Current state:", 32)) + " " + status_str)
+    write("  " + ui::bold(fmt::pad_right("Filesystem:", 32)) + " " + ui::cyan(fs_to_string(s.fs_type)))
+    write("  " + ui::bold(fmt::pad_right("Backend:", 32)) + " " + ui::cyan(s.backend))
+    if s.overlay_mode is
+        write("  " + ui::bold(fmt::pad_right("OverlayFS detected:", 32)) + " " + ui::cyan("yes"))
+    end
+    write("")
+    write("  " + ui::bold("Protected (read-only):"))
+    if s.ro_paths.len() == 0 is
+        write("    " + ui::dim("·") + " none")
+    else is
+        let mut i: int = 0
+        while i < s.ro_paths.len() is
+            write("    " + ui::bright_green("✔") + " " + s.ro_paths[i])
+            i += 1
+        end
+    end
+    if s.rw_paths.len() > 0 is
+        write("")
+        write("  " + ui::yellow_bold("⚠  Should be protected but writable:"))
+        let mut j: int = 0
+        while j < s.rw_paths.len() is
+            write("    " + ui::red_bold("!") + " " + ui::red(s.rw_paths[j]))
+            j += 1
+        end
+    end
+    write("")
+    write("  " + ui::bold("Always read-write:"))
+    let rwa: [string] = rw_always()
+    let mut k: int = 0
+    while k < rwa.len() is
+        write("    " + ui::dim("·") + " " + ui::cyan(rwa[k]))
+        k += 1
+    end
+    let snaps: [string] = list_snapshots_raw()
+    if snaps.len() > 0 is
+        write("")
+        write("  " + ui::bold("Snapshots:"))
+        let mut n: int = 0
+        while n < snaps.len() is
+            write("    " + ui::dim("·") + " " + ui::cyan(snaps[n]))
+            n += 1
+        end
+    end
+    write("")
+    write("  Verify integrity : " + ui::cyan("hammer immutable verify"))
+    write("  Create snapshot  : " + ui::cyan("hammer immutable snapshot <label>"))
+    return ""
+end
+
+pub fn cmd_immutable(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "status"
+    if sub == "enable" is return enable_immutable() end
+    if sub == "disable" is return disable_immutable() end
+    if sub == "status" is return print_immutable_status() end
+    if sub == "verify" is return verify_integrity() end
+    if sub == "lock" is
+        let e: string = ensure_root("hammer immutable lock")
+        if e != "" is return e end
+        write("  " + ui::accent_bold("⬡") + "  Relocking…")
+        let r: string = relock()
+        if r != "" is return r end
+        write("  " + ui::bright_green("✔") + " Relocked.")
+        return ""
+    end
+    if sub == "unlock" is
+        let e2: string = ensure_root("hammer immutable unlock")
+        if e2 != "" is return e2 end
+        write("  " + ui::bright_yellow_bold("⬡") + "  Temporarily unlocking…")
+        write("  " + ui::yellow_bold("!") + "  Run " + ui::cyan("hammer immutable lock") + " when done.")
+        let r2: string = unlock_by_backend(saved_backend())
+        if r2 != "" is return r2 end
+        write("  " + ui::bright_green("✔") + " Unlocked (temporary).")
+        log::info("immutable: manually unlocked")
+        return ""
+    end
+    if sub == "install-service" is
+        let r3: string = install_immutable_service()
+        if r3 != "" is return r3 end
+        write("  " + ui::bright_green("✔") + " hammer-immutable.service installed.")
+        return ""
+    end
+    if sub == "snapshot" is
+        let label: string = if args.len() > 1 then args[1] else "manual"
+        return create_snapshot(label)
+    end
+    if sub == "snapshots" || sub == "list-snapshots" is return list_snapshots() end
+    return "Unknown immutable subcommand: '" + sub + "'\n  Usage: hammer immutable [status|enable|disable|lock|unlock|verify|snapshot <label>|snapshots|install-service]"
+end
