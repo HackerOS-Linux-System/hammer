@@ -1,0 +1,421 @@
+use "std -> fs"      from "fs"
+use "std -> env"     from "env"
+use "std -> fmt"     from "fmt"
+use "std -> process" from "proc"
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+use "bit -> colors"
+
+;; hammer -> internal::log
+;;
+;; Port of source-code/internal/log.rs (Rust) to H#.
+;; Dziennik hammera: plik /var/log/hammer.log (z rotacja), opcjonalnie
+;; journald przez `systemd-cat`, poziomy logowania, ID sesji i komenda
+;; `hammer log`.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;;
+;; 1. STAN GLOBALNY. Rust trzyma `CURRENT_LEVEL` (AtomicU8) i `SESSION_ID`
+;;    (OnceLock) w `static`. H# nie ma zmiennych globalnych na poziomie
+;;    modulu, wiec oba siedza w zmiennych srodowiskowych procesu
+;;    (`HAMMER__LOG_LEVEL_NOW`, `HAMMER__SESSION_ID`) — to jest stan
+;;    procesu, nie systemu, i dziala tak samo jak static (jeden proces =
+;;    jedna wartosc; `env::set` nie wycieka do procesu-rodzica).
+;;    Publiczna zmienna srodowiskowa `HAMMER_LOG_LEVEL` (ustawiana przez
+;;    uzytkownika) dziala jak wczesniej i jest czytana w `session_start`.
+;; 2. STALE jako funkcje. `LOG_FILE`, `LOG_MAX_BYTES`, `LOG_KEEP_DAYS`
+;;    to `log_file()`, `log_max_bytes()`, `log_keep_days()` — nie
+;;    zakladam obslugi `const` na poziomie modulu w kazdej wersji H#.
+;; 3. `Level` to zwykly enum + `level_rank`/`level_from_rank` (H# nie ma
+;;    `#[repr(u8)]` ani rzutowania enum -> liczba).
+;; 4. Znacznik czasu: `time::format` daje sekundy, wiec czesc `.%3f`
+;;    (milisekundy) dokladam sam z `time::now_ms() % 1000`.
+;; 5. `cmd_log` zwraca kod wyjscia (`int`) zamiast `anyhow::Result<()>`;
+;;    tryb `-f/--follow` czyta przyrost pliku przez `tail -c +N`
+;;    (H# nie ma seek), a nie przez File::seek.
+;; 6. `--json` emituje ta sama tablice `[{"line": "..."}]` co Rust
+;;    (serde_json::to_string_pretty), z wlasnym escapowaniem stringa.
+
+;; ── Stale ────────────────────────────────────────────────────────────────
+
+pub fn log_file() -> string is return "/var/log/hammer.log" end
+
+;; 10 MiB
+pub fn log_max_bytes() -> int is return 10 * 1024 * 1024 end
+
+pub fn log_keep_days() -> int is return 90 end
+
+;; Wersja hammera pokazywana w naglowku sesji (Rust: CARGO_PKG_VERSION,
+;; tu: recznie utrzymywane razem z Bit.hk / Cargo.toml).
+pub fn hammer_version() -> string is return "0.5.0" end
+
+;; ── Poziomy ──────────────────────────────────────────────────────────────
+
+pub enum Level is
+    Error
+    Warn
+    Info
+    Pkg
+    File
+    Debug
+end
+
+;; Kolejnosc jak w Rust (`Error = 0 ... Debug = 5`); wiekszy = bardziej
+;; gadatliwy.
+pub fn level_rank(l: Level) -> int is
+    match l is
+        Level::Error => return 0
+        Level::Warn  => return 1
+        Level::Info  => return 2
+        Level::Pkg   => return 3
+        Level::File  => return 4
+        Level::Debug => return 5
+    end
+    return 5
+end
+
+pub fn level_from_rank(n: int) -> Level is
+    if n == 0 is return Level::Error end
+    if n == 1 is return Level::Warn end
+    if n == 2 is return Level::Info end
+    if n == 3 is return Level::Pkg end
+    if n == 4 is return Level::File end
+    return Level::Debug
+end
+
+pub fn level_as_str(l: Level) -> string is
+    match l is
+        Level::Error => return "ERROR"
+        Level::Warn  => return "WARN "
+        Level::Info  => return "INFO "
+        Level::Pkg   => return "PKG  "
+        Level::File  => return "FILE "
+        Level::Debug => return "DEBUG"
+    end
+    return "DEBUG"
+end
+
+pub fn set_level(l: Level) is
+    env::set("HAMMER__LOG_LEVEL_NOW", to_string(level_rank(l)))
+end
+
+pub fn current_level() -> Level is
+    let raw: string = env::get_or("HAMMER__LOG_LEVEL_NOW", "2")
+    return level_from_rank(conv::str_to_int(raw))
+end
+
+pub fn set_verbose() is set_level(Level::Debug) end
+
+pub fn set_quiet() is set_level(Level::Warn) end
+
+;; ── ID sesji ─────────────────────────────────────────────────────────────
+
+;; Unix-czas pierwszego wywolania w tym procesie (jak `OnceLock` w Rust).
+pub fn session_id() -> int is
+    let raw: string = env::get_or("HAMMER__SESSION_ID", "")
+    if raw != "" is return conv::str_to_int(raw) end
+    let now: int = compat::time_now_unix()
+    env::set("HAMMER__SESSION_ID", to_string(now))
+    return now
+end
+
+;; ── Rdzen zapisu ─────────────────────────────────────────────────────────
+
+;; Bezpieczne ujecie tekstu w apostrofy dla `sh -c`.
+fn shell_quote(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn two_digits(n: int) -> string is
+    if n < 10 is return "0" + to_string(n) end
+    return to_string(n)
+end
+
+fn three_digits(n: int) -> string is
+    if n < 10 is return "00" + to_string(n) end
+    if n < 100 is return "0" + to_string(n) end
+    return to_string(n)
+end
+
+;; "YYYY-MM-DD HH:MM:SS.mmm" (czas lokalny, jak `chrono::Local::now()`).
+fn timestamp() -> string is
+    let ms: int = compat::time_now_ms()
+    let secs: int = ms / 1000
+    return compat::time_format(secs, "%Y-%m-%d %H:%M:%S") + "." + three_digits(ms % 1000)
+end
+
+fn write_entry(level: Level, msg: string) is
+    if level_rank(level) > level_rank(current_level()) is return end
+
+    let ts: string = timestamp()
+    let pid: int = compat::os_pid()
+    let sid: int = session_id()
+
+    let line: string = "[" + ts + "] " + level_as_str(level) +
+        " [pid=" + to_string(pid) + " sid=" + to_string(sid) + "] " + msg + "\n"
+
+    try_journald(level, msg)
+
+    rotate_if_needed()
+    fs::append(log_file(), line)
+end
+
+;; Czy journald jest osiagalny: sam plik gniazda (`/run/systemd/journal/
+;; socket`) istnieje tylko gdy journald dziala — tanie sprawdzenie bez
+;; odpalania procesu, jak w oryginale.
+pub fn journald_available() -> bool is
+    return fs::exists("/run/systemd/journal/socket")
+end
+
+fn journald_priority(level: Level) -> string is
+    match level is
+        Level::Error => return "3"
+        Level::Warn  => return "4"
+        Level::Info  => return "6"
+        Level::Pkg   => return "6"
+        Level::File  => return "6"
+        Level::Debug => return "7"
+    end
+    return "6"
+end
+
+;; Fire-and-forget, bledy ignorowane; stdout/stderr systemd-cat idzie do
+;; /dev/null (inaczej jego wlasne komunikaty blad wpadalyby w terminal
+;; uzytkownika przy kazdym wpisie — powod jak w komentarzu Rust).
+fn try_journald(level: Level, msg: string) is
+    if !journald_available() is return end
+    let cmd: string = "printf '%s' " + shell_quote(msg) +
+        " | systemd-cat --identifier=hammer --priority=" + journald_priority(level) +
+        " >/dev/null 2>&1"
+    proc::shell(cmd)
+end
+
+;; hammer.log -> hammer.log.1 -> ... -> hammer.log.5 (najstarszy odpada).
+fn rotate_if_needed() is
+    let path: string = log_file()
+    if !fs::exists(path) is return end
+    if fs::size(path) < log_max_bytes() is return end
+
+    let mut i: int = 4
+    while i >= 1 is
+        let old: string = path + "." + to_string(i)
+        let dst: string = path + "." + to_string(i + 1)
+        if fs::exists(old) is fs::rename(old, dst) end
+        i -= 1
+    end
+    fs::rename(path, path + ".1")
+end
+
+;; ── Publiczne funkcje logowania ──────────────────────────────────────────
+
+pub fn error(msg: string) is write_entry(Level::Error, msg) end
+pub fn warn(msg: string)  is write_entry(Level::Warn,  msg) end
+pub fn info(msg: string)  is write_entry(Level::Info,  msg) end
+pub fn debug(msg: string) is write_entry(Level::Debug, msg) end
+
+pub fn pkg(action: string, name: string, version: string) is
+    write_entry(Level::Pkg, fmt::pad_right(action, 10) + " " + name + "-" + version)
+end
+
+pub fn file_op(action: string, path: string) is
+    write_entry(Level::File, fmt::pad_right(action, 8) + " " + path)
+end
+
+pub fn cmd(args: [string]) is
+    write_entry(Level::Info, "cmd: hammer " + str::join(args, " "))
+end
+
+pub fn transaction_start(action: string, packages: [string]) is
+    write_entry(Level::Info, "transaction::" + action + " START [" + str::join(packages, ", ") + "]")
+end
+
+pub fn transaction_done(action: string, packages: [string]) is
+    write_entry(Level::Info, "transaction::" + action + " DONE  [" + str::join(packages, ", ") + "]")
+end
+
+;; Ustawia ID sesji, czyta HAMMER_LOG_LEVEL i dopisuje naglowek sesji.
+pub fn session_start() is
+    let sid: int = session_id()
+
+    let level_env: string = env::get_or("HAMMER_LOG_LEVEL", "")
+    if level_env != "" is
+        let lv: string = str::to_lower(level_env)
+        if lv == "error" is set_level(Level::Error) end
+        if lv == "warn"  is set_level(Level::Warn) end
+        if lv == "info"  is set_level(Level::Info) end
+        if lv == "pkg"   is set_level(Level::Pkg) end
+        if lv == "file"  is set_level(Level::File) end
+        if lv == "debug" is set_level(Level::Debug) end
+    end
+
+    let kernel: string = str::trim(compat::os_kernel_version())
+    let sep: string = str::repeat("═", 66)
+    let header: string = "\n" + sep + "\n[SESSION " + to_string(sid) +
+        "] ⬡ HAMMER v" + hammer_version() + "  pid=" + to_string(compat::os_pid()) +
+        "  kernel=" + kernel + "\n" + sep + "\n"
+    fs::append(log_file(), header)
+end
+
+;; ── hammer log (CLI) ─────────────────────────────────────────────────────
+
+;; Wartosc opcji `--nazwa=wartosc` albo "" gdy jej brak.
+fn opt_value(args: [string], prefix: string) -> string is
+    let mut i: int = 0
+    while i < args.len() is
+        let a: string = args[i]
+        if string_len(a) >= string_len(prefix) && string_slice(a, 0, string_len(prefix)) == prefix is
+            return string_slice(a, string_len(prefix), string_len(a))
+        end
+        i += 1
+    end
+    return ""
+end
+
+fn has_flag(args: [string], a: string, b: string) -> bool is
+    let mut i: int = 0
+    while i < args.len() is
+        if args[i] == a || args[i] == b is return true end
+        i += 1
+    end
+    return false
+end
+
+;; `-nN` albo `--lines=N`; domyslnie 50 (jak w Rust).
+fn lines_count(args: [string]) -> int is
+    let mut i: int = 0
+    while i < args.len() is
+        let a: string = args[i]
+        if string_len(a) >= 2 && string_slice(a, 0, 2) == "-n" is
+            let rest: string = str::trim(string_slice(a, 2, string_len(a)))
+            if str::is_numeric(rest) is return conv::str_to_int(rest) end
+        end
+        if string_len(a) >= 8 && string_slice(a, 0, 8) == "--lines=" is
+            let rest: string = string_slice(a, 8, string_len(a))
+            if str::is_numeric(rest) is return conv::str_to_int(rest) end
+        end
+        i += 1
+    end
+    return 50
+end
+
+;; Escapowanie stringa do JSON (`"`, `\`, sterujace).
+pub fn json_escape(s: string) -> string is
+    let mut out: string = ""
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(s, i)
+        if c == "\"" is
+            out = out + "\\\""
+        elsif c == "\\" is
+            out = out + "\\\\"
+        elsif c == "\n" is
+            out = out + "\\n"
+        elsif c == "\r" is
+            out = out + "\\r"
+        elsif c == "\t" is
+            out = out + "\\t"
+        else is
+            out = out + c
+        end
+        i += 1
+    end
+    return out
+end
+
+fn colour_line(line: string) -> string is
+    if compat::str_index_of(line, "ERROR") >= 0 is return colors::red(line) end
+    if compat::str_index_of(line, "WARN ") >= 0 is return colors::yellow(line) end
+    if compat::str_index_of(line, "DEBUG") >= 0 is return colors::dim(line) end
+    if compat::str_index_of(line, "PKG  ") >= 0 is return colors::bright_cyan(line) end
+    if compat::str_index_of(line, "SESSION") >= 0 is return colors::bold(line) end
+    return line
+end
+
+;; `hammer log [-nN|--lines=N] [--json] [-f|--follow] [--level=L]
+;;              [--session=ID] [--grep=TEKST]`
+;; Zwraca kod wyjscia procesu (0 = ok).
+pub fn cmd_log(args: [string]) -> int is
+    let n: int = lines_count(args)
+    let json_mode: bool = has_flag(args, "--json", "--json")
+    let follow_mode: bool = has_flag(args, "-f", "--follow")
+    let level_filter: string = opt_value(args, "--level=")
+    let session_raw: string = opt_value(args, "--session=")
+    let grep_filter: string = opt_value(args, "--grep=")
+
+    let path: string = log_file()
+    if !fs::exists(path) is
+        write("  " + colors::dim("·") + " No log file found at " + path)
+        return 0
+    end
+
+    let all: [string] = fs::read_lines(path)
+    let mut lines: [string] = []
+    let mut i: int = 0
+    while i < all.len() is
+        let l: string = all[i]
+        let mut keep: bool = true
+        if level_filter != "" && compat::str_index_of(l, str::to_upper(level_filter)) < 0 is keep = false end
+        if session_raw != "" && str::is_numeric(session_raw) &&
+           compat::str_index_of(l, "sid=" + session_raw) < 0 is keep = false end
+        if grep_filter != "" &&
+           compat::str_index_of(str::to_lower(l), str::to_lower(grep_filter)) < 0 is keep = false end
+        if keep is lines.push(l) end
+        i += 1
+    end
+
+    ;; ostatnie N linii
+    let total: int = lines.len()
+    let start: int = if total > n then total - n else 0
+    let mut tail: [string] = []
+    let mut k: int = start
+    while k < total is
+        tail.push(lines[k])
+        k += 1
+    end
+
+    if json_mode is
+        let mut out: string = "["
+        let mut j: int = 0
+        while j < tail.len() is
+            if j > 0 is out = out + "," end
+            out = out + "\n  {\n    \"line\": \"" + json_escape(tail[j]) + "\"\n  }"
+            j += 1
+        end
+        if tail.len() > 0 is out = out + "\n" end
+        write(out + "]")
+        return 0
+    end
+
+    write("")
+    write("  " + colors::bold(colors::bright_cyan("⬡")) + "  hammer log  (last " + to_string(tail.len()) + " lines)")
+    write("  " + colors::dim(str::repeat("─", 70)))
+
+    let mut m: int = 0
+    while m < tail.len() is
+        write("  " + colour_line(tail[m]))
+        m += 1
+    end
+
+    if follow_mode is
+        write("  " + colors::dim("·") + " Following log (Ctrl+C to stop)…")
+        let mut pos: int = fs::size(path)
+        while true is
+            compat::time_sleep_ms(500)
+            let new_size: int = fs::size(path)
+            if new_size > pos is
+                ;; tail -c +N liczy bajty od 1 — zachowuje semantyke bajtowa
+                ;; (w logu sa znaki wielobajtowe, np. "═").
+                let chunk: string = proc::shell("tail -c +" + to_string(pos + 1) + " " + shell_quote(path))
+                let parts: [string] = str::split(chunk, "\n")
+                let mut p: int = 0
+                while p < parts.len() is
+                    if parts[p] != "" is write("  " + parts[p]) end
+                    p += 1
+                end
+                pos = new_size
+            end
+        end
+    end
+    return 0
+end
