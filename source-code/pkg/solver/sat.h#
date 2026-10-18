@@ -1,0 +1,463 @@
+use "std -> strings" from "str"
+
+;; hammer -> pkg::solver::sat
+;;
+;; Zamiennik source-code/pkg/solver/sat.rs (CDCL, 874 linii) dla portu H#.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. SILNIK: zamiast CDCL (watched literals, VSIDS, uczenie klauzul, restarty
+;;    Luby, preprocessing, LBD) — zwarty DPLL z propagacja jednostkowa po
+;;    wszystkich klauzulach i chronologicznym cofaniem. Wynik SAT/UNSAT jest
+;;    ten sam (oba sa kompletne); roznia sie czas i liczniki w `SolverStats`.
+;;    Powod: w H# tablice maja semantyke wskaznikowa z realokacja przy `push`
+;;    (patrz PORT_STATUS.md), co czyni wierny port struktur CDCL (listy
+;;    obserwowanych literalow, kopiowanie klauzul) kruchym; dla zadania
+;;    `resolve_install` — WERYFIKACJI wyniku heurystyki, gdzie wszystkie
+;;    planowane pakiety sa jednostkami `true` — DPLL wystarcza.
+;; 2. Literaly: `+v` / `-v` (Rust: `v << 1 | neg`). Zmienne numerowane od 1.
+;; 3. `Result<bool, SolverError>` -> `sat_solve` zwraca int: 1 = SAT,
+;;    0 = przekroczono limit konfliktow (Ok(false) w Rust), -1 = UNSAT; tresc
+;;    bledu w `Sat.err`. `add_clause` zwraca "" albo blad (pusta klauzula).
+;; 4. Domyslna faza decyzji: `false` (jak Rust: pakiet nie jest instalowany,
+;;    dopoki nic go nie wymusza); `prefer_installed(v)` -> `true`.
+;; 5. `SolverStats.propagations` pominiete w porcie (struktura w `mod.h#`
+;;    ma 5 pol); `restarts` zawsze 0 (DPLL nie restartuje).
+;; 7. STYL FUNKCYJNY: interpreter H# przekazuje struktury i tablice przez
+;;    WARTOSC, a backend LLVM przez wskaznik — mutacja argumentu jest wiec
+;;    widoczna u wolajacego tylko w LLVM. Kazda funkcja zwraca nowy `Sat`
+;;    (`s = sat_intern(s, "x")`).
+;; 6. Brak `preprocess()` (pure-literal/FLP): to optymalizacje bez wplywu na
+;;    satysfakcjonowalnosc; `sat_preprocess` zostaje jako no-op dla zgodnosci
+;;    wywolan.
+
+pub struct IntList is
+    pub items: [int]
+end
+
+pub struct Sat is
+    ;; names[v] = nazwa zmiennej v (names[0] puste)
+    pub names:     [string]
+    pub clauses:   [IntList]
+    ;; prefer[v] = true => domyslna faza `true`
+    pub prefer:    [bool]
+    pub limit:     int
+    pub conflicts: int
+    pub decisions: int
+    ;; przypisanie po `sat_solve`: 0 = brak, 1 = true, -1 = false (indeks = zmienna)
+    pub assign:    [int]
+    ;; wynik `sat_solve`: 1 = SAT, 0 = limit konfliktow, -1 = UNSAT
+    pub status:    int
+    pub err:       string
+end
+
+pub fn sat_new(conflict_limit: int) -> Sat is
+    let names: [string] = [""]
+    let clauses: [IntList] = []
+    let prefer: [bool] = [false]
+    let assign: [int] = [0]
+    return Sat { names: names, clauses: clauses, prefer: prefer,
+        limit: conflict_limit, conflicts: 0, decisions: 0, assign: assign, status: 0, err: "" }
+end
+
+pub fn sat_n_vars(s: Sat) -> int is
+    return s.names.len() - 1
+end
+
+pub fn sat_n_clauses(s: Sat) -> int is
+    return s.clauses.len()
+end
+
+fn append_str(a: [string], x: string) -> [string] is
+    let mut out: [string] = a
+    out.push(x)
+    return out
+end
+
+fn append_bool(a: [bool], x: bool) -> [bool] is
+    let mut out: [bool] = a
+    out.push(x)
+    return out
+end
+
+fn append_int(a: [int], x: int) -> [int] is
+    let mut out: [int] = a
+    out.push(x)
+    return out
+end
+
+fn append_clause(a: [IntList], x: IntList) -> [IntList] is
+    let mut out: [IntList] = a
+    out.push(x)
+    return out
+end
+
+;; Zapewnia istnienie zmiennej dla `name`; zwraca nowy stan.
+pub fn sat_intern(s0: Sat, name: string) -> Sat is
+    if sat_var(s0, name) > 0 is return s0 end
+    let mut s: Sat = s0
+    s.names = append_str(s.names, name)
+    s.prefer = append_bool(s.prefer, false)
+    s.assign = append_int(s.assign, 0)
+    return s
+end
+
+;; Numer zmiennej (0 gdy nie istnieje) — wolac PO `sat_intern`. Wyszukiwanie
+;; liniowe (bez map: `std -> collections` dziala tylko w LLVM, a interpreter
+;; jest jedynym sposobem uruchomienia `self_test`); przy setkach zmiennych
+;; koszt jest pomijalny.
+pub fn sat_var(s: Sat, name: string) -> int is
+    let mut v: int = 1
+    while v < s.names.len() is
+        if s.names[v] == name is return v end
+        v += 1
+    end
+    return 0
+end
+
+pub fn sat_prefer_installed(s0: Sat, name: string) -> Sat is
+    let s: Sat = sat_intern(s0, name)
+    let v: int = sat_var(s, name)
+    let mut p: [bool] = s.prefer
+    p[v] = true
+    let mut out: Sat = s
+    out.prefer = p
+    return out
+end
+
+fn abs_i(x: int) -> int is
+    if x < 0 is return 0 - x end
+    return x
+end
+
+fn lit_text(s: Sat, lit: int) -> string is
+    if lit < 0 is return "¬" + s.names[abs_i(lit)] end
+    return s.names[lit]
+end
+
+fn clause_text(s: Sat, lits: [int]) -> string is
+    let mut parts: [string] = []
+    let mut i: int = 0
+    while i < lits.len() is
+        parts.push(lit_text(s, lits[i]))
+        i += 1
+    end
+    return str::join(parts, " ∨ ")
+end
+
+;; Dodaje klauzule (`[+v, -w, ...]`) i zwraca nowy stan; blad (pusta
+;; klauzula) trafia do `err`. Usuwa duplikaty literalow, pomija tautologie.
+pub fn sat_add_clause(s0: Sat, lits: [int]) -> Sat is
+    let mut clean: [int] = []
+    let mut i: int = 0
+    while i < lits.len() is
+        let l: int = lits[i]
+        let mut dup: bool = false
+        let mut j: int = 0
+        while j < clean.len() is
+            if clean[j] == l is dup = true end
+            if clean[j] == 0 - l is return s0 end
+            j += 1
+        end
+        if !dup is clean.push(l) end
+        i += 1
+    end
+    let mut s: Sat = s0
+    if clean.len() == 0 is
+        s.err = "empty clause (unsatisfiable requirement)"
+        return s
+    end
+    s.clauses = append_clause(s.clauses, IntList { items: clean })
+    return s
+end
+
+;; no-op (patrz odejscie 6)
+pub fn sat_preprocess(s: Sat) -> Sat is
+    return s
+end
+
+;; ── Ewaluacja klauzuli ───────────────────────────────────────────────────
+
+fn code_sat() -> int is return 1000000001 end
+fn code_conflict() -> int is return 1000000002 end
+fn code_open() -> int is return 1000000003 end
+
+;; Stan klauzuli przy przypisaniu `a`: kody powyzej albo jedyny wolny literal.
+fn clause_eval(lits: [int], a: [int]) -> int is
+    let mut free: int = 0
+    let mut n_free: int = 0
+    let mut i: int = 0
+    while i < lits.len() is
+        let l: int = lits[i]
+        let v: int = abs_i(l)
+        let val: int = a[v]
+        if val == 0 is
+            n_free += 1
+            free = l
+        else is
+            let is_true: bool = (l > 0 && val == 1) || (l < 0 && val == -1)
+            if is_true is return code_sat() end
+        end
+        i += 1
+    end
+    if n_free == 0 is return code_conflict() end
+    if n_free == 1 is return free end
+    return code_open()
+end
+
+fn with_lit(a: [int], lit: int) -> [int] is
+    let mut out: [int] = a
+    if lit > 0 is
+        out[lit] = 1
+    else is
+        out[0 - lit] = -1
+    end
+    return out
+end
+
+;; Stan przeszukiwania: przypisanie, slad (kolejnosc przypisan), konflikt.
+pub struct Search is
+    pub assign:   [int]
+    pub trail:    [int]
+    ;; indeks klauzuli w konflikcie albo -1
+    pub conflict: int
+end
+
+;; Propagacja jednostkowa do punktu stalego.
+fn propagate(s: Sat, st0: Search) -> Search is
+    let mut assign: [int] = st0.assign
+    let mut trail: [int] = st0.trail
+    let mut changed: bool = true
+    while changed is
+        changed = false
+        let mut ci: int = 0
+        while ci < s.clauses.len() is
+            let r: int = clause_eval(s.clauses[ci].items, assign)
+            if r == code_conflict() is
+                return Search { assign: assign, trail: trail, conflict: ci }
+            end
+            if r != code_sat() && r != code_open() is
+                assign = with_lit(assign, r)
+                trail = append_int(trail, abs_i(r))
+                changed = true
+            end
+            ci += 1
+        end
+    end
+    return Search { assign: assign, trail: trail, conflict: -1 }
+end
+
+;; Cofa przypisania do dlugosci sladu `pos`.
+fn undo_to(st: Search, pos: int) -> Search is
+    let mut assign: [int] = st.assign
+    let mut keep: [int] = []
+    let mut i: int = 0
+    while i < st.trail.len() is
+        if i < pos is
+            keep.push(st.trail[i])
+        else is
+            assign[st.trail[i]] = 0
+        end
+        i += 1
+    end
+    return Search { assign: assign, trail: keep, conflict: -1 }
+end
+
+fn first_unassigned(assign: [int]) -> int is
+    let mut v: int = 1
+    while v < assign.len() is
+        if assign[v] == 0 is return v end
+        v += 1
+    end
+    return 0
+end
+
+fn take_int(a: [int], n: int) -> [int] is
+    let mut out: [int] = []
+    let mut i: int = 0
+    while i < n is
+        out.push(a[i])
+        i += 1
+    end
+    return out
+end
+
+fn take_bool(a: [bool], n: int) -> [bool] is
+    let mut out: [bool] = []
+    let mut i: int = 0
+    while i < n is
+        out.push(a[i])
+        i += 1
+    end
+    return out
+end
+
+;; Rozwiazuje; zwraca nowy stan z `status` (1 SAT, 0 limit, -1 UNSAT),
+;; `assign`, licznikami i ewentualnym `err`.
+pub fn sat_solve(s0: Sat) -> Sat is
+    let mut s: Sat = s0
+    if s.err != "" is
+        s.status = -1
+        return s
+    end
+    let mut st: Search = Search { assign: s.assign, trail: [], conflict: -1 }
+    let mut dec_var: [int] = []
+    let mut dec_pos: [int] = []
+    let mut dec_flip: [bool] = []
+    let mut conflicts: int = 0
+    let mut decisions: int = 0
+
+    while true is
+        st = propagate(s, st)
+        if st.conflict >= 0 is
+            let bad: int = st.conflict
+            conflicts += 1
+            if conflicts > s.limit is
+                s.assign = st.assign
+                s.conflicts = conflicts
+                s.decisions = decisions
+                s.status = 0
+                return s
+            end
+            let mut resolved: bool = false
+            while dec_var.len() > 0 && !resolved is
+                let top: int = dec_var.len() - 1
+                let v: int = dec_var[top]
+                let pos: int = dec_pos[top]
+                let flipped: bool = dec_flip[top]
+                dec_var = take_int(dec_var, top)
+                dec_pos = take_int(dec_pos, top)
+                dec_flip = take_bool(dec_flip, top)
+                st = undo_to(st, pos)
+                if !flipped is
+                    ;; faza poczatkowa = prefer[v]; probuj przeciwnej
+                    let lit: int = if s.prefer[v] then 0 - v else v
+                    dec_var.push(v)
+                    dec_pos.push(st.trail.len())
+                    dec_flip.push(true)
+                    st = Search { assign: with_lit(st.assign, lit), trail: append_int(st.trail, v), conflict: -1 }
+                    resolved = true
+                end
+            end
+            if !resolved is
+                s.assign = st.assign
+                s.conflicts = conflicts
+                s.decisions = decisions
+                s.status = -1
+                s.err = "unsatisfiable: " + clause_text(s, s.clauses[bad].items)
+                return s
+            end
+        else is
+            let v: int = first_unassigned(st.assign)
+            if v == 0 is
+                s.assign = st.assign
+                s.conflicts = conflicts
+                s.decisions = decisions
+                s.status = 1
+                return s
+            end
+            decisions += 1
+            dec_var.push(v)
+            dec_pos.push(st.trail.len())
+            dec_flip.push(false)
+            let lit: int = if s.prefer[v] then v else 0 - v
+            st = Search { assign: with_lit(st.assign, lit), trail: append_int(st.trail, v), conflict: -1 }
+        end
+    end
+    return s
+end
+
+;; Wartosc zmiennej po rozwiazaniu: 1 true, -1 false, 0 bez znaczenia.
+pub fn sat_value(s: Sat, name: string) -> int is
+    let v: int = sat_var(s, name)
+    if v == 0 is return 0 end
+    return s.assign[v]
+end
+
+;; ── Testy ────────────────────────────────────────────────────────────────
+
+fn t_expect(label: string, got: int, want: int) -> int is
+    if got == want is return 0 end
+    write("sat::self_test FAIL: " + label + " got " + to_string(got) + " want " + to_string(want))
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow.
+pub fn self_test() -> int is
+    let mut f: int = 0
+
+    let mut s1: Sat = sat_new(1000)
+    s1 = sat_intern(s1, "a")
+    s1 = sat_intern(s1, "b")
+    let a: int = sat_var(s1, "a")
+    let b: int = sat_var(s1, "b")
+    s1 = sat_add_clause(s1, [a])
+    s1 = sat_add_clause(s1, [0 - a, b])
+    s1 = sat_solve(s1)
+    f += t_expect("implication SAT", s1.status, 1)
+    f += t_expect("b forced true", sat_value(s1, "b"), 1)
+
+    let mut s2: Sat = sat_new(1000)
+    s2 = sat_intern(s2, "x")
+    s2 = sat_intern(s2, "y")
+    let x: int = sat_var(s2, "x")
+    let y: int = sat_var(s2, "y")
+    s2 = sat_add_clause(s2, [x])
+    s2 = sat_add_clause(s2, [y])
+    s2 = sat_add_clause(s2, [0 - x, 0 - y])
+    s2 = sat_solve(s2)
+    f += t_expect("conflict UNSAT", s2.status, -1)
+
+    let mut s3: Sat = sat_new(1000)
+    s3 = sat_intern(s3, "p")
+    s3 = sat_intern(s3, "q")
+    s3 = sat_intern(s3, "r")
+    let p: int = sat_var(s3, "p")
+    let q: int = sat_var(s3, "q")
+    let r: int = sat_var(s3, "r")
+    s3 = sat_add_clause(s3, [p])
+    s3 = sat_add_clause(s3, [0 - p, q, r])
+    s3 = sat_add_clause(s3, [0 - q, 0 - r])
+    s3 = sat_solve(s3)
+    f += t_expect("OR-group SAT", s3.status, 1)
+    let exactly_one: int = (if sat_value(s3, "q") == 1 then 1 else 0) + (if sat_value(s3, "r") == 1 then 1 else 0)
+    f += t_expect("exactly one of q,r", exactly_one, 1)
+
+    let mut s4: Sat = sat_new(1000)
+    s4 = sat_intern(s4, "m")
+    s4 = sat_intern(s4, "n")
+    let m: int = sat_var(s4, "m")
+    let n: int = sat_var(s4, "n")
+    s4 = sat_add_clause(s4, [m, n])
+    s4 = sat_prefer_installed(s4, "n")
+    s4 = sat_solve(s4)
+    f += t_expect("prefer installed SAT", s4.status, 1)
+    f += t_expect("n preferred true", sat_value(s4, "n"), 1)
+
+    ;; wymaga cofania: (a|b) & (!a|c) & (!b|c) & (!c|d) & !d  -> UNSAT
+    let mut s5: Sat = sat_new(1000)
+    s5 = sat_intern(s5, "a")
+    s5 = sat_intern(s5, "b")
+    s5 = sat_intern(s5, "c")
+    s5 = sat_intern(s5, "d")
+    let a5: int = sat_var(s5, "a")
+    let b5: int = sat_var(s5, "b")
+    let c5: int = sat_var(s5, "c")
+    let d5: int = sat_var(s5, "d")
+    s5 = sat_add_clause(s5, [a5, b5])
+    s5 = sat_add_clause(s5, [0 - a5, c5])
+    s5 = sat_add_clause(s5, [0 - b5, c5])
+    s5 = sat_add_clause(s5, [0 - c5, d5])
+    s5 = sat_add_clause(s5, [0 - d5])
+    s5 = sat_solve(s5)
+    f += t_expect("backtracking UNSAT", s5.status, -1)
+
+    ;; limit konfliktow 0 przy konflikcie => status 0
+    let mut s6: Sat = sat_new(0)
+    s6 = sat_intern(s6, "u")
+    let u: int = sat_var(s6, "u")
+    s6 = sat_add_clause(s6, [u])
+    s6 = sat_add_clause(s6, [0 - u])
+    s6 = sat_solve(s6)
+    f += t_expect("conflict budget exceeded", s6.status, 0)
+    return f
+end
