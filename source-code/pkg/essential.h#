@@ -1,0 +1,160 @@
+use "std -> strings" from "str"
+use "std -> fmt"     from "fmt"
+use "std -> process"    from "proc"
+
+mod internal
+mod ui
+mod package
+mod cache
+mod db
+
+;; hammer -> pkg::essential
+;;
+;; Port of source-code/pkg/essential.rs (Rust) to H#: ochrona pakietow
+;; krytycznych przed usunieciem (`guard_essential_removal`) i `hammer essential`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `EssentialDb` bez `HashSet`: dwie tablice nazw (`essential`,
+;;    `required`); `is_*` = liniowe wyszukiwanie.
+;; 2. `guard_essential_removal` zwraca `string` ("" = mozna usuwac) —
+;;    konwencja z reszty portu zamiast `anyhow::Result<()>`. Ostrzezenie
+;;    przy `--force-essential` idzie na stderr tak samo jak w Rust
+;;    (`eprintln!`); w H# `write_err` — patrz nizej.
+;; 3. `build` korzysta z `package::Package.priority` (== "required") tak jak
+;;    oryginal; pole `essential:` z indeksu NIE jest uzywane — zgodnie z
+;;    komentarzem w Rust ("not in our Package struct yet").
+
+;; Zawsze-krytyczne pakiety niezaleznie od pola Essential.
+pub fn hammer_critical() -> [string] is
+    return [
+        "bash", "dash", "coreutils", "util-linux", "grep", "sed", "awk",
+        "gawk", "findutils", "diffutils", "tar", "gzip", "bzip2", "xz-utils",
+        "libc6", "libgcc-s1", "libstdc++6",
+        "systemd", "systemd-sysv", "udev",
+        "login", "passwd", "shadow-utils",
+        "apt-utils",   ;; zostaje dla triggerow dpkg
+        "hammer"       ;; ochrona samego siebie
+    ]
+end
+
+pub struct EssentialDb is
+    pub essential: [string]
+    pub required:  [string]
+end
+
+fn contains(list: [string], name: string) -> bool is
+    let mut i: int = 0
+    while i < list.len() is
+        if list[i] == name is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Buduje z cache pakietow.
+pub fn essential_build(c: cache::PackageCache) -> EssentialDb is
+    let mut required: [string] = []
+    let all: [package::Package] = cache::cache_all_packages(c)
+    let mut i: int = 0
+    while i < all.len() is
+        let p: package::Package = all[i]
+        if p.priority != nil is
+            let prio: string = p.priority
+            if prio == "required" is required.push(p.name) end
+        end
+        i += 1
+    end
+    return EssentialDb { essential: hammer_critical(), required: required }
+end
+
+pub fn is_essential(d: EssentialDb, name: string) -> bool is
+    return contains(d.essential, name) || contains(hammer_critical(), name)
+end
+
+pub fn is_required(d: EssentialDb, name: string) -> bool is
+    return contains(d.required, name)
+end
+
+pub fn is_protected(d: EssentialDb, name: string) -> bool is
+    return is_essential(d, name) || is_required(d, name)
+end
+
+fn write_err(line: string) is
+    proc::shell("printf '%s\n' " + "'" + str::replace_all(line, "'", "'\\''") + "' >&2")
+end
+
+;; Wolac PRZED kazda transakcja usuwania. "" = mozna, inaczej tresc bledu.
+pub fn guard_essential_removal(to_remove: [string], force_essential: bool, c: cache::PackageCache) -> string is
+    let d: EssentialDb = essential_build(c)
+    let mut blocked: [string] = []
+    let mut i: int = 0
+    while i < to_remove.len() is
+        if is_protected(d, to_remove[i]) is blocked.push(to_remove[i]) end
+        i += 1
+    end
+    if blocked.len() == 0 is return "" end
+
+    if force_essential is
+        let mut coloured: [string] = []
+        let mut j: int = 0
+        while j < blocked.len() is
+            coloured.push(ui::red_bold(blocked[j]))
+            j += 1
+        end
+        write_err("")
+        write_err("  " + ui::red_bold("!") + " --force-essential: removing protected package(s): " + str::join(coloured, ", "))
+        write_err("  " + ui::red_bold("WARNING:") + " This may make your system unbootable.")
+        write_err("")
+        return ""    ;; dozwolone mimo ostrzezenia
+    end
+
+    let mut quoted: [string] = []
+    let mut k: int = 0
+    while k < blocked.len() is
+        quoted.push("'" + blocked[k] + "'")
+        k += 1
+    end
+    return "Cannot remove essential/required package(s): " + str::join(quoted, ", ") +
+        "\n  These packages are critical for system operation.\n  " +
+        "Use --force-essential to override (DANGEROUS)."
+end
+
+;; `hammer essential` — wypisuje zainstalowane chronione pakiety.
+pub fn cmd_list_essential() -> string is
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+    let d: EssentialDb = essential_build(c)
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Essential/Required packages")
+    write("  " + ui::dim(str::repeat("─", 60)))
+
+    let all: [db::InstalledPackage] = idb.list_all()
+    let mut shown: int = 0
+    let mut i: int = 0
+    while i < all.len() is
+        let p: db::InstalledPackage = all[i]
+        if is_protected(d, p.name) is
+            let reason: string = if is_essential(d, p.name) then "essential" else "required"
+            write("  " + ui::bright_green("●") + " " + ui::bold(fmt::pad_right(p.name, 32)) + " " +
+                  ui::cyan(fmt::pad_right(p.version, 12)) + " " + ui::dim(reason))
+            shown += 1
+        end
+        i += 1
+    end
+
+    ;; krytyczne, ktorych brakuje
+    let crit: [string] = hammer_critical()
+    let mut k: int = 0
+    while k < crit.len() is
+        if !idb.is_installed(crit[k]) is
+            write("  " + ui::yellow("○") + " " + ui::bold(fmt::pad_right(crit[k], 32)) + " " +
+                  ui::red_bold("NOT INSTALLED") + " " + ui::red("critical"))
+        end
+        k += 1
+    end
+
+    write("")
+    write("  \x1b[36m" + to_string(shown) + "\x1b[0m essential/required package(s) installed.")
+    return ""
+end
