@@ -1,0 +1,770 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod pkg
+mod internal
+mod postinst
+
+;; hammer -> profile
+;;
+;; Port of source-code/system/profile.rs (Rust) to H#: generacje
+;; (generations.json), kompozycja profilu (dowiazania do store), relink
+;; binarek do /usr/bin, aktywacja pending, przelaczanie `active`,
+;; skrypty postinst, usluga `hammer-activate.service`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. JSON: `serde_json` -> `internal/jsonlite.h#` (tokenizer + czytnik
+;;    schematu generations.json) i reczny zapis w formacie
+;;    `to_string_pretty` (wciecie 2 spacje, puste tablice jako `[]`).
+;;    Kolejnosc i nazwy pol takie same, wiec plik jest wymienny z wersja
+;;    Rust. Blad skladni w `load_from` => pusta baza (jak `unwrap_or_default`);
+;;    w `load` => blad "Parsing generations.json".
+;; 2. `DateTime<Utc>` -> `string` RFC3339 z `date -u` ("...Z", sekundy).
+;;    chrono (Rust) czyta tez ten format; zapisuje nanosekundy.
+;; 3. `Option<GenState>` -> `state: string?` ("Active" | "Pending" | "Old" |
+;;    "Failed"; nil = brak pola/null), bo serde zapisuje wariant jako napis.
+;; 4. `Result<T>` -> struktury z polem `err` ("" = Ok) albo `string` bledu.
+;; 5. `walkdir` + `symlink` w `link_store_into_profile` -> jedno
+;;    `cp -rsnT -- <store> <profile>` (katalogi tworzone, pliki jako
+;;    dowiazania symboliczne, istniejace cele pomijane — jak
+;;    `!dest.symlink_metadata().is_ok()`). Roznica: Rust kanonizowal zrodlo
+;;    (`canonicalize`), `cp -s` wskazuje na sciezke w store (bez `/./` —
+;;    sprawdzone; wariant `<store>/.` wstawial `/./` do celu dowiazania);
+;;    dla symlinkow w store oba rozwiazuja sie do tego samego pliku.
+;;    `-n` daje ostrzezenie coreutils (stderr -> /dev/null), a `--update=none`
+;;    nie istnieje przed coreutils 9.3 (Debian 12 ma 9.1).
+;; 6. `relink_bins`: decyzja per plik w jednym `sh -c` (test -d/-x/-L,
+;;    readlink, rm, ln -s) zamiast kilku wywolan systemowych na plik; to
+;;    samo drzewo decyzji co w Rust, w tym `seen` (pierwszy katalog w
+;;    kolejnosci BIN_SOURCE_DIRS wygrywa).
+;; 7. `switch_active`: `rename(tmp, active)` -> `mv -T tmp active` (rename(2)).
+;; 8. Sciezki (`GENERATIONS_FILE`, `PENDING_LINK`, `ACTIVATION_LOG`) jako
+;;    funkcje nad `build_mode::` (tryb w czasie dzialania).
+;; 9. `activate_pending` zwraca `ActivateOutcome { ok, err, result }`.
+
+pub fn boot_gen_file() -> string is return "/boot/hammer-boot-gen" end
+pub fn generations_file() -> string is return build_mode::generations_file() end
+pub fn pending_link() -> string is return compat::path_join(build_mode::base_dir(), "pending") end
+pub fn activation_log() -> string is return compat::path_join(build_mode::db_dir(), "activation.log") end
+
+fn bin_source_dirs() -> [string] is
+    return ["usr/bin", "usr/local/bin", "usr/sbin", "usr/local/sbin", "bin", "sbin"]
+end
+
+fn link_target_dir() -> string is return "/usr/bin" end
+
+;; ── Struktury ────────────────────────────────────────────────────────────
+
+pub struct GenPackage is
+    pub name:       string
+    pub version:    string
+    pub store_hash: string
+end
+
+pub struct Generation is
+    pub number:    int
+    pub timestamp: string
+    pub packages:  [GenPackage]
+    pub note:      string?
+    pub state:     string?
+end
+
+pub fn gen_profile_path(g: Generation) -> string is
+    return compat::path_join(store::profiles_dir(), "gen-" + to_string(g.number))
+end
+
+pub fn gen_package_count(g: Generation) -> int is return g.packages.len() end
+
+pub struct GenerationsDb is
+    pub current:     int
+    pub pending:     int?
+    pub generations: [Generation]
+end
+
+pub struct LoadResult is
+    pub db:  GenerationsDb
+    pub err: string
+end
+
+pub struct ActivationResult is
+    pub gen_number:      int
+    pub packages_linked: int
+    pub scripts_failed:  [string]
+    pub already_active:  bool
+end
+
+pub struct ActivateOutcome is
+    pub ok:     bool
+    pub err:    string
+    pub result: ActivationResult
+end
+
+pub struct ComposeResult is
+    pub generation: Generation
+    pub err:        string
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sys_ok(cmd: string) -> bool is
+    return system(cmd) == 0
+end
+
+pub fn db_empty() -> GenerationsDb is
+    let none: [Generation] = []
+    return GenerationsDb { current: 0, pending: nil, generations: none }
+end
+
+;; ── GenerationsDb ────────────────────────────────────────────────────────
+
+pub fn db_get(d: GenerationsDb, number: int) -> Generation? is
+    let mut i: int = 0
+    while i < d.generations.len() is
+        if d.generations[i].number == number is return d.generations[i] end
+        i += 1
+    end
+    return nil
+end
+
+pub fn db_current_gen(d: GenerationsDb) -> Generation? is
+    return db_get(d, d.current)
+end
+
+pub fn db_next_number(d: GenerationsDb) -> int is
+    let mut mx: int = 0
+    let mut i: int = 0
+    while i < d.generations.len() is
+        if d.generations[i].number > mx is mx = d.generations[i].number end
+        i += 1
+    end
+    return mx + 1
+end
+
+;; Numer aktywnej generacji wg dowiazania `active`.
+pub fn db_active_num(d: GenerationsDb) -> int? is
+    return read_active_gen()
+end
+
+;; ── JSON: czytanie ───────────────────────────────────────────────────────
+
+struct PkgParsed is
+    pub pkg: GenPackage
+    pub pos: int
+    pub ok:  bool
+end
+
+struct GenParsed is
+    pub gen: Generation
+    pub pos: int
+    pub ok:  bool
+end
+
+fn num_of(tok: string) -> int is
+    if !jsonlite::is_word_tok(tok) is return 0 end
+    let t: string = jsonlite::tok_text(tok)
+    if t != "" && str::is_numeric(t) is return conv::str_to_int(t) end
+    return 0
+end
+
+fn parse_package(toks: [string], start: int) -> PkgParsed is
+    let mut p: GenPackage = GenPackage { name: "", version: "", store_hash: "" }
+    let mut pos: int = start
+    if pos >= toks.len() || toks[pos] != "{" is return PkgParsed { pkg: p, pos: pos, ok: false } end
+    pos += 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is
+            return PkgParsed { pkg: p, pos: pos, ok: false }
+        end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        let v: string = toks[vpos]
+        if key == "name" && jsonlite::is_string_tok(v) is p.name = jsonlite::tok_text(v) end
+        if key == "version" && jsonlite::is_string_tok(v) is p.version = jsonlite::tok_text(v) end
+        if key == "store_hash" && jsonlite::is_string_tok(v) is p.store_hash = jsonlite::tok_text(v) end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return PkgParsed { pkg: p, pos: pos, ok: false } end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    if pos >= toks.len() is return PkgParsed { pkg: p, pos: pos, ok: false } end
+    return PkgParsed { pkg: p, pos: pos + 1, ok: true }
+end
+
+fn parse_generation(toks: [string], start: int) -> GenParsed is
+    let none_pk: [GenPackage] = []
+    let mut g: Generation = Generation { number: 0, timestamp: "", packages: none_pk, note: nil, state: nil }
+    let mut pos: int = start
+    if pos >= toks.len() || toks[pos] != "{" is return GenParsed { gen: g, pos: pos, ok: false } end
+    pos += 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is
+            return GenParsed { gen: g, pos: pos, ok: false }
+        end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        let v: string = toks[vpos]
+        if key == "number" is
+            g.number = num_of(v)
+        elsif key == "timestamp" && jsonlite::is_string_tok(v) is
+            g.timestamp = jsonlite::tok_text(v)
+        elsif key == "note" && jsonlite::is_string_tok(v) is
+            g.note = jsonlite::tok_text(v)
+        elsif key == "state" && jsonlite::is_string_tok(v) is
+            g.state = jsonlite::tok_text(v)
+        elsif key == "packages" && v == "[" is
+            let mut pkgs: [GenPackage] = []
+            let mut ppos: int = vpos + 1
+            while ppos < toks.len() && toks[ppos] != "]" is
+                let pr: PkgParsed = parse_package(toks, ppos)
+                if !pr.ok is return GenParsed { gen: g, pos: ppos, ok: false } end
+                pkgs.push(pr.pkg)
+                ppos = pr.pos
+                if ppos < toks.len() && toks[ppos] == "," is ppos += 1 end
+            end
+            g.packages = pkgs
+        end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return GenParsed { gen: g, pos: pos, ok: false } end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    if pos >= toks.len() is return GenParsed { gen: g, pos: pos, ok: false } end
+    return GenParsed { gen: g, pos: pos + 1, ok: true }
+end
+
+;; "" = Ok.
+pub fn parse_generations_json(text: string) -> LoadResult is
+    let toks: [string] = jsonlite::tokenize(text)
+    if toks.len() == 0 || toks[0] != "{" is
+        return LoadResult { db: db_empty(), err: "Parsing generations.json" }
+    end
+    let mut d: GenerationsDb = db_empty()
+    let mut gens: [Generation] = []
+    let mut pos: int = 1
+    while pos < toks.len() && toks[pos] != "}" is
+        if !jsonlite::is_string_tok(toks[pos]) || pos + 2 >= toks.len() is
+            return LoadResult { db: db_empty(), err: "Parsing generations.json" }
+        end
+        let key: string = jsonlite::tok_text(toks[pos])
+        let vpos: int = pos + 2
+        let v: string = toks[vpos]
+        if key == "current" is
+            d.current = num_of(v)
+        elsif key == "pending" is
+            if jsonlite::is_word_tok(v) && !jsonlite::is_null_tok(v) is d.pending = num_of(v) end
+        elsif key == "generations" && v == "[" is
+            let mut gpos: int = vpos + 1
+            while gpos < toks.len() && toks[gpos] != "]" is
+                let gr: GenParsed = parse_generation(toks, gpos)
+                if !gr.ok is return LoadResult { db: db_empty(), err: "Parsing generations.json" } end
+                gens.push(gr.gen)
+                gpos = gr.pos
+                if gpos < toks.len() && toks[gpos] == "," is gpos += 1 end
+            end
+        end
+        let next: int = jsonlite::skip_value(toks, vpos)
+        if next < 0 is return LoadResult { db: db_empty(), err: "Parsing generations.json" } end
+        pos = next
+        if pos < toks.len() && toks[pos] == "," is pos += 1 end
+    end
+    d.generations = gens
+    return LoadResult { db: d, err: "" }
+end
+
+;; Brak pliku => pusta baza.
+pub fn db_load() -> LoadResult is
+    let file: string = generations_file()
+    if !fs::exists(file) is return LoadResult { db: db_empty(), err: "" } end
+    let r: LoadResult = parse_generations_json(fs::read(file))
+    if r.err != "" is return LoadResult { db: db_empty(), err: r.err } end
+    return r
+end
+
+;; Wersja tolerancyjna: zepsuty JSON => pusta baza, bez bledu.
+pub fn db_load_from(file: string) -> GenerationsDb is
+    if !fs::exists(file) is return db_empty() end
+    let r: LoadResult = parse_generations_json(fs::read(file))
+    if r.err != "" is return db_empty() end
+    return r.db
+end
+
+;; ── JSON: zapis (format `serde_json::to_string_pretty`) ──────────────────
+
+fn gen_to_json(g: Generation) -> string is
+    let mut out: string = "    {\n"
+    out = out + "      \"number\": " + to_string(g.number) + ",\n"
+    out = out + "      \"timestamp\": \"" + jsonlite::escape(g.timestamp) + "\",\n"
+    if g.packages.len() == 0 is
+        out = out + "      \"packages\": [],\n"
+    else is
+        out = out + "      \"packages\": [\n"
+        let mut i: int = 0
+        while i < g.packages.len() is
+            let p: GenPackage = g.packages[i]
+            out = out + "        {\n"
+            out = out + "          \"name\": \"" + jsonlite::escape(p.name) + "\",\n"
+            out = out + "          \"version\": \"" + jsonlite::escape(p.version) + "\",\n"
+            out = out + "          \"store_hash\": \"" + jsonlite::escape(p.store_hash) + "\"\n"
+            out = out + "        }"
+            if i + 1 < g.packages.len() is out = out + "," end
+            out = out + "\n"
+            i += 1
+        end
+        out = out + "      ],\n"
+    end
+    out = out + "      \"note\": " + jsonlite::str_or_null(g.note) + ",\n"
+    out = out + "      \"state\": " + jsonlite::str_or_null(g.state) + "\n"
+    out = out + "    }"
+    return out
+end
+
+pub fn generations_to_json(d: GenerationsDb) -> string is
+    let mut out: string = "{\n"
+    out = out + "  \"current\": " + to_string(d.current) + ",\n"
+    if d.pending == nil is
+        out = out + "  \"pending\": null,\n"
+    else is
+        let pn: int = d.pending
+        out = out + "  \"pending\": " + to_string(pn) + ",\n"
+    end
+    if d.generations.len() == 0 is
+        out = out + "  \"generations\": []\n"
+    else is
+        out = out + "  \"generations\": [\n"
+        let mut i: int = 0
+        while i < d.generations.len() is
+            out = out + gen_to_json(d.generations[i])
+            if i + 1 < d.generations.len() is out = out + "," end
+            out = out + "\n"
+            i += 1
+        end
+        out = out + "  ]\n"
+    end
+    out = out + "}"
+    return out
+end
+
+;; Zapis atomowy: *.tmp + rename. "" = Ok.
+pub fn db_save(d: GenerationsDb) -> string is
+    let file: string = generations_file()
+    let dir: string = compat::path_parent(file)
+    if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+    let tmp: string = file + ".tmp"
+    fs::write(tmp, generations_to_json(d))
+    fs::rename(tmp, file)
+    return ""
+end
+
+;; Rust: `path.with_extension("tmp")` (zastepuje rozszerzenie).
+pub fn db_save_to(d: GenerationsDb, file: string) -> string is
+    let dir: string = compat::path_parent(file)
+    if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+    let tmp: string = compat::path_with_extension(file, "tmp")
+    fs::write(tmp, generations_to_json(d))
+    fs::rename(tmp, file)
+    return ""
+end
+
+;; ── Czas ─────────────────────────────────────────────────────────────────
+
+pub fn now_rfc3339() -> string is
+    return str::trim(proc::shell("date -u +%Y-%m-%dT%H:%M:%SZ"))
+end
+
+;; ── link_store_into_profile / compose_profile ────────────────────────────
+
+;; "" = Ok.
+fn link_store_into_profile(store_path: string, profile_dir: string) -> string is
+    if !sys_ok("cp -rsnT -- " + shq(store_path) + " " + shq(profile_dir) + " 2>/dev/null") is
+        ;; `cp` zwraca != 0 tez gdy czesc plikow juz istnieje (-n); Rust ignorowal
+        ;; bledy symlink (`.ok()`), wiec sprawdzamy tylko, ze profil istnieje
+        if !fs::is_dir(profile_dir) is return "Linking " + store_path + " into " + profile_dir + " failed" end
+    end
+    return ""
+end
+
+pub fn compose_profile(gen_num: int, store_entries: [store::StoreEntry], note: string?) -> ComposeResult is
+    let none_pk: [GenPackage] = []
+    let empty_gen: Generation = Generation { number: gen_num, timestamp: "", packages: none_pk, note: note, state: nil }
+    let profile_dir: string = compat::path_join(store::profiles_dir(), "gen-" + to_string(gen_num))
+    fs::mkdir(profile_dir)
+    if !fs::is_dir(profile_dir) is
+        return ComposeResult { generation: empty_gen, err: "Cannot create " + profile_dir }
+    end
+    let subs: [string] = ["usr/bin", "usr/local/bin", "usr/sbin", "usr/lib", "usr/share", "etc", "var", "lib"]
+    let mut s: int = 0
+    while s < subs.len() is
+        fs::mkdir(compat::path_join(profile_dir, subs[s]))
+        s += 1
+    end
+
+    let mut pkgs: [GenPackage] = []
+    let mut i: int = 0
+    while i < store_entries.len() is
+        let e: store::StoreEntry = store_entries[i]
+        i += 1
+        if fs::exists(e.path) is
+            let err: string = link_store_into_profile(e.path, profile_dir)
+            if err != "" is return ComposeResult { generation: empty_gen, err: err } end
+        end
+        pkgs.push(GenPackage { name: e.name, version: e.version, store_hash: e.hash })
+    end
+    return ComposeResult {
+        generation: Generation { number: gen_num, timestamp: now_rfc3339(), packages: pkgs, note: note, state: "Pending" },
+        err: ""
+    }
+end
+
+;; ── relink_bins ──────────────────────────────────────────────────────────
+
+pub struct RelinkResult is
+    pub linked:  int
+    pub removed: int
+    pub err:     string
+end
+
+;; Decyzja dla jednego pliku (patrz odejscie 6). Wypisuje slowa:
+;;   skip | same | removed | linked | failed  (`removed` moze poprzedzac `linked`/`failed`)
+fn relink_one_cmd(src: string, link: string) -> string is
+    return "src=" + shq(src) + "; link=" + shq(link) + "; " +
+        "if [ -d \"$src\" ]; then echo skip; exit 0; fi; " +
+        "if [ ! -x \"$src\" ] && [ ! -L \"$src\" ]; then echo skip; exit 0; fi; " +
+        "if [ -e \"$link\" ] || [ -L \"$link\" ]; then " +
+        "  if [ \"$(readlink \"$link\" 2>/dev/null)\" = \"$src\" ]; then echo same; exit 0; fi; " +
+        "  rm -f -- \"$link\"; echo removed; " +
+        "fi; " +
+        "if ln -s -- \"$src\" \"$link\" 2>/dev/null; then echo linked; else echo failed; fi"
+end
+
+fn seen_has(seen: [string], n: string) -> bool is
+    let mut i: int = 0
+    while i < seen.len() is
+        if seen[i] == n is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn relink_bins(profile_path: string) -> RelinkResult is
+    let link_dir: string = link_target_dir()
+    fs::mkdir(link_dir)
+    if !fs::is_dir(link_dir) is
+        return RelinkResult { linked: 0, removed: 0, err: "Cannot create " + link_dir }
+    end
+    let mut linked: int = 0
+    let mut removed: int = 0
+    let mut seen: [string] = []
+
+    let dirs: [string] = bin_source_dirs()
+    let mut d: int = 0
+    while d < dirs.len() is
+        let src_dir: string = compat::path_join(profile_path, dirs[d])
+        d += 1
+        if fs::exists(src_dir) is
+            let names: [string] = fs::list_dir(src_dir)
+            let mut i: int = 0
+            while i < names.len() is
+                let file_name: string = names[i]
+                i += 1
+                if file_name != "" && !seen_has(seen, file_name) is
+                    let src_path: string = compat::path_join(src_dir, file_name)
+                    let link_path: string = compat::path_join(link_dir, file_name)
+                    let out: string = proc::shell(relink_one_cmd(src_path, link_path))
+                    let words: [string] = str::split(str::trim(out), "\n")
+                    let mut w: int = 0
+                    while w < words.len() is
+                        let word: string = str::trim(words[w])
+                        w += 1
+                        if word == "removed" is
+                            removed += 1
+                        elsif word == "same" is
+                            seen.push(file_name)
+                        elsif word == "linked" is
+                            linked += 1
+                            seen.push(file_name)
+                            log::info("relink: " + link_path + " → " + src_path)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    ;; vim wrapper
+    let vim_link: string = compat::path_join(link_dir, "vim")
+    let vim_basic: string = compat::path_join(profile_path, "usr/bin/vim.basic")
+    let vim_exists: bool = sys_ok("test -e " + shq(vim_link) + " -o -L " + shq(vim_link))
+    if !vim_exists && fs::exists(vim_basic) is
+        if sys_ok("ln -s -- " + shq(vim_basic) + " " + shq(vim_link) + " 2>/dev/null") is linked += 1 end
+    end
+    return RelinkResult { linked: linked, removed: removed, err: "" }
+end
+
+;; ── pending / active ─────────────────────────────────────────────────────
+
+fn symlink_exists(p: string) -> bool is
+    return sys_ok("test -L " + shq(p) + " -o -e " + shq(p))
+end
+
+pub fn read_pending_gen() -> int? is
+    let r: LoadResult = db_load()
+    if r.err != "" is return nil end
+    return r.db.pending
+end
+
+pub fn read_active_gen() -> int? is
+    let active: string = store::active_link()
+    if !symlink_exists(active) is return nil end
+    let target: string = str::trim(proc::shell("readlink " + shq(active) + " 2>/dev/null"))
+    if target == "" is return nil end
+    let name: string = compat::path_filename(target)
+    if !name.starts_with("gen-") is return nil end
+    let rest: string = str::slice(name, 4, string_len(name))
+    if rest != "" && str::is_numeric(rest) is return conv::str_to_int(rest) end
+    return nil
+end
+
+;; "" = Ok.
+pub fn switch_active(g: Generation) -> string is
+    let target: string = gen_profile_path(g)
+    let active: string = store::active_link()
+    let tmp: string = active + ".tmp"
+    if !fs::exists(target) is return "Profile does not exist: " + target end
+    if symlink_exists(tmp) is system("rm -f -- " + shq(tmp)) end
+    if !sys_ok("ln -s -- " + shq(target) + " " + shq(tmp) + " 2>/dev/null") is
+        return "Creating tmp active symlink"
+    end
+    if !sys_ok("mv -T -- " + shq(tmp) + " " + shq(active) + " 2>/dev/null") is
+        return "Atomic rename of active symlink"
+    end
+    log::info("profile: switched active to gen-" + to_string(g.number))
+    return ""
+end
+
+pub fn set_pending(g: Generation) -> string is
+    let pending: string = pending_link()
+    if symlink_exists(pending) is system("rm -f -- " + shq(pending)) end
+    system("ln -s -- " + shq(gen_profile_path(g)) + " " + shq(pending) + " 2>/dev/null")
+    let r: LoadResult = db_load()
+    if r.err != "" is return r.err end
+    let mut d: GenerationsDb = r.db
+    d.pending = g.number
+    return db_save(d)
+end
+
+pub fn clear_pending() -> string is
+    let pending: string = pending_link()
+    if symlink_exists(pending) is system("rm -f -- " + shq(pending)) end
+    return ""
+end
+
+;; ── run_postinst ─────────────────────────────────────────────────────────
+
+fn join_or_empty(items: [string]) -> string is
+    return str::join(items, ", ")
+end
+
+;; Wolane tez z transaction.rs. "" = Ok, inaczej blad (lista nieudanych akcji).
+pub fn run_postinst(pkg_name: string, script_path: string) -> string is
+    if !fs::exists(script_path) is return "Reading " + script_path end
+    let script: string = fs::read(script_path)
+    let actions: [postinst::Action] = postinst::translate(script)
+    let outcome: postinst::RunOutcome = postinst::run(actions)
+    let summary: postinst::PostinstResult = outcome.summary
+
+    if summary.services_enabled.len() > 0 is
+        log::info("postinst [" + pkg_name + "]: enabled services: " + join_or_empty(summary.services_enabled))
+    end
+    if summary.services_started.len() > 0 is
+        log::info("postinst [" + pkg_name + "]: started services: " + join_or_empty(summary.services_started))
+    end
+    if summary.conffiles_created.len() > 0 is
+        log::info("postinst [" + pkg_name + "]: created conffiles: " + join_or_empty(summary.conffiles_created))
+    end
+    let mut w: int = 0
+    while w < summary.warnings.len() is
+        log::warn("postinst [" + pkg_name + "]: " + summary.warnings[w])
+        w += 1
+    end
+
+    let mut msgs: [string] = []
+    let mut i: int = 0
+    while i < outcome.results.len() is
+        let r: postinst::ActionResult = outcome.results[i]
+        if !r.success && r.action != "skip" is
+            msgs.push("  " + r.action + " failed: " + r.message)
+        end
+        i += 1
+    end
+    if msgs.len() > 0 is
+        return "postinst actions failed:\n" + str::join(msgs, "\n")
+    end
+    return ""
+end
+
+;; ── activate_pending ─────────────────────────────────────────────────────
+
+fn no_activation(err: string) -> ActivateOutcome is
+    let none: [string] = []
+    return ActivateOutcome { ok: false, err: err,
+        result: ActivationResult { gen_number: 0, packages_linked: 0, scripts_failed: none, already_active: false } }
+end
+
+fn name_in_gen(g: Generation, name: string) -> bool is
+    let mut i: int = 0
+    while i < g.packages.len() is
+        if g.packages[i].name == name is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn activate_pending() -> ActivateOutcome is
+    let pending: int? = read_pending_gen()
+    let none: [string] = []
+
+    if pending == nil is
+        let lr: LoadResult = db_load()
+        if lr.err != "" is return no_activation(lr.err) end
+        let cur: Generation? = db_current_gen(lr.db)
+        if cur == nil is return no_activation("No current generation") end
+        let cg: Generation = cur
+        let rl: RelinkResult = relink_bins(gen_profile_path(cg))
+        if rl.err != "" is return no_activation(rl.err) end
+        return ActivateOutcome { ok: true, err: "",
+            result: ActivationResult { gen_number: lr.db.current, packages_linked: rl.linked,
+                scripts_failed: none, already_active: true } }
+    end
+
+    let pending_num: int = pending
+    let lr: LoadResult = db_load()
+    if lr.err != "" is return no_activation(lr.err) end
+    let mut d: GenerationsDb = lr.db
+    let found: Generation? = db_get(d, pending_num)
+    if found == nil is return no_activation("Pending gen " + to_string(pending_num) + " not in DB") end
+    let g: Generation = found
+
+    let profile_path: string = gen_profile_path(g)
+    if !fs::exists(profile_path) is return no_activation("Profile path missing: " + profile_path) end
+
+    let sw: string = switch_active(g)
+    if sw != "" is return no_activation(sw) end
+    let rl: RelinkResult = relink_bins(profile_path)
+    if rl.err != "" is return no_activation(rl.err) end
+    let linked: int = rl.linked
+
+    ;; pakiety obecne w poprzedniej (current) generacji nie dostaja postinst ponownie
+    let prev: Generation? = db_current_gen(d)
+    let mut scripts_failed: [string] = []
+    let mut i: int = 0
+    while i < g.packages.len() is
+        let pk: GenPackage = g.packages[i]
+        i += 1
+        let mut in_prev: bool = false
+        if prev != nil is
+            let pg: Generation = prev
+            in_prev = name_in_gen(pg, pk.name)
+        end
+        if !in_prev is
+            let script_path: string = "/hammer/db/postinst/" + pk.name + ".postinst"
+            if fs::exists(script_path) is
+                let perr: string = run_postinst(pk.name, script_path)
+                if perr != "" is
+                    log::warn("postinst " + pk.name + " failed: " + perr)
+                    scripts_failed.push(pk.name)
+                end
+            end
+        end
+    end
+
+    d.current = pending_num
+    d.pending = nil
+    let mut k: int = 0
+    while k < d.generations.len() is
+        if d.generations[k].number == pending_num is d.generations[k].state = "Active" end
+        k += 1
+    end
+    let serr: string = db_save(d)
+    if serr != "" is return no_activation(serr) end
+    clear_pending()
+
+    ;; dziennik aktywacji
+    let log_file: string = activation_log()
+    let ldir: string = compat::path_parent(log_file)
+    if ldir != "" && !fs::exists(ldir) is fs::mkdir(ldir) end
+    let msg: string = "[" + now_rfc3339() + "] activated gen-" + to_string(pending_num) + ", " +
+        to_string(linked) + " binaries linked\n"
+    fs::append(log_file, msg)
+
+    log::info("activate: gen-" + to_string(pending_num) + " activated, " + to_string(linked) + " binaries linked")
+    return ActivateOutcome { ok: true, err: "",
+        result: ActivationResult { gen_number: pending_num, packages_linked: linked,
+            scripts_failed: scripts_failed, already_active: false } }
+end
+
+;; ── usluga systemd / sprzatanie ──────────────────────────────────────────
+
+pub fn install_activate_service() -> string is
+    let mut hammer_bin: string = str::trim(proc::shell("readlink /proc/self/exe 2>/dev/null"))
+    if hammer_bin == "" is hammer_bin = "/usr/bin/hammer" end
+    let symlink_path: string = "/usr/bin/hammer"
+    if !symlink_exists(symlink_path) is
+        system("ln -s -- " + shq(hammer_bin) + " " + shq(symlink_path) + " 2>/dev/null")
+    end
+    let unit: string = "[Unit]\n" +
+        "Description=Hammer Package Manager — Generation Activation\n" +
+        "DefaultDependencies=no\n" +
+        "Before=basic.target\n" +
+        "After=local-fs.target\n" +
+        "ConditionPathExists=/hammer/pending\n" +
+        "\n" +
+        "[Service]\n" +
+        "Type=oneshot\n" +
+        "RemainAfterExit=yes\n" +
+        "ExecStart=" + hammer_bin + " _activate\n" +
+        "StandardOutput=journal\n" +
+        "StandardError=journal\n" +
+        "\n" +
+        "[Install]\n" +
+        "WantedBy=sysinit.target\n"
+    if !fs::exists("/etc/systemd/system") is
+        return "Cannot write /etc/systemd/system/hammer-activate.service: directory missing"
+    end
+    fs::write("/etc/systemd/system/hammer-activate.service", unit)
+    system("systemctl enable hammer-activate.service --no-reload >/dev/null 2>&1")
+    log::info("profile: installed hammer-activate.service (" + hammer_bin + ")")
+    return ""
+end
+
+pub fn delete_profile(g: Generation) -> string is
+    let pp: string = gen_profile_path(g)
+    if fs::exists(pp) is
+        if !sys_ok("rm -rf -- " + shq(pp)) is return "Removing profile " + pp end
+        log::info("profile: deleted gen-" + to_string(g.number))
+    end
+    return ""
+end
+
+;; ── tryb uzytkownika ─────────────────────────────────────────────────────
+
+;; Zwraca sciezke profilu; blad: pusty napis (Rust: `Result<PathBuf>`).
+pub fn compose_user_profile(hammer_dir: string, gen_num: int, store_entries: [store::StoreEntry]) -> string is
+    let profile_dir: string = compat::path_join(compat::path_join(hammer_dir, "profiles"), "gen-" + to_string(gen_num))
+    fs::mkdir(compat::path_join(profile_dir, "bin"))
+    if !fs::is_dir(profile_dir) is return "" end
+    let mut i: int = 0
+    while i < store_entries.len() is
+        let e: store::StoreEntry = store_entries[i]
+        i += 1
+        if fs::exists(e.path) is
+            let err: string = link_store_into_profile(e.path, profile_dir)
+            if err != "" is return "" end
+        end
+    end
+    return profile_dir
+end
