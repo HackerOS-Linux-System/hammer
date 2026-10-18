@@ -1,0 +1,367 @@
+use "std -> strings" from "str"
+use "std -> env"     from "env"
+use "bit -> colors"
+
+mod internal
+mod cli
+mod pkg
+mod ui
+mod system
+mod tools
+mod repo
+mod oci
+
+;; hammer -> cli::cli_main
+;;
+;; Port of source-code/cli/cli.rs (Rust) to H#: dispatcher komend (`run`),
+;; `hammer version`, `hammer help`, `hammer oci`.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. Nazwa pliku: `cli.h#` -> `cli_main.h#` (nazwa modulu = nazwa pliku;
+;;    `cli` kolidowalby z katalogiem `cli`).
+;; 2. `async fn run -> Result<()>` -> `run(args) -> string` ("" = OK, inaczej
+;;    tresc bledu; `main` wypisuje ja przez `ui::fatal` i konczy kodem 1).
+;; 3. `std::process::exit(1)` dla nieznanej komendy -> `exit(1)` wbudowane.
+;; 4. `cfg!(feature = "normal-mode")` -> `build_mode::normal_mode()` (czas
+;;    dzialania). Dostepne tez ostrzezenie "immutable not available in
+;;    normal-mode".
+;; 5. Komendy ze stubami (`tools::pending`): `_setup`, `_import`, `source`,
+;;    `build-dep`, `build`, `mirror`, `completion`, `hk validate`, `daemon`,
+;;    `oci` oraz tryb `--user` — odpowiadaja jasnym komunikatem "not available
+;;    yet in the H# port" (nie "unknown command").
+;; 6. `crate::query::cmd_why`/`cmd_why_not` NIE sa wolane przez dispatcher —
+;;    jak w Rust `why`/`why-not` ida do `cli_sys` (wersja z `explain`).
+;; 7. `hammer changelog` wola `query::cmd_changelog(args)` bez `HttpClient`
+;;    (patrz `pkg/query.h#`, odejscie 3).
+;; 8. ZACHOWANE: help wymienia `list --available`, ktorego `cmd_list` nie
+;;    obsluguje (jest tylko `--installed`, `--upgrades`/`--upgradable`).
+
+fn live_safe(cmd: string) -> bool is
+    return cmd == "immutable" || cmd == "doctor" || cmd == "version" || cmd == "features" || cmd == "log" || cmd == "logs"
+end
+
+;; Wycina `n` pierwszych elementow.
+fn tail_from(args: [string], n: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = n
+    while i < args.len() is
+        out.push(args[i])
+        i += 1
+    end
+    return out
+end
+
+;; `--color=always|never|auto`, `NO_COLOR` (patrz `cli_types`), a przy `--json`
+;; kolory sa zawsze wylaczone (wyjscie maszynowe). `auto` zostawia wykrywanie
+;; terminala bibliotece `colors` (COLORTERM, TERM, CLICOLOR, FORCE_COLOR...).
+fn apply_color_mode(flags: cli_types::GlobalFlags) is
+    let label: string = cli_types::color_label(flags.color)
+    if flags.json || label == "never" is
+        colors::support::disable()
+    elsif label == "always" is
+        colors::support::force()
+    end
+end
+
+pub fn run(argv: [string]) -> string is
+    let pa: cli_types::ParsedArgs = cli_types::parse_global_flags(argv)
+    let flags: cli_types::GlobalFlags = pa.flags
+    let args: [string] = pa.args
+    apply_color_mode(flags)
+    let cmd: string = if args.len() > 1 then args[1] else "help"
+    let rest: [string] = tail_from(args, 2)
+    ui::trace("run: cmd=" + cmd)
+
+    ;; ── Zawsze dostepne ─────────────────────────────────────────────
+    if cmd == "_activate" is return cli_sys::cmd_activate_internal() end
+    if cmd == "_selftest" is return run_selftest() end
+    if cmd == "_setup" is return setup::cmd_setup() end
+    if cmd == "_import" is return setup::cmd_import() end
+    if cmd == "version" || cmd == "--version" || cmd == "-V" is
+        print_version()
+        return ""
+    end
+    if cmd == "features" is
+        build_mode::features_print(build_mode::features_current())
+        return ""
+    end
+    if cmd == "oci" is return run_oci(rest) end
+    if cmd == "help" || cmd == "--help" || cmd == "-h" || cmd == "" is
+        print_help()
+        return ""
+    end
+
+    ;; ── Straznik systemu live ───────────────────────────────────────
+    ui::trace("live guard: normal_mode=" + to_string(build_mode::normal_mode()))
+    if !build_mode::normal_mode() && !live_safe(cmd) is livecheck::assert_not_live() end
+    ui::trace("live guard passed")
+
+    if flags.user_mode is return cli_user::run_user(cmd, rest, flags) end
+
+    ;; ── Zarzadzanie pakietami ───────────────────────────────────────
+    if cmd == "install" || cmd == "in" is return cli_pkg::cmd_install(rest, flags) end
+    if cmd == "remove" || cmd == "rm" is return cli_pkg::cmd_remove(rest, flags) end
+    if cmd == "reinstall" is return cli_pkg::cmd_reinstall(rest) end
+    if cmd == "upgrade" || cmd == "up" is return cli_pkg::cmd_upgrade(rest, flags) end
+    if cmd == "dist-upgrade" || cmd == "dup" is return cli_pkg::cmd_dist_upgrade(rest) end
+    if cmd == "autoremove" || cmd == "ar" is return cli_pkg::cmd_autoremove(rest) end
+    if cmd == "fix-broken" || cmd == "fix" is return cli_pkg::cmd_fix_broken(rest) end
+
+    if cmd == "hold" is return pins::cmd_hold(rest) end
+    if cmd == "unhold" is return pins::cmd_unhold(rest) end
+    if cmd == "pin" is return pins::cmd_pin(rest) end
+    if cmd == "unpin" is return pins::cmd_unpin(rest) end
+    if cmd == "mark" is return cli_pkg::cmd_mark(rest) end
+
+    ;; ── Multi-arch ──────────────────────────────────────────────────
+    if cmd == "dpkg-arch" is return multi_arch::cmd_dpkg_arch(rest) end
+    if cmd == "arch" is return multi_arch::cmd_arch(rest) end
+
+    ;; ── Indeks / aktualizacje ───────────────────────────────────────
+    if cmd == "sync" || cmd == "ref" || cmd == "update" is return cli_pkg::cmd_sync() end
+    if cmd == "self-update" || cmd == "selfupdate" is return cli_pkg::cmd_self_update() end
+
+    ;; ── Zapytania ───────────────────────────────────────────────────
+    if cmd == "search" || cmd == "se" is return cli_pkg::cmd_search(rest, flags) end
+    if cmd == "info" is return cli_pkg::cmd_info(rest, flags) end
+    if cmd == "list" || cmd == "ls" is return cli_pkg::cmd_list(rest) end
+    if cmd == "show" is return query::cmd_show(rest, flags.json) end
+    if cmd == "depends" || cmd == "dep" is return query::cmd_depends(rest) end
+    if cmd == "rdepends" is return query::cmd_rdepends(rest) end
+    if cmd == "files" is return query::cmd_files(rest) end
+    if cmd == "which" is return query::cmd_which(rest) end
+    if cmd == "changelog" is return query::cmd_changelog(rest) end
+    if cmd == "policy" is return query::cmd_policy(rest) end
+
+    ;; ── Zrodla / repo ───────────────────────────────────────────────
+    if cmd == "source" is return build_dep::cmd_source(rest) end
+    if cmd == "build-dep" is return build_dep::cmd_build_dep_with_flags(rest, flags) end
+    if cmd == "download" is return cli_pkg::cmd_download(rest) end
+
+    ;; ── Narzedzia .hk ───────────────────────────────────────────────
+    if cmd == "hk" is
+        let sub2: string = if rest.len() > 0 then rest[0] else "help"
+        if sub2 == "validate" is return hk_tools::cmd_validate_hk(tail_from(rest, 1)) end
+        ui::eprint_line("  Unknown hk subcommand '" + sub2 + "'. Available: validate")
+        return ""
+    end
+
+    ;; ── Status ──────────────────────────────────────────────────────
+    if cmd == "status" || cmd == "st" is return cli_sys::cmd_status() end
+    if cmd == "history" || cmd == "hi" is return cli_sys::cmd_history(rest) end
+
+    ;; ── Generacje (tylko atomic) ────────────────────────────────────
+    if cmd == "gen" is
+        let e: string = build_mode::require_atomic("hammer gen")
+        if e != "" is return e end
+        return cli_sys::cmd_gen(rest)
+    end
+    if cmd == "rollback" || cmd == "rb" is
+        let e2: string = build_mode::require_atomic("hammer rollback")
+        if e2 != "" is return e2 end
+        return cli_sys::cmd_rollback(rest)
+    end
+    if cmd == "diff" is return cli_sys::cmd_diff(rest) end
+    if cmd == "pending" is
+        let e3: string = build_mode::require_atomic("hammer pending")
+        if e3 != "" is return e3 end
+        return cli_sys::cmd_pending(rest)
+    end
+
+    ;; ── Zapytania v0.5 ──────────────────────────────────────────────
+    if cmd == "what" is return file_index::cmd_what(rest) end
+    if cmd == "what-rebuild" is return file_index::cmd_what_rebuild() end
+    if cmd == "size" is return size::cmd_size(rest) end
+    if cmd == "undo" is
+        let e4: string = build_mode::require_atomic("hammer undo")
+        if e4 != "" is return e4 end
+        return undo::cmd_undo(rest)
+    end
+    if cmd == "show-deps" is return query::cmd_show_deps(rest) end
+    if cmd == "owns" is return query::cmd_owns(rest) end
+    if cmd == "stats" is return query::cmd_stats() end
+
+    ;; ── Diagnostyka ─────────────────────────────────────────────────
+    if cmd == "verify" is return cli_sys::cmd_verify(rest) end
+    if cmd == "why" is return cli_sys::cmd_why(rest) end
+    if cmd == "why-not" is return cli_sys::cmd_why_not(rest) end
+    if cmd == "doctor" is return cli_sys::cmd_doctor() end
+    if cmd == "fsck" is return cli_sys::cmd_fsck(rest) end
+    if cmd == "check" is return cli_sys::cmd_check(rest) end
+    if cmd == "audit" is return audit::cmd_audit(rest) end
+
+    ;; ── Uslugi / logi ───────────────────────────────────────────────
+    if cmd == "service" || cmd == "svc" is return cli_sys::cmd_service(rest) end
+    if cmd == "log" || cmd == "logs" is return cli_sys::cmd_log(rest) end
+
+    ;; ── Immutable (tylko atomic) ────────────────────────────────────
+    if cmd == "immutable" || cmd == "imm" is
+        if build_mode::normal_mode() is
+            ui::eprint_line("  " + ui::yellow_bold("!") + " 'hammer immutable' is not available in normal-mode builds.")
+            return ""
+        end
+        return cli_sys::cmd_immutable(rest)
+    end
+
+    ;; ── Migawki (tylko atomic) ──────────────────────────────────────
+    if cmd == "snapshot" || cmd == "snap" is
+        let e5: string = build_mode::require_atomic("hammer snapshot")
+        if e5 != "" is return e5 end
+        return immutable::create_snapshot(if rest.len() > 0 then rest[0] else "manual")
+    end
+
+    ;; ── Export / import / klucze ────────────────────────────────────
+    if cmd == "export" is return cli_sys::cmd_export(rest) end
+    if cmd == "import" is return cli_sys::cmd_import_pkg(rest) end
+    if cmd == "key" is return cli_sys::cmd_key(rest) end
+
+    ;; ── Lustra / repo ───────────────────────────────────────────────
+    if cmd == "mirror" is return mirror::cmd_mirror(rest) end
+    if cmd == "repo" is return repo::cmd_repo(rest) end
+    if cmd == "build" is return build_dep::cmd_build(rest) end
+
+    ;; ── Utrzymanie ──────────────────────────────────────────────────
+    if cmd == "gc" is return cli_sys::cmd_gc(rest) end
+    if cmd == "clean" is return cli_sys::cmd_clean() end
+    if cmd == "init" is return cli_sys::cmd_init(rest) end
+    if cmd == "relink" is return cli_sys::cmd_relink() end
+    if cmd == "store" is return cli_sys::cmd_store() end
+    if cmd == "completion" is return completion::cmd_completion(rest) end
+    if cmd == "boot" is return cli_sys::cmd_boot(rest) end
+
+    if cmd == "daemon" is return cli_sys::cmd_daemon(rest) end
+    if cmd == "db" is return cli_sys::cmd_db(rest) end
+
+    ui::eprint_line("  " + ui::red_bold("!") + " Unknown command: '" + cmd + "'. Try " + ui::cyan("hammer help") + ".")
+    exit(1)
+    return ""
+end
+
+;; ── OCI ──────────────────────────────────────────────────────────────────
+
+;; Ukryta komenda (bez odpowiednika w Rust, gdzie to `cargo test`): testy
+;; solvera z `pkg/solver/tests.h#` — SAT + resolver (w tym te, ktorych nie
+;; da sie uruchomic w interpreterze: cache/hashmapy i baza sqlite).
+fn run_selftest() -> string is
+    let failures: int = tests::run_all()
+    if failures == 0 is
+        write("  " + ui::bright_green_bold("✔") + " solver self-tests: all passed")
+        return ""
+    end
+    return "solver self-tests: " + to_string(failures) + " failure(s)"
+end
+
+fn run_oci(rest: [string]) -> string is
+    if !build_mode::oci_mode() is
+        return "'hammer oci' is only available in builds compiled with oci-mode (bit build-oci).\n    This binary was built without it (run 'hammer features' to check)."
+    end
+    return oci_cmd::run(rest)
+end
+
+;; ── Wersja ───────────────────────────────────────────────────────────────
+
+fn print_version() is
+    write("")
+    write("  " + ui::brand() + "  " + ui::bold("v" + build_mode::hammer_version()))
+    write("  " + ui::dim("Atomic Debian package manager — HackerOS"))
+    write("")
+    build_mode::print_mode_banner()
+    write(ui::kv("License", "Apache-2.0", 8))
+    write(ui::kv("Source", ui::link("https://github.com/HackerOS-Linux-System/hammer"), 8))
+    write(ui::kv("Colors", colors::support::level_name(), 8))
+    write("")
+    write("  " + ui::msg_hint("Run " + ui::cyan("hammer features") + " to list all feature flags."))
+    write("")
+end
+
+;; ── Pomoc ────────────────────────────────────────────────────────────────
+
+fn help_section(title: string) is
+    write("")
+    write(ui::section(title))
+end
+
+;; `  komenda  argumenty            opis` — kolumna komendy dopelniana WIDOCZNIE.
+fn help_row(cmd: string, args: string, desc: string) is
+    let mut line: string = "    " + ui::cyan(ui::pad_vis(cmd, 13)) + " "
+    if args != "" is line = line + ui::pad_vis(args, 28) + " " else line = line + ui::pad_vis("", 28) + " " end
+    if desc != "" is line = line + ui::muted(desc) end
+    write(line)
+end
+
+;; Wiersz z lista komend bez opisu: `  grupa:  a  b  c`.
+fn help_names(label: string, names: [string]) is
+    let mut parts: [string] = []
+    let mut i: int = 0
+    while i < names.len() is
+        parts.push(ui::cyan(names[i]))
+        i += 1
+    end
+    write("    " + ui::dim(ui::pad_vis(label, 13)) + " " + str::join(parts, "  "))
+end
+
+fn print_help() is
+    let atomic: bool = !build_mode::normal_mode()
+    let mode: string = if atomic then ui::badge("ATOMIC", "teal") else ui::badge("NORMAL", "darkorange")
+    write("")
+    write("  " + ui::brand() + "  " + ui::dim("v" + build_mode::hammer_version()) + "  " + mode)
+    write("  " + ui::muted("Debian package manager for HackerOS"))
+    write("")
+    write("  " + ui::bold("Usage:") + " " + ui::cyan("hammer") + " [" + ui::yellow("flags") + "] " + ui::cyan("<command>") + " [args]")
+
+    help_section("Package management")
+    help_row("install", "<pkg…> [--arch=ARCH]", "zainstaluj z zależnościami")
+    help_row("remove", "<pkg…>", "usuń pakiety")
+    help_row("reinstall", "<pkg…>", "zainstaluj ponownie")
+    help_row("upgrade", "[pkg…]", "aktualizuj zainstalowane")
+    help_row("dist-upgrade", "", "aktualizacja z zamianą zależności")
+    help_names("also:", ["autoremove", "fix-broken", "sync", "self-update"])
+
+    help_section("Query")
+    help_row("search", "<q> [--installed]", "szukaj pakietów (--json)")
+    help_row("info", "<pkg>", "szczegóły pakietu (alias: show)")
+    help_row("list", "[--installed|--upgradable]", "lista pakietów")
+    help_row("what", "<ścieżka>", "która paczka dostarcza plik")
+    help_row("owns", "<ścieżka>", "kto posiada plik (przez indeks)")
+    help_row("size", "<pkg…>", "rozmiar na dysku")
+    help_row("show-deps", "<pkg>", "drzewo zależności")
+    help_row("undo", "[--yes]", "cofnij ostatnią operację")
+    help_names("also:", ["depends", "rdepends", "files", "which", "policy", "changelog", "what-rebuild"])
+
+    help_section("Pinning, sources, services")
+    help_names("pinning:", ["pin", "unpin", "hold", "unhold", "mark"])
+    help_names("sources:", ["source", "build-dep", "download", "mirror", "key"])
+    write("    " + ui::dim(ui::pad_vis("format:", 13)) + " " + ui::cyan(repo::sources_hk()) + " " + ui::muted("(source list)"))
+    help_row("service", "list|start|stop|…", "usługi systemd")
+
+    if atomic is
+        help_section("Atomic (immutable + generations)")
+        help_row("immutable", "status|enable|lock|…", "niezmienny system plików")
+        help_row("gen", "list|switch N|delete N", "generacje systemu")
+        help_names("also:", ["rollback", "diff"])
+    end
+
+    help_section("System")
+    help_names("diagnostics:", ["doctor", "check", "verify", "fsck", "audit", "log"])
+    help_names("maintenance:", ["gc", "clean", "init", "relink", "store", "completion", "boot"])
+    help_row("daemon", "start|stop|status|…", "demon hammerd")
+    help_row("db", "export-json|recover|…", "baza zainstalowanych")
+    help_row("--user", "install|remove|list|…", "pakiety użytkownika (bez roota)")
+    if build_mode::oci_mode() is
+        help_row("oci", "help", "tryb obrazowy OCI + deb")
+    end
+
+    help_section("Global flags")
+    help_row("-y, --yes", "", "bez pytań")
+    help_row("-n, --dry-run", "", "tylko pokaż plan")
+    help_row("--json", "", "wyjście maszynowe (bez kolorów)")
+    help_row("--color=MODE", "always|never|auto", "kolory (też NO_COLOR, FORCE_COLOR)")
+    help_row("-v, -q", "", "więcej / mniej komunikatów")
+
+    help_section("Build modes")
+    write("    " + ui::dim(ui::pad_vis("atomic:", 13)) + " bit build          " + ui::muted("(domyślny)"))
+    write("    " + ui::dim(ui::pad_vis("normal:", 13)) + " bit build-normal   " + ui::muted("(klasyczny, bez atomowości)"))
+    write("")
+    write("  " + ui::msg_hint("Szczegóły komendy: " + ui::cyan("hammer <command> --help")))
+    write("")
+end
