@@ -1,0 +1,12 @@
+mod internal
+mod ui
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_update   (port cmd/update.rs)
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    let pr: oci_repo_index::PoolResult = oci_deb_layer::refresh_package_index(cfg)
+    if pr.err != "" is return pr.err end
+    write("  " + ui::bright_green_bold("✔") + " Refreshed package index (" + to_string(oci_repo_index::pool_count(pr.pool)) + " package(s) available across " + to_string(cfg.apt_sources.len()) + " source(s)).")
+    return ""
+end
