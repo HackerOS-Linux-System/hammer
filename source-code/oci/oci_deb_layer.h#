@@ -1,0 +1,234 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "bit -> progress-bar" from "pb"
+
+mod internal
+mod pkg
+mod system
+mod ui
+mod oci_types
+mod oci_process
+mod oci_overlay
+mod oci_repo_index
+mod oci_status_db
+
+;; hammer -> oci::oci_deb_layer
+;;
+;; Port of source-code/oci/deb_layer.rs (Rust) to H#: instalacja i usuwanie
+;; paczek .deb jako warstwy w `session.merged_dir`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `async`/`reqwest` -> `download::get_file` do pliku, weryfikacja
+;;    `gpg_verify::verify_deb` (SHA-256 z indeksu), `deb::parse_file` +
+;;    `deb::unpack` (kazdy modul juz przepisany) — `.deb` nie siedzi w RAM.
+;; 2. `DebLayer<'a> { cfg }` -> argument `cfg` w kazdej funkcji.
+;; 3. BLAD ORYGINALU, KTORY NAPRAWIAM: `remove_packages` iterowal po
+;;    `pkg.files`, ale `status_db::load_all` NIGDY nie wypelnia `files`
+;;    ("loaded lazily") — wiec `hammer oci uninstall` usuwal wpis ze
+;;    statusu, a pliki zostawialy sie w obrazie. Teraz lista czytana z
+;;    `dpkg/info/<pkg>.list` (`status_db::load_file_list`). Do cofniecia.
+;; 4. Usuwanie plikow: odrzucam wpisy ze skladowa `..` (zepsuty .list nie
+;;    moze wyjsc poza `merged_dir`); symlink do katalogu jest usuwany jak
+;;    plik (nie `rmdir`).
+;; 5. Jak w Rust: `prerm`/`postrm` NIE sa uruchamiane przy usuwaniu
+;;    (komentarz w Rust to obiecuje, kod tego nie robi); uruchamiany jest
+;;    tylko `postinst configure`, bez `preinst`.
+;; 6. `Result<T>` -> `InstallResult { layers, err }` / `string`.
+
+pub struct InstallResult is
+    pub layers: [oci_types::PackageLayer]
+    pub err:    string
+end
+
+fn unwrap_or(v: string?, d: string) -> string is
+    if v == nil is return d end
+    let s: string = v
+    return s
+end
+
+fn fail_bar(tty: bool, msg: string) -> InstallResult is
+    download::clear_bar(tty)
+    return fail(msg)
+end
+
+fn fail(msg: string) -> InstallResult is
+    let none: [oci_types::PackageLayer] = []
+    return InstallResult { layers: none, err: msg }
+end
+
+;; Rust: `refresh_package_index`.
+pub fn refresh_package_index(cfg: oci_types::Config) -> oci_repo_index::PoolResult is
+    return oci_repo_index::refresh_index(cfg)
+end
+
+;; Rust: `is_installed`.
+pub fn is_installed(rootfs_path: string, package_name: string) -> bool is
+    return oci_status_db::is_installed(rootfs_path, package_name)
+end
+
+;; Rust: `run_maintainer_script` — jedyne miejsce z procesem zewnetrznym
+;; (chroot): skrypty .deb zakladaja wykonanie wewnatrz docelowego systemu.
+fn run_maintainer_script(session: oci_overlay::OverlaySession, package_name: string, script_content: string, script_name: string) -> string is
+    let info_dir: string = compat::path_join(session.merged_dir, "var/lib/dpkg/info")
+    proc::shell("mkdir -p -- " + oci_process::shq(info_dir) + " 2>/dev/null")
+    let host_path: string = compat::path_join(info_dir, package_name + "." + script_name)
+    fs::write(host_path, script_content)
+    oci_process::run_capture("chmod", ["755", host_path])
+    let chroot_path: string = "/var/lib/dpkg/info/" + package_name + "." + script_name
+    let e: string = oci_process::run_inherit("chroot", [session.merged_dir, chroot_path, "configure"])
+    if e != "" is return "Running " + script_name + " for " + package_name + " in chroot: " + e end
+    return ""
+end
+
+fn in_names(names: [string], n: string) -> bool is
+    let mut i: int = 0
+    while i < names.len() is
+        if names[i] == n is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Rust: `install_packages` — zaleznosci + pobranie + weryfikacja +
+;; rozpakowanie + postinst + status. Zwraca WSZYSTKIE zainstalowane.
+pub fn install_packages(cfg: oci_types::Config, session: oci_overlay::OverlaySession, names: [string]) -> InstallResult is
+    let pr: oci_repo_index::PoolResult = refresh_package_index(cfg)
+    if pr.err != "" is return fail(pr.err) end
+    let pool: oci_repo_index::Pool = pr.pool
+
+    let mut to_install: [package::Package] = []
+    let plan: solver::PlanResult = oci_repo_index::resolve_with_real_solver(pool, session.lower_dir, names)
+    if plan.err == "" is
+        ;; Swiezy install trafia do `to_install`; cel juz obecny w starszej
+        ;; wersji idzie przez `to_upgrade` — oba trzeba pobrac.
+        to_install = plan.plan.to_install
+        let mut u: int = 0
+        while u < plan.plan.to_upgrade.len() is
+            to_install.push(plan.plan.to_upgrade[u])
+            u += 1
+        end
+    else
+        log::warn("oci: CDCL resolution failed (" + plan.err + "), falling back to the simpler BFS dependency closure — this loses proper Conflicts:/alternative handling for this install")
+        let cl: oci_repo_index::ClosureResult = oci_repo_index::resolve_closure(pool, names)
+        if cl.err != "" is return fail("Resolving dependency closure (fallback): " + cl.err) end
+        to_install = cl.pkgs
+    end
+
+    let client: download::HttpClient = download::client_new()
+    let mut installed: [oci_types::PackageLayer] = []
+
+    let tty: bool = download::stdout_is_tty()
+    let mut progress: bar::ProgressBar = download::count_bar(to_install.len(), "Installing")
+
+    let mut i: int = 0
+    while i < to_install.len() is
+        let pkg: package::Package = to_install[i]
+        i += 1
+        if oci_status_db::is_installed(session.merged_dir, pkg.name) is continue end
+        let url: string? = oci_repo_index::deb_url(pool, pkg.name)
+        if url == nil is
+            download::clear_bar(tty)
+            return fail_bar(tty, "No download URL (Filename:) for package '" + pkg.name + "'")
+        end
+
+        progress = progress.set(i - 1)
+        progress = progress.set_message(pkg.name + " " + pkg.version)
+        download::draw_bar(progress, tty)
+        log::info("oci: fetching " + pkg.name + " " + pkg.version)
+        let deb_file: string = fs::temp_file("hammer-oci-deb")
+        let ge: string = download::get_file(client, url, deb_file)
+        if ge != "" is
+            proc::shell("rm -f -- " + oci_process::shq(deb_file))
+            return fail_bar(tty, "Downloading " + url + ": " + ge)
+        end
+        if pkg.sha256 != nil is
+            let ve: string = gpg_verify::verify_deb(deb_file, pkg.sha256)
+            if ve != "" is
+                proc::shell("rm -f -- " + oci_process::shq(deb_file))
+                return fail_bar(tty, ve)
+            end
+        end
+
+        let parsed: deb::ParseResult = deb::parse_file(deb_file)
+        proc::shell("rm -f -- " + oci_process::shq(deb_file))
+        if parsed.err != "" || parsed.deb == nil is
+            return fail_bar(tty, "Parsing " + pkg.name + ".deb: " + parsed.err)
+        end
+        let d: deb::DebPackage = parsed.deb
+        let extract: deb::ExtractResult = deb::unpack(d, session.merged_dir)
+        if extract.err != "" is
+            deb::cleanup(d)
+            return fail_bar(tty, "Unpacking " + pkg.name + " into " + session.merged_dir + ": " + extract.err)
+        end
+
+        if d.postinst != nil is
+            let se: string = run_maintainer_script(session, pkg.name, d.postinst, "postinst")
+            if se != "" is
+                deb::cleanup(d)
+                return fail_bar(tty, se)
+            end
+        end
+        deb::cleanup(d)
+
+        let mut kib: int = 0
+        if pkg.installed_size_kb != nil is kib = pkg.installed_size_kb end
+        let ue: string = oci_status_db::upsert(session.merged_dir, oci_status_db::InstalledPackage {
+            name: pkg.name,
+            version: pkg.version,
+            architecture: pkg.architecture,
+            maintainer: unwrap_or(pkg.maintainer, ""),
+            description: unwrap_or(pkg.description_short, ""),
+            depends: unwrap_or(pkg.depends, ""),
+            pre_depends: unwrap_or(pkg.pre_depends, ""),
+            provides: unwrap_or(pkg.provides, ""),
+            section: unwrap_or(pkg.section, ""),
+            priority: unwrap_or(pkg.priority, ""),
+            installed_size: kib * 1024,
+            files: extract.all_files,
+            status: oci_status_db::default_status(),
+            installed_by: oci_status_db::installed_by_marker()
+        })
+        if ue != "" is return fail_bar(tty, ue) end
+
+        ;; apt: pakiety podane z nazwy = "manual", reszta = "auto" (to pozwala
+        ;; `hammer oci autoremove` je rozroznic).
+        let ae: string = oci_status_db::set_auto_installed(session.merged_dir, pkg.name, pkg.architecture, !in_names(names, pkg.name))
+        if ae != "" is return fail_bar(tty, ae) end
+
+        installed.push(oci_types::layer_new(pkg.name, pkg.version))
+    end
+    download::clear_bar(tty)
+    return InstallResult { layers: installed, err: "" }
+end
+
+;; Skrypt usuwajacy liste (od konca): $1 = merged_dir, $2 = plik z lista.
+fn remove_script() -> string is
+    return "root=\"$1\"; list=\"$2\"\ntac \"$list\" | while IFS= read -r f; do\n  [ -z \"$f\" ] && continue\n  case \"/$f/\" in */../*) continue;; esac\n  rel=$(printf '%s' \"$f\" | sed 's#^/*##')\n  p=\"$root/$rel\"\n  if [ -L \"$p\" ] || [ ! -d \"$p\" ]; then rm -f -- \"$p\" 2>/dev/null; else rmdir -- \"$p\" 2>/dev/null; fi\ndone\nexit 0\n"
+end
+
+;; Rust: `remove_packages` — usuwa pliki wg `dpkg/info/<pkg>.list`.
+pub fn remove_packages(session: oci_overlay::OverlaySession, names: [string]) -> string is
+    let mut n: int = 0
+    while n < names.len() is
+        let name: string = names[n]
+        n += 1
+        if !oci_status_db::is_installed(session.merged_dir, name) is
+            log::warn("oci: '" + name + "' not installed, skipping removal")
+            continue
+        end
+        let files: [string] = oci_status_db::load_file_list(session.merged_dir, name)
+        if files.len() > 0 is
+            let list_file: string = fs::temp_file("hammer-oci-list")
+            let script: string = fs::temp_file("hammer-oci-rm")
+            fs::write(list_file, str::join(files, "\n") + "\n")
+            fs::write(script, remove_script())
+            oci_process::run_capture("bash", [script, session.merged_dir, list_file])
+            proc::shell("rm -f -- " + oci_process::shq(list_file) + " " + oci_process::shq(script))
+        end
+        let re: string = oci_status_db::remove(session.merged_dir, name)
+        if re != "" is return re end
+        oci_status_db::set_auto_installed(session.merged_dir, name, "", false)
+    end
+    return ""
+end
