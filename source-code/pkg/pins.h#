@@ -1,0 +1,518 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> fmt"     from "fmt"
+use "std -> conv"    from "conv"
+
+use "bit -> libhammer" from "lh"
+use "bit -> hk-parser" from "hkp"
+
+mod internal
+mod ui
+mod db
+
+;; hammer -> pkg::pins
+;;
+;; Port of source-code/pkg/pins.rs (Rust) to H#: piny wersji/priorytetow z
+;; /etc/hammer/pins.hk + komendy `hammer pin|hold|unhold|unpin`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `PinDb` jest wartoscia niemutowalna: `retain`/`push` zwracaja NOWY
+;;    `PinDb` (pin_remove / pin_add) zamiast mutowac `&mut self`.
+;; 2. `crate::solver::version::compare` (pkg/solver/version.rs, jeszcze
+;;    nieprzepisane) -> `lhversion::version_cmp` z libhammer — ta sama
+;;    kolejnosc wersji Debiana.
+;; 3. `Result<()>` -> `string` ("" = Ok, inaczej komunikat bledu, ktory
+;;    `main` wypisze jak `ui::fatal`).
+;; 4. `crate::log::info(..)` w `save()` -> `log::info(..)` (internal/log.h#).
+;; 5. `owo_colors` -> ANSI lokalnie; kolumny dopelniane przed
+;;    pokolorowaniem. `parse::<i32>()` -> wlasne `parse_int_or`.
+;; 6. `trim_end_matches('*')` / `trim_matches('"')` zdejmuja WSZYSTKIE
+;;    znaki brzegowe — `trim_end_char` / `trim_quotes` robia to samo.
+
+pub fn pins_file() -> string is return "/etc/hammer/pins.hk" end
+
+pub struct PinEntry is
+    pub package:  string
+    pub version:  string
+    pub priority: int
+    pub note:     string?
+end
+
+pub struct PinDb is
+    pub entries: [PinEntry]
+end
+
+;; ── Pomocniki tekstowe ───────────────────────────────────────────────────
+
+fn trim_end_char(s: string, ch: string) -> string is
+    let mut n: int = string_len(s)
+    while n > 0 && str::slice(s, n - 1, n) == ch is
+        n -= 1
+    end
+    return str::slice(s, 0, n)
+end
+
+fn trim_quotes(s: string) -> string is
+    let mut a: int = 0
+    let mut b: int = string_len(s)
+    while a < b && str::slice(s, a, a + 1) == "\"" is a += 1 end
+    while b > a && str::slice(s, b - 1, b) == "\"" is b -= 1 end
+    return str::slice(s, a, b)
+end
+
+;; `s.parse::<i32>().unwrap_or(default)` — akceptuje znak '-'.
+fn parse_int_or(s: string, default: int) -> int is
+    let t: string = str::trim(s)
+    if t == "" is return default end
+    if t.starts_with("-") is
+        let rest: string = str::slice(t, 1, string_len(t))
+        if rest != "" && str::is_numeric(rest) is return 0 - conv::str_to_int(rest) end
+        return default
+    end
+    if str::is_numeric(t) is return conv::str_to_int(t) end
+    return default
+end
+
+fn note_is(e: PinEntry, value: string) -> bool is
+    if e.note == nil is return false end
+    let n: string = e.note
+    return n == value
+end
+
+fn note_or_empty(e: PinEntry) -> string is
+    if e.note == nil is return "" end
+    let n: string = e.note
+    return n
+end
+
+
+;; ── PinEntry ─────────────────────────────────────────────────────────────
+
+;; Czy pin pasuje do wersji `version` (`installed_version` = "" gdy brak).
+pub fn matches_version(e: PinEntry, version: string, installed_version: string) -> bool is
+    let spec: string = e.version
+    if spec == "*" is return true end
+    if spec == "installed" is
+        return installed_version != "" && installed_version == version
+    end
+    ;; kolejnosc galezi jak w Rust: wildcard PRZED operatorami
+    if compat::str_index_of(spec, "*") >= 0 is
+        return version.starts_with(trim_end_char(spec, "*"))
+    end
+    if spec.starts_with(">=") is
+        let req: string = str::trim(str::slice(spec, 2, string_len(spec)))
+        return lhversion::version_cmp(version, req) >= 0
+    end
+    if spec.starts_with("<=") is
+        let req: string = str::trim(str::slice(spec, 2, string_len(spec)))
+        return lhversion::version_cmp(version, req) <= 0
+    end
+    if spec.starts_with(">") is
+        let req: string = str::trim(str::slice(spec, 1, string_len(spec)))
+        return lhversion::version_cmp(version, req) > 0
+    end
+    if spec.starts_with("<") is
+        let req: string = str::trim(str::slice(spec, 1, string_len(spec)))
+        return lhversion::version_cmp(version, req) < 0
+    end
+    return spec == version
+end
+
+pub fn matches_package(e: PinEntry, name: string) -> bool is
+    if compat::str_index_of(e.package, "*") >= 0 is
+        return name.starts_with(trim_end_char(e.package, "*"))
+    end
+    return e.package == name
+end
+
+;; ── PinDb ────────────────────────────────────────────────────────────────
+
+pub fn pindb_empty() -> PinDb is
+    let none: [PinEntry] = []
+    return PinDb { entries: none }
+end
+
+;; Brak pliku = pusta baza (nie blad).
+pub fn pindb_load() -> PinDb is
+    let file: string = pins_file()
+    if !fs::exists(file) is return pindb_empty() end
+    return parse_hk(fs::read(file))
+end
+
+;; ── Parsowanie przez biblioteke `hk-parser` ──────────────────────────────
+;;
+;; `hk-parser` rozbija sciezki kluczy po kropkach i nawiasach (`sekcja.klucz`,
+;; `a[0]`), wiec sekcja `[libssl1.1]` albo `[python3.11]` byla by nieosiagalna
+;; (`get("libssl1.1.version")` szuka sekcji `libssl1`). Dlatego przed
+;; parsowaniem kropki W NAZWACH SEKCJI zamieniam na znacznik, a po
+;; odczycie przywracam.
+;;
+;; Poprzedni (reczny) parser byl tolerancyjny: zla linia byla pomijana.
+;; `hk-parser` jest scisly — przy bledzie skladni CALY plik jest odrzucany, a
+;; to znaczyloby ciche zignorowanie WSZYSTKICH blokad (`hold`/`pin`). Dlatego
+;; przy bledzie ostrzegamy i wracamy do `parse_hk_lenient`.
+
+fn dot_marker() -> string is return "__hk_dot__" end
+
+;; `[nazwa.z.kropka]` -> `[nazwa__hk_dot__z__hk_dot__kropka]` (tylko linie,
+;; ktore w calosci sa naglowkiem sekcji).
+fn escape_section_dots(content: string) -> string is
+    let lines: [string] = str::split(content, "\n")
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < lines.len() is
+        let t: string = str::trim(lines[i])
+        i += 1
+        if t.starts_with("[") && t.ends_with("]") && compat::str_index_of(t, "\"") < 0 && compat::str_index_of(t, ",") < 0 is
+            out.push(str::replace_all(t, ".", dot_marker()))
+        else is
+            out.push(t)
+        end
+    end
+    return str::join(out, "\n")
+end
+
+fn unescape_section(name: string) -> string is
+    return str::replace_all(name, dot_marker(), ".")
+end
+
+pub fn parse_hk(content: string) -> PinDb is
+    let h: hkp::HkConfig = hkp::parse(escape_section_dots(content))
+    if !h.is_valid() is
+        log::warn("pins: " + pins_file() + " is not valid .hk (" + hkp::last_error() + ") — using the lenient fallback parser")
+        return parse_hk_lenient(content)
+    end
+    let mut entries: [PinEntry] = []
+    let sections: [string] = h.keys("")
+    let mut i: int = 0
+    while i < sections.len() is
+        let sec: string = sections[i]
+        i += 1
+        if h.type_of(sec) != "map" is continue end
+        let mut ver: string = "*"
+        if h.has(sec + ".version") is ver = h.get(sec + ".version") end
+        let mut prio: int = 500
+        if h.has(sec + ".priority") is
+            if h.type_of(sec + ".priority") == "number" is
+                prio = h.get_int(sec + ".priority")
+            else is
+                prio = parse_int_or(h.get(sec + ".priority"), 500)
+            end
+        end
+        let mut note: string? = nil
+        if h.has(sec + ".note") is note = h.get(sec + ".note") end
+        entries.push(PinEntry { package: unescape_section(sec), version: ver, priority: prio, note: note })
+    end
+    h.free()
+    return PinDb { entries: entries }
+end
+
+pub fn parse_hk_lenient(content: string) -> PinDb is
+    let mut entries: [PinEntry] = []
+    let mut cur_pkg: string = ""
+    let mut cur_ver: string = "*"
+    let mut cur_prio: int = 500
+    let mut cur_note: string? = nil
+    let mut in_section: bool = false
+
+    let lines: [string] = str::split(content, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = str::trim(lines[i])
+        i += 1
+        if line == "" || line.starts_with("!") is
+            ;; pomijamy
+        elsif line.starts_with("[") && line.ends_with("]") is
+            if in_section && cur_pkg != "" is
+                entries.push(PinEntry { package: cur_pkg, version: cur_ver, priority: cur_prio, note: cur_note })
+            end
+            cur_pkg = str::trim(str::slice(line, 1, string_len(line) - 1))
+            cur_ver = "*"
+            cur_prio = 500
+            cur_note = nil
+            in_section = true
+        elsif in_section && line.starts_with("->") is
+            let kv: string = str::trim(str::slice(line, 2, string_len(line)))
+            let pos: int = compat::str_index_of(kv, "=>")
+            if pos >= 0 is
+                let k: string = str::trim(str::slice(kv, 0, pos))
+                let v: string = trim_quotes(str::trim(str::slice(kv, pos + 2, string_len(kv))))
+                if k == "version" is
+                    cur_ver = v
+                elsif k == "priority" is
+                    cur_prio = parse_int_or(v, 500)
+                elsif k == "note" is
+                    cur_note = v
+                end
+            end
+        end
+    end
+
+    if in_section && cur_pkg != "" is
+        entries.push(PinEntry { package: cur_pkg, version: cur_ver, priority: cur_prio, note: cur_note })
+    end
+    return PinDb { entries: entries }
+end
+
+;; Najwyzszy priorytet pasujacych pinow; domyslnie 500.
+pub fn pindb_priority(db: PinDb, name: string, version: string, installed_version: string) -> int is
+    let mut best: int = 0
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < db.entries.len() is
+        let e: PinEntry = db.entries[i]
+        if matches_package(e, name) && matches_version(e, version, installed_version) is
+            if !found || e.priority > best is best = e.priority end
+            found = true
+        end
+        i += 1
+    end
+    if !found is return 500 end
+    return best
+end
+
+pub fn pindb_is_forbidden(db: PinDb, name: string, version: string) -> bool is
+    return pindb_priority(db, name, version, "") < 0
+end
+
+pub fn pindb_is_held(db: PinDb, name: string) -> bool is
+    let mut i: int = 0
+    while i < db.entries.len() is
+        if matches_package(db.entries[i], name) && db.entries[i].priority >= 1000 is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Kopia bez wpisow o pakiecie `pkg` (`retain(|e| e.package != pkg)`).
+pub fn pin_remove(db: PinDb, pkg: string) -> PinDb is
+    let mut out: [PinEntry] = []
+    let mut i: int = 0
+    while i < db.entries.len() is
+        if db.entries[i].package != pkg is out.push(db.entries[i]) end
+        i += 1
+    end
+    return PinDb { entries: out }
+end
+
+;; Kopia bez wpisu "held" dla `pkg` (`unhold`).
+pub fn pin_remove_held(db: PinDb, pkg: string) -> PinDb is
+    let mut out: [PinEntry] = []
+    let mut i: int = 0
+    while i < db.entries.len() is
+        let e: PinEntry = db.entries[i]
+        if !(e.package == pkg && note_is(e, "held")) is out.push(e) end
+        i += 1
+    end
+    return PinDb { entries: out }
+end
+
+pub fn pin_add(db: PinDb, e: PinEntry) -> PinDb is
+    let mut out: [PinEntry] = db.entries
+    out.push(e)
+    return PinDb { entries: out }
+end
+
+;; (constraint, priority) pierwszego pinu pakietu innego niz "held"; nil gdy brak.
+;; Zwraca [constraint, priority-jako-tekst].
+pub fn pindb_get_pin(db: PinDb, name: string) -> [string]? is
+    let mut i: int = 0
+    while i < db.entries.len() is
+        let e: PinEntry = db.entries[i]
+        if e.package == name && !note_is(e, "held") is
+            return [e.version, to_string(e.priority)]
+        end
+        i += 1
+    end
+    return nil
+end
+
+pub fn pindb_is_held_local(db: PinDb, name: string) -> bool is
+    let mut i: int = 0
+    while i < db.entries.len() is
+        if db.entries[i].package == name && note_is(db.entries[i], "held") is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Zapis atomowy (*.tmp + rename). "" = Ok.
+pub fn pindb_save(db: PinDb) -> string is
+    if !fs::exists("/etc/hammer") is fs::mkdir("/etc/hammer") end
+    let mut out: string = "! hammer pins — auto-generated\n\n"
+    let mut i: int = 0
+    while i < db.entries.len() is
+        let e: PinEntry = db.entries[i]
+        out = out + "[" + e.package + "]\n"
+        out = out + "-> version  => \"" + e.version + "\"\n"
+        out = out + "-> priority => " + to_string(e.priority) + "\n"
+        if e.note != nil is out = out + "-> note     => \"" + note_or_empty(e) + "\"\n" end
+        out = out + "\n"
+        i += 1
+    end
+    let file: string = pins_file()
+    let tmp: string = file + ".tmp"
+    fs::write(tmp, out)
+    fs::rename(tmp, file)
+    log::info("pins: saved " + to_string(db.entries.len()) + " entries to " + file)
+    return ""
+end
+
+;; ── CLI ──────────────────────────────────────────────────────────────────
+
+fn arg_at(args: [string], i: int) -> string is
+    if i < args.len() is return args[i] end
+    return ""
+end
+
+fn ok_mark() -> string is return ui::bright_green("✔") end
+
+;; `hammer pin [list|add|remove|hold|unhold]`; "" = Ok, inaczej blad.
+pub fn cmd_pin(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "list"
+
+    if sub == "list" || sub == "ls" is
+        let db: PinDb = pindb_load()
+        if db.entries.len() == 0 is
+            write("  " + ui::dim("·") + " No pins configured.")
+            write("  Add: " + ui::cyan("hammer pin add <pkg> <version> [priority]"))
+            return ""
+        end
+        write("")
+        write("  " + ui::accent_bold("⬡") + "  Package pins")
+        write("  " + ui::dim(str::repeat("─", 70)))
+        write("  " + ui::bold(fmt::pad_right("Package", 24)) + " " + ui::bold(fmt::pad_right("Version", 20)) + " " +
+              ui::bold(fmt::pad_right("Priority", 8)) + " " + ui::bold("Note"))
+        write("  " + ui::dim(str::repeat("─", 70)))
+        let mut i: int = 0
+        while i < db.entries.len() is
+            let e: PinEntry = db.entries[i]
+            let p: string = fmt::pad_right(to_string(e.priority), 12)
+            let mut prio_col: string = ui::dim(p)
+            if e.priority < 0 is
+                prio_col = ui::red(p)
+            elsif e.priority >= 1000 is
+                prio_col = ui::bright_green_bold(p)
+            elsif e.priority >= 500 is
+                prio_col = ui::yellow(p)
+            end
+            write("  " + ui::bold(fmt::pad_right(e.package, 24)) + " " + ui::cyan(fmt::pad_right(e.version, 20)) + " " +
+                  prio_col + " " + ui::dim(note_or_empty(e)))
+            i += 1
+        end
+        return ""
+    end
+
+    if sub == "add" is
+        let pkg: string = arg_at(args, 1)
+        if pkg == "" is return "Usage: hammer pin add <package> <version> [priority] [note]" end
+        let ver: string = if args.len() > 2 then args[2] else "*"
+        let prio: int = parse_int_or(arg_at(args, 3), 1001)
+        let mut note: string? = nil
+        if args.len() > 4 is note = args[4] end
+        let db: PinDb = pin_add(pin_remove(pindb_load(), pkg),
+            PinEntry { package: pkg, version: ver, priority: prio, note: note })
+        let err: string = pindb_save(db)
+        if err != "" is return err end
+        write("  " + ok_mark() + " Pinned " + ui::bold(pkg) + " to " + ui::cyan(ver) + " (priority " + to_string(prio) + ")")
+        return ""
+    end
+
+    if sub == "remove" || sub == "rm" || sub == "unpin" is
+        let pkg: string = arg_at(args, 1)
+        if pkg == "" is return "Usage: hammer pin remove <package>" end
+        let db: PinDb = pindb_load()
+        let after: PinDb = pin_remove(db, pkg)
+        if after.entries.len() < db.entries.len() is
+            let err: string = pindb_save(after)
+            if err != "" is return err end
+            write("  " + ok_mark() + " Unpinned " + ui::bold(pkg) + ".")
+        else is
+            write("  " + ui::dim("·") + " No pin found for '" + pkg + "'.")
+        end
+        return ""
+    end
+
+    if sub == "hold" is
+        let pkg: string = arg_at(args, 1)
+        if pkg == "" is return "Usage: hammer pin hold <package>" end
+        let idb: db::InstalledDb = db::InstalledDb::open()
+        let inst: db::InstalledPackage? = idb.get(pkg)
+        let mut ver: string = "installed"
+        if inst != nil is
+            let ip: db::InstalledPackage = inst
+            ver = ip.version
+        end
+        let out: PinDb = pin_add(pin_remove(pindb_load(), pkg),
+            PinEntry { package: pkg, version: ver, priority: 1001, note: "held" })
+        let err: string = pindb_save(out)
+        if err != "" is return err end
+        write("  " + ok_mark() + " " + ui::bold(pkg) + " held at version " + ui::cyan(ver))
+        return ""
+    end
+
+    if sub == "unhold" is
+        let pkg: string = arg_at(args, 1)
+        if pkg == "" is return "Usage: hammer pin unhold <package>" end
+        let err: string = pindb_save(pin_remove_held(pindb_load(), pkg))
+        if err != "" is return err end
+        write("  " + ok_mark() + " " + ui::bold(pkg) + " released from hold.")
+        return ""
+    end
+
+    return "Unknown pin subcommand '" + sub + "'. Try: list, add, remove, hold, unhold"
+end
+
+;; `hammer hold <pkg>` — trzyma pakiet w wersji biezacej (tylko baza SQLite).
+pub fn cmd_hold(args: [string]) -> string is
+    let pkg: string = arg_at(args, 0)
+    if pkg == "" is return "Usage: hammer hold <package>" end
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let err: string = idb.hold_package(pkg)
+    if err != "" is return err end
+    let inst: db::InstalledPackage? = idb.get(pkg)
+    let mut ver: string = ""
+    if inst != nil is
+        let ip: db::InstalledPackage = inst
+        ver = ip.version
+    end
+    write("  " + ui::green("✔") + " " + pkg + " held at " + ver + ".")
+    return ""
+end
+
+pub fn cmd_unhold(args: [string]) -> string is
+    let pkg: string = arg_at(args, 0)
+    if pkg == "" is return "Usage: hammer unhold <package>" end
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let err: string = idb.unhold_package(pkg)
+    if err != "" is return err end
+    write("  " + ui::green("✔") + " " + pkg + " released from hold.")
+    return ""
+end
+
+;; `hammer unpin <pkg…>` — usuwa pin z pliku I z bazy.
+pub fn cmd_unpin(args: [string]) -> string is
+    let mut names: [string] = []
+    let mut n: int = 0
+    while n < args.len() is
+        if !args[n].starts_with("-") is names.push(args[n]) end
+        n += 1
+    end
+    if names.len() == 0 is return "Usage: hammer unpin <package…>" end
+
+    let mut db: PinDb = pindb_load()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let mut i: int = 0
+    while i < names.len() is
+        let before: int = db.entries.len()
+        db = pin_remove(db, names[i])
+        idb.unpin_package(names[i])
+        if db.entries.len() < before is
+            write("  " + ok_mark() + " Unpinned " + ui::bold(names[i]))
+        else is
+            write("  " + ui::dim("·") + " '" + names[i] + "' had no pin.")
+        end
+        i += 1
+    end
+    return pindb_save(db)
+end
