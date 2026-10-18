@@ -1,0 +1,160 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv" from "conv"
+use "bit -> colors"
+
+mod internal
+mod ui
+
+;; hammer -> internal::lock
+;;
+;; Port of source-code/internal/lock.rs (Rust) to H#.
+;; Blokada wylacznosci: tylko jedna instancja hammera na raz.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. BRAK `flock(2)`. Rust uzywa crate'a `fslock` (flock na deskryptorze
+;;    trzymanym do `Drop`). H# nie ma ani `Drop`, ani sprawdzonego
+;;    bindingu do libc `open`/`flock` (wariadyczne `open`), wiec blokada
+;;    to plik z PID-em tworzony ATOMOWO (`set -C`, czyli O_EXCL) przez
+;;    powloke. Zerwany proces nie zwalnia jej sam (flock tak) — dlatego
+;;    kazde `acquire` sprawdza, czy wlasciciel (PID z pliku) jeszcze zyje
+;;    (`kill -0`), a martwa blokade zdejmuje i probuje ponownie.
+;;    Ograniczenie: ponowne uzycie PID-u przez inny proces zmyli to
+;;    sprawdzenie (flock tego nie ma) — wtedy blokade trzeba usunac recznie
+;;    (komunikat bledu podaje sciezke, jak w Rust).
+;; 2. BRAK `Drop`: `lock_release(l)` jest OBOWIAZKOWE na kazdej sciezce
+;;    wyjscia (tak jak `cleanup(deb)` w `pkg/deb.h#`). Zwalnia tylko wtedy,
+;;    gdy plik nadal zawiera NASZ PID (nie kasuje cudzej blokady).
+;; 3. `anyhow::Result<HammerLock>` -> `LockResult { lock, err }`:
+;;    `err == ""` = Ok. Tresci bledow jak w Rust.
+;; 4. `cfg!(feature = "normal-mode")` -> `build_mode::normal_mode()`
+;;    (czas dzialania, patrz `internal/build_mode.h#`).
+;; 5. `acquire_wait` odpytuje co 500 ms zamiast blokowac w `flock()`.
+
+pub struct HammerLock is
+    pub lock_path: string
+    pub pid:       int
+end
+
+pub struct LockResult is
+    pub lock: HammerLock
+    pub err:  string
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+;; Sciezka blokady zalezna od trybu budowy.
+pub fn system_lock_path() -> string is
+    if build_mode::normal_mode() is return "/var/lib/hammer/.lock" end
+    return "/hammer/db/.lock"
+end
+
+fn lock_ok(path: string) -> LockResult is
+    return LockResult { lock: HammerLock { lock_path: path, pid: compat::os_pid() }, err: "" }
+end
+
+fn lock_err(path: string, msg: string) -> LockResult is
+    return LockResult { lock: HammerLock { lock_path: path, pid: 0 }, err: msg }
+end
+
+fn ensure_parent(path: string) -> string is
+    let parent: string = compat::path_parent(path)
+    if parent == "" is return "" end
+    proc::shell("mkdir -p -- " + shq(parent) + " 2>/dev/null")
+    if !fs::is_dir(parent) is
+        return "Cannot create lock dir " + parent
+    end
+    return ""
+end
+
+;; Probuje utworzyc plik blokady atomowo; true = utworzony.
+fn try_create(path: string) -> bool is
+    let cmd: string = "( set -C; echo " + to_string(compat::os_pid()) + " > " + shq(path) + " ) 2>/dev/null && echo created || echo exists"
+    return str::trim(proc::shell(cmd)) == "created"
+end
+
+;; PID zapisany w pliku blokady (0 gdy nieczytelny).
+fn owner_pid(path: string) -> int is
+    let t: string = str::trim(proc::shell("cat -- " + shq(path) + " 2>/dev/null"))
+    if t == "" || !str::is_numeric(t) is return 0 end
+    return conv::str_to_int(t)
+end
+
+fn pid_alive(pid: int) -> bool is
+    if pid <= 0 is return false end
+    return str::trim(proc::shell("kill -0 " + to_string(pid) + " 2>/dev/null && echo alive || echo dead")) == "alive"
+end
+
+;; Jedna proba zdobycia blokady (z zdjeciem martwej).
+fn acquire_once(path: string) -> bool is
+    if try_create(path) is return true end
+    let owner: int = owner_pid(path)
+    if owner == compat::os_pid() is return true end
+    if !pid_alive(owner) is
+        ;; wlasciciel nie zyje (albo plik jest pusty/uszkodzony): zdejmij i ponow
+        proc::shell("rm -f -- " + shq(path))
+        return try_create(path)
+    end
+    return false
+end
+
+fn busy_message(path: string) -> string is
+    return "Another hammer instance is already running.\n  Lock: " + path + "\n  If no other hammer is running, remove the lock file."
+end
+
+;; Rust: `HammerLock::acquire` — bez czekania.
+pub fn acquire(path: string) -> LockResult is
+    let e: string = ensure_parent(path)
+    if e != "" is return lock_err(path, e) end
+    if acquire_once(path) is return lock_ok(path) end
+    return lock_err(path, busy_message(path))
+end
+
+;; Rust: `HammerLock::acquire_wait` — czeka na zwolnienie.
+pub fn acquire_wait(path: string) -> LockResult is
+    let e: string = ensure_parent(path)
+    if e != "" is return lock_err(path, e) end
+    if acquire_once(path) is return lock_ok(path) end
+    ui::eprint_line("  " + colors::yellow("·") + "  Waiting for another hammer instance to finish…")
+    while true is
+        compat::time_sleep_ms(500)
+        if acquire_once(path) is return lock_ok(path) end
+    end
+    return lock_err(path, busy_message(path))
+end
+
+pub fn acquire_system() -> LockResult is
+    return acquire(system_lock_path())
+end
+
+pub fn acquire_system_wait() -> LockResult is
+    return acquire_wait(system_lock_path())
+end
+
+pub fn acquire_user(user_dir: string) -> LockResult is
+    return acquire(compat::path_join(user_dir, ".lock"))
+end
+
+pub fn system_lock() -> LockResult is
+    return acquire_system_wait()
+end
+
+pub fn user_lock(user_dir: string) -> LockResult is
+    return acquire_wait(compat::path_join(user_dir, ".lock"))
+end
+
+;; Rust: `HammerLock::path()`.
+pub fn lock_path(l: HammerLock) -> string is
+    return l.lock_path
+end
+
+;; Zamiennik `Drop`: zwalnia blokade, jesli nadal jest nasza.
+pub fn lock_release(l: HammerLock) is
+    if l.pid <= 0 is return end
+    if owner_pid(l.lock_path) == l.pid is
+        proc::shell("rm -f -- " + shq(l.lock_path))
+    end
+end
