@@ -1,0 +1,50 @@
+use "std -> strings" from "str"
+
+mod internal
+mod ui
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_search   (port cmd/search.rs)
+;; Odejscia: sortowanie nazw przez `sorting::sorted`; dopasowanie opisu bez
+;; rozroznienia wielkosci liter, nazwy z rozroznieniem (jak Rust).
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    if args.len() == 0 is return "Usage: hammer oci search <term>" end
+    let term: string = args[0]
+    let pr: oci_repo_index::PoolResult = oci_deb_layer::refresh_package_index(cfg)
+    if pr.err != "" is return pr.err end
+    let all: [package::Package] = oci_repo_index::pool_all(pr.pool)
+    let lterm: string = str::to_lower(term)
+
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < all.len() is
+        let p: package::Package = all[i]
+        i += 1
+        let mut hit: bool = compat::str_index_of(p.name, term) >= 0
+        if !hit && p.description_short != nil is
+            let d: string = p.description_short
+            hit = compat::str_index_of(str::to_lower(d), lterm) >= 0
+        end
+        if hit is names.push(p.name) end
+    end
+
+    if names.len() == 0 is
+        write("  No packages found matching '" + term + "'.")
+        return ""
+    end
+    let sorted_names: [string] = sorting::sorted(names)
+    write("")
+    let mut k: int = 0
+    while k < sorted_names.len() is
+        let found: package::Package? = oci_repo_index::pool_find(pr.pool, sorted_names[k])
+        k += 1
+        if found == nil is continue end
+        let p: package::Package = found
+        let mut desc: string = ""
+        if p.description_short != nil is desc = p.description_short end
+        write("  " + ui::bold(p.name) + " " + ui::dim(p.version) + " — " + desc)
+    end
+    write("")
+    return ""
+end
