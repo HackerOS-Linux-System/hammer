@@ -1,0 +1,366 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod ui
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+;; [mod gpg_verify pominiete: source-code/system/gpg_verify.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania gpg_verify::fn dzialaja bez zmian]
+;; [mod cache pominiete: source-code/pkg/cache.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania cache::fn dzialaja bez zmian]
+
+;; hammer -> tools::mirror
+;;
+;; Port of source-code/tools/mirror.rs (Rust) to H#: `hammer mirror <url>
+;; <local-path> [--arch=..] [--suite=..] [--components=..] [--limit=KBPS]
+;; [--insecure]` — lustro repozytorium Debiana z weryfikacja GPG i SHA-256.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `reqwest` + `tokio` -> `curl`. `download_resumable`: `curl -C -` (wznawianie
+;;    po `.part`, jak naglowek `Range`) + `--limit-rate` (zamiast reczej petli
+;;    100 ms) i atomowe `mv .part -> cel`. Gotowy, niepusty plik jest pomijany
+;;    (jak w Rust).
+;; 2. `xz2::XzDecoder` -> `xz -dc` przez `lhdeb::decompress_file`.
+;; 3. `anyhow::Result<()>` -> `string` ("" = OK); `Option<InRelease>` ->
+;;    `IndexResult { err, have_ir, ir }` (pole `have_ir` zastepuje `Some`).
+;; 4. SHA-256 pliku: `sha256sum` (jak `verify_file_sha256` — porownanie bez
+;;    rozrozniania wielkosci liter).
+;; 5. `inrelease.verify_file(rel_path, &bytes)` -> `gpg_verify::inrelease_verify_file`
+;;    z SCIEZKA pliku (bez wczytywania calosci).
+;; 6. `--limit=KBPS` -> `curl --limit-rate <N>k` (Rust mnozyl przez 1024 i
+;;    dzielil na okna 100 ms; efekt: srednia predkosc w KB/s).
+;; 7. `fetch_flat_packages`: `get_bytes` -> pobranie do pliku i `decompress_file`.
+;; 8. ZACHOWANE: pobieranie `.deb` jest SEKWENCYJNE (bez rownoleglosci), a
+;;    pakiet bez `Filename` jest pomijany bez komunikatu.
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+pub struct MirrorConfig is
+    pub source_url: string
+    pub local_path: string
+    pub arch:       string
+    pub suite:      string
+    pub components: [string]
+    ;; bajty/s (0 = bez limitu)
+    pub bw_limit:   int
+    ;; pomin weryfikacje GPG (niebezpieczne)
+    pub insecure:   bool
+end
+
+fn trim_trailing_slash(s: string) -> string is
+    let mut n: int = string_len(s)
+    while n > 0 && string_at(s, n - 1) == "/" is
+        n -= 1
+    end
+    return str::slice(s, 0, n)
+end
+
+pub fn mirror_config_new(url: string, local: string) -> MirrorConfig is
+    return MirrorConfig { source_url: trim_trailing_slash(url), local_path: local, arch: cache::detect_arch(),
+        suite: "bookworm", components: ["main", "contrib"], bw_limit: 0, insecure: false }
+end
+
+fn mkdir_p(p: string) -> bool is
+    proc::shell("mkdir -p " + shq(p))
+    return fs::is_dir(p)
+end
+
+;; ── Wznawialne pobieranie ────────────────────────────────────────────────
+
+;; "" = OK. Gotowy niepusty plik => OK bez pobierania.
+pub fn download_resumable(url: string, dest: string, bw_limit: int) -> string is
+    if fs::exists(dest) && fs::size(dest) > 0 is return "" end
+    let part: string = compat::path_with_extension(dest, "part")
+    let limit: string = if bw_limit > 0 then " --limit-rate " + to_string(bw_limit / 1024) + "k" else ""
+    let out: string = str::trim(proc::shell("curl -sSL -C - -w '%{{http_code}}' -o " + shq(part) + limit + " " + shq(url) + " 2>/dev/null"))
+    if !str::is_numeric(out) is
+        return "GET " + url + " failed"
+    end
+    let code: int = conv::str_to_int(out)
+    if code == 404 is
+        fs::remove(part)
+        return "404 Not Found: " + url
+    end
+    ;; 416 przy wznawianiu: plik juz kompletny
+    if code == 416 is
+        if fs::exists(dest) is return "" end
+        return "Range not satisfiable for " + url
+    end
+    if code < 200 || code >= 300 is
+        return "HTTP " + to_string(code) + " for " + url
+    end
+    if !sh_ok("mv -f " + shq(part) + " " + shq(dest)) is
+        return "Renaming " + part + " → " + dest
+    end
+    return ""
+end
+
+fn file_sha256(path: string) -> string is
+    let out: string = str::trim(proc::shell("sha256sum -- " + shq(path) + " 2>/dev/null"))
+    if out == "" is return "" end
+    return str::slice(out, 0, compat::str_index_of(out, " "))
+end
+
+;; true gdy skrot sie zgadza; "" w `err` przy bledzie odczytu.
+pub struct ShaCheck is
+    pub ok:  bool
+    pub err: string
+end
+
+fn verify_file_sha256(path: string, expected_hex: string) -> ShaCheck is
+    let actual: string = file_sha256(path)
+    if actual == "" is return ShaCheck { ok: false, err: "Cannot read " + path } end
+    return ShaCheck { ok: str::to_lower(actual) == str::to_lower(expected_hex), err: "" }
+end
+
+;; ── Indeks ───────────────────────────────────────────────────────────────
+
+pub struct IndexResult is
+    pub err:    string
+    pub have_ir: bool
+    pub ir:     gpg_verify::InRelease
+end
+
+fn mirror_index(cfg: MirrorConfig) -> IndexResult is
+    let dists_base: string = cfg.source_url + "/dists/" + cfg.suite
+    let local_dists: string = compat::path_join(compat::path_join(cfg.local_path, "dists"), cfg.suite)
+    let blank: gpg_verify::InRelease = gpg_verify::inrelease_parse("")
+    if !mkdir_p(local_dists) is return IndexResult { err: "Cannot create " + local_dists, have_ir: false, ir: blank } end
+
+    ;; InRelease
+    let inrelease_url: string = dists_base + "/InRelease"
+    let ir_file: string = compat::path_join(local_dists, "InRelease")
+    let tmp_ir: string = fs::temp_file("hammer-inrelease")
+    if !sh_ok("curl -fsSL -o " + shq(tmp_ir) + " " + shq(inrelease_url)) is
+        fs::remove(tmp_ir)
+        return IndexResult { err: "Downloading InRelease", have_ir: false, ir: blank }
+    end
+    let text: string = fs::read(tmp_ir)
+
+    let mut ir: gpg_verify::InRelease = blank
+    let mut have_ir: bool = false
+    if cfg.insecure is
+        write("  " + ui::yellow("!") + " InRelease (unverified)")
+        ir = gpg_verify::inrelease_parse(text)
+        have_ir = true
+    else is
+        let ve: string = gpg_verify::verify_inrelease(text, gpg_verify::keyring_dir())
+        if ve != "" is
+            fs::remove(tmp_ir)
+            return IndexResult { err: "InRelease GPG verification failed: " + ve + "\n  Add the repo's signing key with `hammer key add`, or pass --insecure to skip verification (NOT RECOMMENDED).", have_ir: false, ir: blank }
+        end
+        write("  " + ui::bright_green("✔") + " InRelease (GPG verified)")
+        ir = gpg_verify::inrelease_parse(text)
+        have_ir = true
+    end
+    sh_ok("mv -f " + shq(tmp_ir) + " " + shq(ir_file))
+
+    ;; Packages.xz dla kazdego komponentu, SHA-256 wg InRelease
+    let mut ci: int = 0
+    while ci < cfg.components.len() is
+        let comp: string = cfg.components[ci]
+        let rel_path: string = comp + "/binary-" + cfg.arch + "/Packages.xz"
+        let pkg_url: string = dists_base + "/" + rel_path
+        let pkg_dir: string = compat::path_join(compat::path_join(local_dists, comp), "binary-" + cfg.arch)
+        if !mkdir_p(pkg_dir) is return IndexResult { err: "Cannot create " + pkg_dir, have_ir: have_ir, ir: ir } end
+        let dest: string = compat::path_join(pkg_dir, "Packages.xz")
+
+        let de: string = download_resumable(pkg_url, dest, 0)
+        if de != "" is return IndexResult { err: "Downloading " + pkg_url + ": " + de, have_ir: have_ir, ir: ir } end
+
+        let mut sha_status: string = ui::yellow("unverified")
+        if have_ir && !cfg.insecure is
+            let ve2: string = gpg_verify::inrelease_verify_file(ir, rel_path, dest)
+            if ve2 == "" is
+                sha_status = ui::bright_green("sha256 ✔")
+            else is
+                fs::remove(dest)
+                return IndexResult { err: "SHA256 mismatch for " + rel_path + ": " + ve2, have_ir: have_ir, ir: ir }
+            end
+        end
+        write("  " + ui::green("✔") + " " + comp + "/binary-" + cfg.arch + "/Packages.xz [" + sha_status + "]")
+        ci += 1
+    end
+    return IndexResult { err: "", have_ir: have_ir, ir: ir }
+end
+
+fn load_packages_from_mirror(cfg: MirrorConfig) -> [package::Package] is
+    let mut all: [package::Package] = []
+    let local_uri: string = "file://" + cfg.local_path
+    let mut ci: int = 0
+    while ci < cfg.components.len() is
+        let pkg_path: string = compat::path_join(compat::path_join(compat::path_join(compat::path_join(cfg.local_path, "dists"), cfg.suite), cfg.components[ci]), "binary-" + cfg.arch + "/Packages.xz")
+        if fs::exists(pkg_path) is
+            let plain: string = lhdeb::decompress_file(pkg_path, "Packages.xz")
+            let text: string = fs::read(plain)
+            fs::remove(plain)
+            let pkgs: [package::Package] = package::parse_index(text)
+            let mut k: int = 0
+            while k < pkgs.len() is
+                let mut p: package::Package = pkgs[k]
+                p.repo_base_uri = local_uri
+                all.push(p)
+                k += 1
+            end
+        end
+        ci += 1
+    end
+    return all
+end
+
+;; ── .deb ─────────────────────────────────────────────────────────────────
+
+fn mirror_debs(cfg: MirrorConfig, pkgs: [package::Package]) -> string is
+    let total: int = pkgs.len()
+    write("  Mirroring " + ui::cyan_bold(to_string(total)) + " .deb files…")
+    let mut done: int = 0
+    let mut total_bytes: int = 0
+    let mut sha_ok: int = 0
+    let mut sha_bad: int = 0
+
+    let mut i: int = 0
+    while i < pkgs.len() is
+        let pkg: package::Package = pkgs[i]
+        if pkg.filename != nil is
+            let filename: string = pkg.filename
+            let url: string = cfg.source_url + "/" + filename
+            let dest: string = compat::path_join(cfg.local_path, filename)
+            let parent: string = compat::path_parent(dest)
+            if parent != "" && !mkdir_p(parent) is return "Cannot create " + parent end
+            let size: int = if pkg.download_size == nil then 0 else pkg.download_size
+
+            let de: string = download_resumable(url, dest, cfg.bw_limit)
+            if de != "" is
+                log::warn("mirror: failed " + filename + ": " + de)
+            else is
+                let mut skip: bool = false
+                if pkg.sha256 != nil is
+                    let expected: string = pkg.sha256
+                    let chk: ShaCheck = verify_file_sha256(dest, expected)
+                    if chk.err != "" is
+                        log::warn("mirror: could not verify " + filename + ": " + chk.err)
+                    elsif chk.ok is
+                        sha_ok += 1
+                    else is
+                        sha_bad += 1
+                        log::warn("mirror: SHA256 mismatch for " + filename + " — removing")
+                        fs::remove(dest)
+                        skip = true
+                    end
+                end
+                if !skip is
+                    done += 1
+                    total_bytes += size
+                    if done % 100 == 0 || done == total is
+                        write("  [" + to_string(done) + "/" + to_string(total) + "] " + ui::cyan(ui::human_size(total_bytes)) + " (sha256 ok: " + to_string(sha_ok) + ", bad: " + to_string(sha_bad) + ")")
+                    end
+                end
+            end
+        end
+        i += 1
+    end
+    write("  " + ui::bright_green("✔") + " " + to_string(done) + " packages mirrored (" + ui::cyan(ui::human_size(total_bytes)) + ") — " + ui::bright_green(to_string(sha_ok)) + " verified, " + ui::red(to_string(sha_bad)) + " bad")
+    return ""
+end
+
+;; ── Komenda ──────────────────────────────────────────────────────────────
+
+pub fn cmd_mirror(args: [string]) -> string is
+    if args.len() < 1 is
+        return "Usage: hammer mirror <url> <local-path> [--arch=ARCH] [--suite=SUITE] [--limit=KBPS] [--insecure]"
+    end
+    if args.len() < 2 is return "Usage: hammer mirror <url> <local-path>" end
+    let url: string = args[0]
+    let local: string = args[1]
+    let mut cfg: MirrorConfig = mirror_config_new(url, local)
+
+    let mut i: int = 2
+    while i < args.len() is
+        let arg: string = args[i]
+        if string_starts_with(arg, "--arch=") is cfg.arch = str::slice(arg, 7, string_len(arg)) end
+        if string_starts_with(arg, "--suite=") is cfg.suite = str::slice(arg, 8, string_len(arg)) end
+        if string_starts_with(arg, "--components=") is
+            let parts: [string] = str::split(str::slice(arg, 13, string_len(arg)), ",")
+            let mut comps: [string] = []
+            let mut k: int = 0
+            while k < parts.len() is
+                comps.push(str::trim(parts[k]))
+                k += 1
+            end
+            cfg.components = comps
+        end
+        if string_starts_with(arg, "--limit=") is
+            let v: string = str::slice(arg, 8, string_len(arg))
+            cfg.bw_limit = if str::is_numeric(v) then conv::str_to_int(v) * 1024 else 0
+        end
+        if arg == "--insecure" is cfg.insecure = true end
+        i += 1
+    end
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Mirroring " + ui::cyan(url) + " → " + ui::bold(local))
+    write("  Suite: " + ui::bold(cfg.suite) + "  Arch: " + ui::bold(cfg.arch) + "  Components: " + ui::dim(str::join(cfg.components, ", ")))
+    if cfg.insecure is
+        write("  " + ui::red_bold("!") + " --insecure: GPG verification DISABLED")
+    end
+    write("  " + ui::dim(str::repeat("─", 65)))
+
+    let ix: IndexResult = mirror_index(cfg)
+    if ix.err != "" is return ix.err end
+    let pkgs: [package::Package] = load_packages_from_mirror(cfg)
+    let me: string = mirror_debs(cfg, pkgs)
+    if me != "" is return me end
+
+    write("")
+    write("  " + ui::bright_green_bold("✔") + " Mirror complete at " + ui::bold(local))
+    if ix.have_ir is
+        let valid: string = if ix.ir.valid_until == nil then "unknown" else ix.ir.valid_until
+        let label: string = if cfg.insecure then ui::yellow("unverified") else ui::bright_green("GPG OK")
+        write("  InRelease: " + label + " (valid until " + ui::dim(valid) + ")")
+    end
+    write("  To use: add to /etc/hammer/sources-list.hk:")
+    write("    " + ui::cyan("->") + " baseurl => \"file://" + local + "\"")
+    return ""
+end
+
+;; ── Repozytoria "flat" ───────────────────────────────────────────────────
+
+pub fn resolve_flat_repo_url(base: string, filename: string) -> string is
+    let mut f: int = 0
+    while f < string_len(filename) && string_at(filename, f) == "/" is
+        f += 1
+    end
+    return trim_trailing_slash(base) + "/" + str::slice(filename, f, string_len(filename))
+end
+
+;; Indeks Packages repozytorium flat (`deb file:///path ./`); `arch` jak w
+;; Rust nieuzywany. "" w `text` + niepusty `err` gdy brak.
+pub struct FlatResult is
+    pub text: string
+    pub err:  string
+end
+
+pub fn fetch_flat_packages(base_url: string, arch: string) -> FlatResult is
+    let suffixes: [string] = ["Packages.xz", "Packages.gz", "Packages"]
+    let mut i: int = 0
+    while i < suffixes.len() is
+        let url: string = trim_trailing_slash(base_url) + "/" + suffixes[i]
+        let tmp: string = fs::temp_file("hammer-flat")
+        if sh_ok("curl -fsSL -o " + shq(tmp) + " " + shq(url)) is
+            let plain: string = if suffixes[i] == "Packages" then tmp else lhdeb::decompress_file(tmp, suffixes[i])
+            let text: string = fs::read(plain)
+            fs::remove(tmp)
+            if plain != tmp is fs::remove(plain) end
+            return FlatResult { text: text, err: "" }
+        end
+        fs::remove(tmp)
+        i += 1
+    end
+    return FlatResult { text: "", err: "No Packages index found at " + base_url }
+end
