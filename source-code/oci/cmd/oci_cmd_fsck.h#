@@ -1,0 +1,15 @@
+mod internal
+mod ui
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_fsck   (port cmd/fsck.rs)
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    write("  " + ui::dim("·") + " Verifying OSTree repo at " + cfg.ostree_repo_path + "…")
+    let rr: oci_ostree_repo::RepoResult = oci_ostree_repo::repo_open(cfg.ostree_repo_path)
+    if rr.err != "" is return rr.err end
+    let e: string = oci_ostree_repo::check_integrity(rr.repo, true)
+    if e != "" is return e end
+    write("  " + ui::bright_green_bold("✔") + " Repository integrity verified — every ref's commit history is intact.")
+    return ""
+end
