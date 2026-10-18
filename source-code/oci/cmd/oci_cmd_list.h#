@@ -1,0 +1,27 @@
+mod internal
+mod ui
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_list   (port cmd/list.rs)
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    let sr: oci_sysroot::SysrootResult = oci_sysroot::sysroot_open(cfg.sysroot_path, cfg.ostree_repo_path, cfg.osname)
+    if sr.err != "" is return sr.err end
+    let booted: oci_sysroot::BootedResult = oci_sysroot::booted_deployment(sr.sysroot)
+    if booted.err != "" is return booted.err end
+    if !booted.found is return "No booted deployment." end
+    let lm: oci_sysroot::LayerMeta = oci_sysroot::read_layer_metadata(sr.sysroot, booted.dep.checksum)
+    if lm.layers.len() == 0 is
+        write("  No layered packages on the booted deployment.")
+        return ""
+    end
+    write("")
+    let mut i: int = 0
+    while i < lm.layers.len() is
+        write("  " + ui::bright_green("●") + " " + ui::bold(lm.layers[i].name) + " " + ui::dim(lm.layers[i].version))
+        i += 1
+    end
+    write("")
+    write("  " + to_string(lm.layers.len()) + " package(s) layered on top of the base image.")
+    return ""
+end
