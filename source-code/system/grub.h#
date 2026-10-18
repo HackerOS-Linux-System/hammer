@@ -1,0 +1,533 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod profile
+mod ui
+
+;; hammer -> grub
+;;
+;; Port of source-code/system/grub.rs (Rust) to H#: integracja z bootloaderem
+;; (GRUB: generator /etc/grub.d/09_hammer + plik generacji + grub-mkconfig;
+;; systemd-boot: wpisy w loader/entries), wykrywanie bootloadera, odczyt
+;; `hammer_gen=` z /proc/cmdline.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `gen.timestamp` (chrono) jest tu RFC3339 `string`: "%Y-%m-%d %H:%M" =
+;;    `ui::format_ts`, "%Y.%m.%d" = pierwsze 10 znakow z '-' -> '.'.
+;; 2. `env!("CARGO_PKG_VERSION")` -> `log::hammer_version()`.
+;; 3. `Result<..>` -> `string` bledu ("" = Ok); `Option<u32>` -> `int?`;
+;;    `BootloaderKind` + `kind_name` zamiast `Display`.
+;; 4. `Command::output()` -> `system("... >/dev/null 2>&1")`; komunikat
+;;    ostrzezenia z `grub-mkconfig` czytany przez plik tymczasowy.
+;; 5. `gens_db.all()` / `active_num()` -> `db.generations` / `profile::read_active_gen()`.
+;;
+;; ── BLEDY ORYGINALU, KTORE NAPRAWIAM ─────────────────────────────────────
+;; A. SKRYPT 09_hammer wybieral jadro petla `for vmlinuz in /boot/vmlinuz-*
+;;    ... break` — czyli PIERWSZE ALFABETYCZNIE, a wiec NAJSTARSZE
+;;    zainstalowane jadro (5.10 przed 6.12; sprawdzone), i bral pierwszy
+;;    initrd niezaleznie od wersji. Teraz: najnowsze wg `sort -V` (bez
+;;    `*.old`) i initrd o TEJ SAMEJ wersji (dopiero potem dowolny).
+;; B. Ten sam skrypt: `. /usr/share/grub/grub-mkconfig_lib 2>/dev/null || true`.
+;;    Dla `.` (wbudowane specjalne) brak pliku KONCZY powloke mimo `|| true`
+;;    (dash; sprawdzone: skrypt wychodzil bez zadnego wpisu). Teraz
+;;    `[ -r plik ] && .`.
+;; C. systemd-boot: `find_kernel_initrd` wybieral `.max()` po NAZWIE —
+;;    leksykograficznie `vmlinuz-6.9` > `vmlinuz-6.12`. Teraz sortowanie
+;;    wersji (`sort -V`).
+;; D. systemd-boot dopisywal `hammer.gen=N` (kropka), a `read_boot_gen` czyta
+;;    tylko `hammer_gen=` (podkreslnik) — na systemd-boot generacja
+;;    uruchomieniowa nigdy nie byla rozpoznana. Teraz `read_boot_gen`
+;;    rozpoznaje OBA zapisy, a wpisy systemd-boot uzywaja `hammer_gen=`
+;;    (jak GRUB) i usuwaja z cmdline oba stare zapisy (inaczej system
+;;    uruchomiony przez GRUB z `hammer_gen=3` dostawal w kazdym wpisie
+;;    dwie sprzeczne wartosci).
+;; E. ZACHOWANE: `set_systemd_boot_default` NADPISUJE caly `loader.conf`
+;;    (traci wlasne ustawienia uzytkownika) — jak w Rust.
+;; F. ZACHOWANE: generacje NOWSZE niz `current` (po rollbacku) dostaja w menu
+;;    etykiete `old(DATA)` — jak w Rust.
+
+pub fn grub_generator() -> string is return "/etc/grub.d/09_hammer" end
+pub fn grub_defaults() -> string is return "/etc/default/grub.d/hammer.cfg" end
+pub fn grub_gens_file() -> string is return "/boot/grub/hammer-generations" end
+pub fn grub_cfg() -> string is return "/boot/grub/grub.cfg" end
+
+fn os_name() -> string is return "HackerOS GNU/Linux" end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sys_ok(cmd: string) -> bool is
+    return system(cmd) == 0
+end
+
+fn lines_of(s: string) -> [string] is
+    let parts: [string] = str::split(s, "\n")
+    let mut out: [string] = []
+    let n: int = if parts.len() > 0 && parts[parts.len() - 1] == "" then parts.len() - 1 else parts.len()
+    let mut i: int = 0
+    while i < n is
+        out.push(parts[i])
+        i += 1
+    end
+    return out
+end
+
+;; Zapis tylko gdy tresc sie zmienila; true gdy zapisano.
+fn write_if_changed(file: string, content: string) -> bool is
+    let existing: string = if fs::exists(file) then fs::read(file) else ""
+    if existing == content is return false end
+    fs::write(file, content)
+    return true
+end
+
+;; ── Plik generacji (czytelny maszynowo) ──────────────────────────────────
+
+fn sort_gens_desc(items: [profile::Generation]) -> [profile::Generation] is
+    let mut a: [profile::Generation] = items
+    let mut i: int = 1
+    while i < a.len() is
+        let cur: profile::Generation = a[i]
+        let mut j: int = i - 1
+        while j >= 0 && a[j].number < cur.number is
+            a[j + 1] = a[j]
+            j -= 1
+        end
+        a[j + 1] = cur
+        i += 1
+    end
+    return a
+end
+
+;; "2026-10-02T10:00:00Z" -> "2026.10.02"
+fn date_label(ts: string) -> string is
+    if string_len(ts) >= 10 is return str::replace_all(str::slice(ts, 0, 10), "-", ".") end
+    return ts
+end
+
+pub fn generations_file_text(db: profile::GenerationsDb) -> string is
+    let mut lines: [string] = ["# hammer generations — auto-generated, do not edit"]
+    lines.push("current=" + to_string(db.current))
+    if db.pending != nil is
+        let p: int = db.pending
+        lines.push("pending=" + to_string(p))
+    end
+    let gens: [profile::Generation] = sort_gens_desc(db.generations)
+    let mut i: int = 0
+    while i < gens.len() is
+        let g: profile::Generation = gens[i]
+        i += 1
+        let mut note: string = ""
+        if g.note != nil is
+            let n: string = g.note
+            note = str::replace_all(n, "\n", " ")
+        end
+        lines.push("gen " + to_string(g.number) + " " + profile::gen_profile_path(g) + " " +
+            to_string(profile::gen_package_count(g)) + " pkgs \"" + ui::format_ts(g.timestamp) + " — " + note +
+            "\" date=" + date_label(g.timestamp))
+    end
+    return str::join(lines, "\n") + "\n"
+end
+
+fn write_generations_file(db: profile::GenerationsDb) -> string is
+    fs::mkdir("/boot/grub")
+    if !fs::is_dir("/boot/grub") is return "Cannot create /boot/grub" end
+    let tmp: string = grub_gens_file() + ".tmp"
+    fs::write(tmp, generations_file_text(db))
+    fs::rename(tmp, grub_gens_file())
+    log::info("grub: wrote hammer-generations")
+    return ""
+end
+
+;; ── Skrypt generatora GRUB (patrz A, B) ──────────────────────────────────
+;;
+;; Konwencja nazw:
+;;   biezaca generacja  -> "HackerOS GNU/Linux"          (domyslna, bez przyrostka)
+;;   oczekujaca         -> "HackerOS GNU/Linux (pending)"
+;;   starsze            -> "HackerOS GNU/Linux old(YYYY.MM.DD)"
+
+pub fn generator_script() -> string is
+    return "#!/bin/sh\n" +
+        "# /etc/grub.d/09_hammer  —  HackerOS generation menu entries\n" +
+        "# Auto-generated by hammer. Do not edit.\n" +
+        "#\n" +
+        "# Label convention:\n" +
+        "#   current generation → \"HackerOS GNU/Linux\"\n" +
+        "#   pending generation → \"HackerOS GNU/Linux (pending)\"\n" +
+        "#   older generations  → \"HackerOS GNU/Linux old(YYYY.MM.DD)\"\n" +
+        "set -e\n" +
+        "\n" +
+        "OS_NAME=\"HackerOS GNU/Linux\"\n" +
+        "GENS_FILE=\"/boot/grub/hammer-generations\"\n" +
+        "\n" +
+        "[ -f \"$GENS_FILE\" ] || exit 0\n" +
+        "\n" +
+        "if [ -r /usr/share/grub/grub-mkconfig_lib ]; then . /usr/share/grub/grub-mkconfig_lib; fi\n" +
+        "\n" +
+        "# ── Detect kernel / initrd ────────────────────────────────────\n" +
+        "# Najnowsze jadro wg `sort -V` (nie pierwsze alfabetycznie) i initrd o TEJ SAMEJ\n" +
+        "# wersji; dopiero gdy go brak — pierwszy znaleziony initrd.\n" +
+        "KERNEL=\"\"\n" +
+        "INITRD=\"\"\n" +
+        "ROOT_UUID=$(findmnt -n -o UUID / 2>/dev/null || true)\n" +
+        "\n" +
+        "KERNEL=$(ls -1 /boot/vmlinuz-* 2>/dev/null | grep -v '\\.old$' | sort -V | tail -n 1)\n" +
+        "[ -n \"$KERNEL\" ] || {{ [ -f /vmlinuz ] && KERNEL=/vmlinuz; }}\n" +
+        "[ -n \"$KERNEL\" ] || exit 0\n" +
+        "\n" +
+        "KVER=\"${{KERNEL#/boot/vmlinuz-}}\"\n" +
+        "for initrd_f in \"/boot/initrd.img-$KVER\" \"/boot/initramfs-$KVER\" /boot/initrd.img-* /boot/initramfs-* /initrd.img; do\n" +
+        "    if [ -f \"$initrd_f\" ]; then INITRD=\"$initrd_f\"; break; fi\n" +
+        "done\n" +
+        "\n" +
+        "# ── Read state ────────────────────────────────────────────────\n" +
+        "CURRENT=$(grep '^current=' \"$GENS_FILE\" | cut -d= -f2)\n" +
+        "PENDING=$(grep '^pending=' \"$GENS_FILE\" | cut -d= -f2)\n" +
+        "\n" +
+        "# ── Linux args ────────────────────────────────────────────────\n" +
+        "if [ -n \"$ROOT_UUID\" ]; then\n" +
+        "    LINUX_ROOT=\"root=UUID=$ROOT_UUID\"\n" +
+        "else\n" +
+        "    LINUX_ROOT=\"root=/dev/sda1\"\n" +
+        "fi\n" +
+        "\n" +
+        "# ── Helper: emit one menuentry ────────────────────────────────\n" +
+        "emit_entry() {\n" +
+        "    GEN_N=\"$1\"\n" +
+        "    LABEL=\"$2\"\n" +
+        "    EXTRA_ARGS=\"$3\"\n" +
+        "    echo \"menuentry \\\"$LABEL\\\" --class hackeros --class gnu-linux --class gnu --class os {\"\n" +
+        "    echo \"    load_video\"\n" +
+        "    echo \"    insmod gzio\"\n" +
+        "    echo \"    insmod part_gpt\"\n" +
+        "    echo \"    insmod ext2\"\n" +
+        "    if [ -n \"$ROOT_UUID\" ]; then\n" +
+        "        echo \"    search --no-floppy --fs-uuid --set=root $ROOT_UUID\"\n" +
+        "    fi\n" +
+        "    echo \"    echo 'Loading $LABEL…'\"\n" +
+        "    echo \"    linux   $KERNEL $LINUX_ROOT ro quiet splash hammer_gen=$GEN_N $EXTRA_ARGS\"\n" +
+        "    [ -n \"$INITRD\" ] && echo \"    initrd  $INITRD\"\n" +
+        "    echo \"}\"\n" +
+        "    echo \"\"\n" +
+        "}\n" +
+        "\n" +
+        "# Get date label for a generation number from the gens file\n" +
+        "get_date() {\n" +
+        "    local gen_n=\"$1\"\n" +
+        "    grep \"^gen $gen_n \" \"$GENS_FILE\" | sed 's/.*date=\\([^ ]*\\).*/\\1/' | head -1\n" +
+        "}\n" +
+        "\n" +
+        "echo \"# BEGIN HackerOS hammer generations\"\n" +
+        "\n" +
+        "# ── Current generation — label is just the OS name (default) ──\n" +
+        "emit_entry \"$CURRENT\" \"$OS_NAME\" \"\"\n" +
+        "\n" +
+        "# ── Pending generation (if any) ───────────────────────────────\n" +
+        "if [ -n \"$PENDING\" ] && [ \"$PENDING\" != \"$CURRENT\" ]; then\n" +
+        "    emit_entry \"$PENDING\" \"$OS_NAME (pending)\" \"\"\n" +
+        "fi\n" +
+        "\n" +
+        "# ── Previous generation — old(YYYY.MM.DD) ─────────────────────\n" +
+        "PREV=$(grep '^gen ' \"$GENS_FILE\" | awk -v cur=\"$CURRENT\" '{\n" +
+        "    split($0, a, \" \")\n" +
+        "    n = a[2]\n" +
+        "    if (n < cur) {{ if (prev == \"\" || n > prev) prev = n }}\n" +
+        "}} END {{ print prev }}')\n" +
+        "\n" +
+        "if [ -n \"$PREV\" ] && [ \"$PREV\" != \"$CURRENT\" ] && [ \"$PREV\" != \"$PENDING\" ]; then\n" +
+        "    PREV_DATE=$(get_date \"$PREV\")\n" +
+        "    emit_entry \"$PREV\" \"$OS_NAME old($PREV_DATE)\" \"\"\n" +
+        "fi\n" +
+        "\n" +
+        "# ── Advanced submenu with ALL generations ─────────────────────\n" +
+        "echo \"submenu 'Advanced HackerOS options >' {\"\n" +
+        "\n" +
+        "# Current first in submenu (no date suffix = current)\n" +
+        "emit_entry \"$CURRENT\" \"$OS_NAME\" \"\"\n" +
+        "\n" +
+        "# All older generations, newest first\n" +
+        "grep '^gen ' \"$GENS_FILE\" | sort -rn -k2 | while read _ GEN_N GEN_PATH GEN_PKGS rest; do\n" +
+        "    if [ \"$GEN_N\" = \"$CURRENT\" ]; then\n" +
+        "        continue  # already emitted above\n" +
+        "    fi\n" +
+        "\n" +
+        "    GEN_DATE=$(get_date \"$GEN_N\")\n" +
+        "\n" +
+        "    if [ \"$GEN_N\" = \"$PENDING\" ]; then\n" +
+        "        GLABEL=\"$OS_NAME (pending)\"\n" +
+        "    else\n" +
+        "        GLABEL=\"$OS_NAME old($GEN_DATE)\"\n" +
+        "    fi\n" +
+        "\n" +
+        "    emit_entry \"$GEN_N\" \"$GLABEL\" \"\"\n" +
+        "    # Recovery entry\n" +
+        "    emit_entry \"$GEN_N\" \"$GLABEL (recovery)\" \"single\"\n" +
+        "done\n" +
+        "\n" +
+        "echo \"}\"\n" +
+        "\n" +
+        "echo \"# END HackerOS hammer generations\"\n"
+end
+
+fn install_generator() -> string is
+    fs::mkdir("/etc/grub.d")
+    if !fs::is_dir("/etc/grub.d") is return "Cannot create /etc/grub.d" end
+    if write_if_changed(grub_generator(), generator_script()) is
+        system("chmod 755 " + shq(grub_generator()))
+        log::info("grub: installed /etc/grub.d/09_hammer")
+    end
+    return ""
+end
+
+;; ── Domyslne ustawienia GRUB ─────────────────────────────────────────────
+
+pub fn defaults_text() -> string is
+    return "# HackerOS hammer GRUB configuration — auto-generated\n" +
+        "GRUB_DISTRIBUTOR=\"" + os_name() + "\"\n" +
+        "GRUB_TIMEOUT_STYLE=\"menu\"\n" +
+        "GRUB_TIMEOUT=5\n" +
+        "# hammer generation is passed via kernel cmdline: hammer_gen=N\n"
+end
+
+fn install_defaults() -> string is
+    fs::mkdir("/etc/default/grub.d")
+    if !fs::is_dir("/etc/default/grub.d") is return "Cannot create /etc/default/grub.d" end
+    if write_if_changed(grub_defaults(), defaults_text()) is log::info("grub: wrote HackerOS GRUB defaults") end
+    return ""
+end
+
+;; ── grub-mkconfig ────────────────────────────────────────────────────────
+
+fn regenerate_grub_cfg() -> string is
+    log::info("grub: running grub-mkconfig...")
+    let errf: string = str::trim(proc::shell("mktemp /tmp/hammer-grub.XXXXXX 2>/dev/null"))
+    let rc: int = system("grub-mkconfig -o " + shq(grub_cfg()) + " >/dev/null 2>" + shq(errf))
+    if rc == 0 is
+        log::info("grub: grub.cfg regenerated")
+    else is
+        let msg: string = if errf != "" && fs::exists(errf) then fs::read(errf) else ""
+        let lines: [string] = lines_of(msg)
+        log::warn("grub: grub-mkconfig warnings: " + (if lines.len() > 0 then lines[0] else ""))
+    end
+    if errf != "" is system("rm -f -- " + shq(errf)) end
+    return ""
+end
+
+;; Punkt wejscia GRUB. "" = Ok.
+pub fn update_grub(db: profile::GenerationsDb) -> string is
+    let e1: string = write_generations_file(db)
+    if e1 != "" is return "Writing hammer-generations file: " + e1 end
+    let e2: string = install_generator()
+    if e2 != "" is return "Installing /etc/grub.d/09_hammer: " + e2 end
+    let e3: string = install_defaults()
+    if e3 != "" is return "Installing GRUB defaults: " + e3 end
+
+    if fs::exists("/usr/sbin/grub-mkconfig") || fs::exists("/usr/bin/grub-mkconfig") || fs::exists("/sbin/grub-mkconfig") is
+        return regenerate_grub_cfg()
+    end
+    log::info("grub: grub-mkconfig not found, skipping grub.cfg regeneration")
+    return ""
+end
+
+;; ── Generacja z cmdline ──────────────────────────────────────────────────
+
+;; Patrz D: oba zapisy (`hammer_gen=` i `hammer.gen=`).
+pub fn read_boot_gen() -> int? is
+    if !fs::exists("/proc/cmdline") is return nil end
+    let cmdline: string = fs::read("/proc/cmdline")
+    let norm: string = str::replace_all(str::replace_all(cmdline, "\t", " "), "\n", " ")
+    let toks: [string] = str::split(norm, " ")
+    let mut i: int = 0
+    while i < toks.len() is
+        let t: string = toks[i]
+        i += 1
+        let mut val: string = ""
+        let mut hit: bool = false
+        if t.starts_with("hammer_gen=") is
+            val = str::slice(t, 11, string_len(t))
+            hit = true
+        elsif t.starts_with("hammer.gen=") is
+            val = str::slice(t, 11, string_len(t))
+            hit = true
+        end
+        if hit is
+            if val != "" && str::is_numeric(val) is return conv::str_to_int(val) end
+            return nil
+        end
+    end
+    return nil
+end
+
+pub fn grub_status() -> string is
+    let cfg_ok: bool = fs::exists(grub_cfg())
+    let gens_ok: bool = fs::exists(grub_gens_file())
+    let gen_ok: bool = fs::exists(grub_generator())
+    if cfg_ok && gens_ok && gen_ok is return "installed (grub.cfg, generator, generations file)" end
+    if gen_ok is return "generator installed, grub.cfg not yet regenerated" end
+    return "not installed — run `hammer init`"
+end
+
+;; ── Wykrywanie bootloadera ───────────────────────────────────────────────
+
+pub enum BootloaderKind is
+    GrubBios
+    GrubEfi
+    SystemdBoot
+    Unknown
+end
+
+pub fn kind_name(k: BootloaderKind) -> string is
+    match k is
+        BootloaderKind::GrubBios    => is return "GRUB (BIOS)" end
+        BootloaderKind::GrubEfi     => is return "GRUB (EFI)" end
+        BootloaderKind::SystemdBoot => is return "systemd-boot" end
+        BootloaderKind::Unknown     => is return "unknown" end
+    end
+end
+
+fn any_exists(paths: [string]) -> bool is
+    let mut i: int = 0
+    while i < paths.len() is
+        if fs::exists(paths[i]) is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn detect_bootloader() -> BootloaderKind is
+    if any_exists(["/boot/efi/EFI/systemd/systemd-bootx64.efi", "/efi/EFI/systemd/systemd-bootx64.efi", "/boot/EFI/systemd/systemd-bootx64.efi"]) is
+        return BootloaderKind::SystemdBoot
+    end
+    if sys_ok("bootctl is-installed >/dev/null 2>&1") is return BootloaderKind::SystemdBoot end
+    if any_exists(["/boot/efi/EFI/grub/grubx64.efi", "/boot/efi/EFI/ubuntu/grubx64.efi", "/boot/efi/EFI/debian/grubx64.efi", "/boot/efi/EFI/HackerOS/grubx64.efi"]) is
+        return BootloaderKind::GrubEfi
+    end
+    if fs::exists("/boot/grub/grub.cfg") is return BootloaderKind::GrubBios end
+    return BootloaderKind::Unknown
+end
+
+fn is_systemd_boot(k: BootloaderKind) -> bool is
+    match k is
+        BootloaderKind::SystemdBoot => is return true end
+        _ => is return false end
+    end
+end
+
+fn is_grub(k: BootloaderKind) -> bool is
+    match k is
+        BootloaderKind::GrubBios => is return true end
+        BootloaderKind::GrubEfi => is return true end
+        _ => is return false end
+    end
+end
+
+;; ── systemd-boot ─────────────────────────────────────────────────────────
+
+fn find_esp() -> string is
+    let cands: [string] = ["/boot/efi", "/efi", "/boot"]
+    let mut i: int = 0
+    while i < cands.len() is
+        if fs::exists(compat::path_join(cands[i], "EFI")) || fs::exists(compat::path_join(cands[i], "loader")) is return cands[i] end
+        i += 1
+    end
+    let s: string = str::trim(proc::shell("findmnt -n -o TARGET --type vfat --mountpoint /boot/efi 2>/dev/null"))
+    if s != "" is return s end
+    return "/boot/efi"
+end
+
+pub struct KernelInitrd is
+    pub kernel: string
+    pub initrd: string
+end
+
+;; Patrz C: najnowsze jadro wg `sort -V`, bez `*.old`; fallback `/boot/vmlinuz`.
+pub fn find_kernel_initrd() -> KernelInitrd is
+    let names: string = proc::shell("ls -1 /boot 2>/dev/null | grep '^vmlinuz-' | grep -v '\\.old$' | sort -V | tail -n 1")
+    let n: string = str::trim(names)
+    let kernel: string = if n != "" then "/boot/" + n else "/boot/vmlinuz"
+    return KernelInitrd { kernel: kernel, initrd: str::replace_all(kernel, "vmlinuz", "initrd.img") }
+end
+
+;; Cmdline biezacego systemu bez `BOOT_IMAGE=`, `hammer.gen=` i `hammer_gen=` (patrz D).
+pub fn read_current_cmdline() -> string is
+    let raw: string = if fs::exists("/proc/cmdline") then fs::read("/proc/cmdline") else ""
+    let norm: string = str::replace_all(str::replace_all(raw, "\t", " "), "\n", " ")
+    let toks: [string] = str::split(norm, " ")
+    let mut kept: [string] = []
+    let mut i: int = 0
+    while i < toks.len() is
+        let t: string = toks[i]
+        i += 1
+        if t != "" && !t.starts_with("hammer.gen=") && !t.starts_with("hammer_gen=") && !t.starts_with("BOOT_IMAGE=") is
+            kept.push(t)
+        end
+    end
+    return str::join(kept, " ")
+end
+
+pub fn systemd_boot_entry_text(gen_num: int, kernel: string, initrd: string, cmdline: string) -> string is
+    return "# hammer gen-" + to_string(gen_num) + " — written by hammer v" + log::hammer_version() + "\n" +
+        "title   HackerOS (gen-" + to_string(gen_num) + ")\n" +
+        "linux   " + kernel + "\n" +
+        "initrd  " + initrd + "\n" +
+        "options " + cmdline + " hammer_gen=" + to_string(gen_num) + "\n"
+end
+
+pub fn write_systemd_boot_entry(gen_num: int) -> string is
+    let esp: string = find_esp()
+    let entries_dir: string = compat::path_join(esp, "loader/entries")
+    fs::mkdir(entries_dir)
+    if !fs::is_dir(entries_dir) is return "Cannot create " + entries_dir end
+    let entry_path: string = compat::path_join(entries_dir, "hammer-gen-" + to_string(gen_num) + ".conf")
+    let ki: KernelInitrd = find_kernel_initrd()
+    fs::write(entry_path, systemd_boot_entry_text(gen_num, ki.kernel, ki.initrd, read_current_cmdline()))
+    log::info("grub: wrote systemd-boot entry for gen-" + to_string(gen_num))
+    return ""
+end
+
+;; Patrz E: nadpisuje caly loader.conf.
+pub fn set_systemd_boot_default(gen_num: int) -> string is
+    let esp: string = find_esp()
+    let loader: string = compat::path_join(esp, "loader/loader.conf")
+    let dir: string = compat::path_parent(loader)
+    if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+    fs::write(loader, "# Written by hammer v" + log::hammer_version() + "\n" +
+        "default hammer-gen-" + to_string(gen_num) + ".conf\n" +
+        "timeout 5\n" +
+        "editor  no\n")
+    log::info("grub: set systemd-boot default to gen-" + to_string(gen_num))
+    return ""
+end
+
+pub fn remove_systemd_boot_entry(gen_num: int) -> string is
+    let entry: string = compat::path_join(compat::path_join(find_esp(), "loader/entries"), "hammer-gen-" + to_string(gen_num) + ".conf")
+    if fs::exists(entry) is
+        if !sys_ok("rm -f -- " + shq(entry)) is return "Removing " + entry end
+    end
+    return ""
+end
+
+;; GRUB albo systemd-boot, zaleznie od wykrytego bootloadera. "" = Ok.
+pub fn update_all_bootloader_entries(db: profile::GenerationsDb) -> string is
+    let kind: BootloaderKind = detect_bootloader()
+    if is_grub(kind) is return update_grub(db) end
+    if is_systemd_boot(kind) is
+        let mut i: int = 0
+        while i < db.generations.len() is
+            let err: string = write_systemd_boot_entry(db.generations[i].number)
+            if err != "" is return err end
+            i += 1
+        end
+        let active: int? = profile::read_active_gen()
+        if active != nil is
+            let a: int = active
+            return set_systemd_boot_default(a)
+        end
+        return ""
+    end
+    log::warn("grub: unknown bootloader — cannot write boot entries")
+    return ""
+end
