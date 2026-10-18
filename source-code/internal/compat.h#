@@ -1,0 +1,202 @@
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+
+;; hammer -> internal::compat
+;;
+;; Zamienniki funkcji z `std`, ktorych backend LLVM (`h# compile`, v0.9) NIE
+;; obsluguje. Sprawdzone prawdziwym typecheckerem + `features::check_module_
+;; features` (compiler/src/builtins_registry.rs): `std -> path`, `os`, `crypto`,
+;; `http`, `time` (przez `date_parse`) zawieraja builtiny oznaczone
+;; `backends: &[Backend::Interpreter]`, a sam `use "std -> <modul>"` wciaga CALY
+;; modul — blad dotyczy wiec kazdego programu, ktory go importuje, nawet gdy
+;; nieuzywane funkcje nigdy nie sa wolane. (bit-main tez nie importuje tych
+;; modulow, tylko `system`/`shell` i wlasny `util.h#`.)
+;;
+;; Wywolania w porcie: `path::join` -> `compat::path_join`, `os::pid` ->
+;; `compat::os_pid`, `crypto::sha256` -> `compat::crypto_sha256`,
+;; `time::now_ms` -> `compat::time_now_ms`, itd.
+;;
+;; Semantyka sciezek jak w std (`__builtin_path_*`): `parent` zwraca "" gdy
+;; brak, `join` z absolutnym drugim argumentem zwraca drugi argument.
+
+;; `system()` NIE jest wbudowane w backendzie LLVM (brak w dispatchu
+;; codegen.rs — bez deklaracji kompilator zglasza `undefined fn: system`);
+;; `bit` deklaruje je tak samo w bit/src/util.h#. Jedna deklaracja na caly
+;; program — pozostale pliki hammera wolaja `system(cmd)` bezposrednio.
+extern static [c] is
+    fn system(cmd: string) -> int
+end
+
+fn sq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn trim_trailing_slashes(p: string) -> string is
+    let mut n: int = string_len(p)
+    while n > 1 && string_at(p, n - 1) == "/" is
+        n -= 1
+    end
+    return str::slice(p, 0, n)
+end
+
+fn last_slash(p: string) -> int is
+    let mut i: int = string_len(p) - 1
+    while i >= 0 is
+        if string_at(p, i) == "/" is return i end
+        i -= 1
+    end
+    return -1
+end
+
+fn last_dot(p: string) -> int is
+    let mut i: int = string_len(p) - 1
+    while i >= 0 is
+        if string_at(p, i) == "." is return i end
+        if string_at(p, i) == "/" is return -1 end
+        i -= 1
+    end
+    return -1
+end
+
+pub fn path_is_absolute(p: string) -> bool is
+    return string_len(p) > 0 && string_at(p, 0) == "/"
+end
+
+pub fn path_join(a: string, b: string) -> string is
+    if path_is_absolute(b) is return b end
+    if a == "" is return b end
+    if b == "" is return a end
+    if string_at(a, string_len(a) - 1) == "/" is return a + b end
+    return a + "/" + b
+end
+
+pub fn path_parent(p0: string) -> string is
+    let p: string = trim_trailing_slashes(p0)
+    if p == "" || p == "/" is return "" end
+    let i: int = last_slash(p)
+    if i < 0 is return "" end
+    if i == 0 is return "/" end
+    return str::slice(p, 0, i)
+end
+
+pub fn path_filename(p0: string) -> string is
+    let p: string = trim_trailing_slashes(p0)
+    if p == "/" is return "" end
+    let i: int = last_slash(p)
+    return str::slice(p, i + 1, string_len(p))
+end
+
+pub fn path_stem(p: string) -> string is
+    let f: string = path_filename(p)
+    let d: int = last_dot(f)
+    if d <= 0 is return f end
+    return str::slice(f, 0, d)
+end
+
+pub fn path_with_extension(p: string, ext: string) -> string is
+    let t: string = trim_trailing_slashes(p)
+    let f: string = path_filename(t)
+    let d: int = last_dot(f)
+    let mut base: string = t
+    if d > 0 is
+        base = str::slice(t, 0, string_len(t) - (string_len(f) - d))
+    end
+    if ext == "" is return base end
+    return base + "." + ext
+end
+
+;; ── napisy ───────────────────────────────────────────────────────────────
+
+;; Pierwsze wystapienie `sub` w `s` (bajty) albo -1; pusty `sub` => -1 (jak
+;; `str::index_of`). `std -> strings`::`index_of` opiera sie na builtinie
+;; `str_split_count`, ktorego NIE ma interpreter H# — `string_find` dziala w
+;; obu backendach, wiec kod mozna testowac w interpreterze (`selftest.h#`).
+pub fn str_index_of(s: string, sub: string) -> int is
+    if string_len(sub) == 0 is return -1 end
+    return string_find(s, sub)
+end
+
+;; ── os ───────────────────────────────────────────────────────────────────
+
+pub fn os_pid() -> int is
+    return __builtin_os_pid()
+end
+
+;; `os::is_root` jest tylko w interpreterze (builtin `os_is_root`).
+pub fn os_is_root() -> bool is
+    return str::trim(proc::shell("id -u 2>/dev/null")) == "0"
+end
+
+pub fn os_kernel_version() -> string is
+    return str::trim(proc::shell("uname -r 2>/dev/null"))
+end
+
+;; ── time ─────────────────────────────────────────────────────────────────
+
+pub fn time_now_unix() -> int is
+    return __builtin_time_now_unix()
+end
+
+pub fn time_now_ms() -> int is
+    return __builtin_time_now_ms()
+end
+
+pub fn time_sleep_ms(ms: int) is
+    __builtin_time_sleep_ms(ms)
+end
+
+pub fn time_sleep_s(s: int) is
+    __builtin_time_sleep_ms(s * 1000)
+end
+
+;; UTC; `date` zna wiecej formatow niz std (%Y %m %d %H %M %S).
+pub fn time_format(ts: int, fmt: string) -> string is
+    return str::trim(proc::shell("date -u -d @" + to_string(ts) + " +" + sq(fmt) + " 2>/dev/null"))
+end
+
+;; ── crypto ───────────────────────────────────────────────────────────────
+
+;; SHA-256 napisu (hex). Bez NUL w danych.
+pub fn crypto_sha256(data: string) -> string is
+    let out: string = str::trim(proc::shell("printf %s " + sq(data) + " | sha256sum 2>/dev/null"))
+    if out == "" is return "" end
+    return str::slice(out, 0, str_index_of(out, " "))
+end
+
+;; ── Testy ────────────────────────────────────────────────────────────────
+
+fn t_str(label: string, got: string, want: string) -> int is
+    if got == want is return 0 end
+    write("compat::self_test FAIL: " + label + " got [" + got + "] want [" + want + "]")
+    return 1
+end
+
+;; Zwraca liczbe niezdanych przypadkow (semantyka jak `std -> path`/Rust `Path`).
+pub fn self_test() -> int is
+    let mut f: int = 0
+    f += t_str("join", path_join("/a/b", "c"), "/a/b/c")
+    f += t_str("join slash", path_join("/a/", "c"), "/a/c")
+    f += t_str("join abs", path_join("/a", "/c"), "/c")
+    f += t_str("join empty a", path_join("", "c"), "c")
+    f += t_str("parent", path_parent("/a/b/c"), "/a/b")
+    f += t_str("parent root child", path_parent("/a"), "/")
+    f += t_str("parent root", path_parent("/"), "")
+    f += t_str("parent rel", path_parent("a"), "")
+    f += t_str("parent trailing", path_parent("/a/b/"), "/a")
+    f += t_str("filename", path_filename("/a/b/c.txt"), "c.txt")
+    f += t_str("filename trailing", path_filename("/a/b/"), "b")
+    f += t_str("stem", path_stem("/a/b/c.tar.gz"), "c.tar")
+    f += t_str("stem dotfile", path_stem("/a/.bashrc"), ".bashrc")
+    f += t_str("with_ext", path_with_extension("/a/b.txt", "md"), "/a/b.md")
+    f += t_str("with_ext none", path_with_extension("/a/b", "md"), "/a/b.md")
+    f += t_str("with_ext tmp", path_with_extension("/x/gens.json", "tmp"), "/x/gens.tmp")
+    if !path_is_absolute("/x") is
+        write("compat::self_test FAIL: is_absolute /x")
+        f += 1
+    end
+    if path_is_absolute("x") is
+        write("compat::self_test FAIL: is_absolute x")
+        f += 1
+    end
+    return f
+end
