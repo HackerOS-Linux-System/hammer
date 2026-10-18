@@ -1,0 +1,265 @@
+use "std -> strings" from "str"
+
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+;; [mod solver pominiete: source-code/pkg/solver/mod.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania solver::fn dzialaja bez zmian]
+;; [mod postinst pominiete: source-code/system/postinst.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania postinst::fn dzialaja bez zmian]
+mod ui
+
+;; hammer -> ui::install_summary
+;;
+;; Port of source-code/ui/install_summary.rs (Rust) to H#: podsumowanie po
+;; instalacji i wykrywanie "podejrzanych" paczek. Teksty po polsku jak w
+;; oryginale.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `Vec<(String, PostinstResult)>` -> dwie rownolegle tablice
+;;    (`postinst_names` / `postinst_results`).
+;; 2. `#[derive(Default)]` -> `summary_new()`.
+;; 3. `Option<u32>`/`Option<&str>` -> `int?` / `string?`.
+;; 4. `confirm_suspicious_packages` -> `ConfirmResult` ("" w `err` = OK);
+;;    `ui::confirm` zwraca `bool`, wiec blad I/O nie wystepuje.
+;; 5. `"👤".to_string().dimmed()` / `"📁"` -> te same emoji w `ui::dim`.
+;; 6. `plan.upgrade_from.get(name)` -> `solver::plan_upgrade_from`.
+;; 7. Pole `reason` w Rust to enum ze strukturalnymi wariantami; tu warianty
+;;    krotkowe (kolejnosc pol jak w Rust).
+
+pub enum SuspiciousReason is
+    ;; Postinst wymaga root i instaluje unit systemd: (unit_name)
+    InstallsSystemdUnit(string)
+    ;; Repozytorium dodane niedawno (< 7 dni): (repo_url, days_ago)
+    RecentlyAddedRepo(string, int)
+    ;; Postinst ma wywolania, ktorych nie umiemy przetlumaczyc: (count)
+    UnknownPostinstCommands(int)
+end
+
+pub struct SuspiciousPackage is
+    pub name:   string
+    pub reason: SuspiciousReason
+end
+
+pub struct InstallSummary is
+    ;; wyniki postinst dla kazdej zainstalowanej paczki (rownolegle tablice)
+    pub postinst_names:   [string]
+    pub postinst_results: [postinst::PostinstResult]
+    pub suspicious:       [SuspiciousPackage]
+    pub needs_daemon_reload: bool
+    pub generation:       int
+end
+
+pub fn summary_new() -> InstallSummary is
+    let a: [string] = []
+    let b: [postinst::PostinstResult] = []
+    let c: [SuspiciousPackage] = []
+    return InstallSummary { postinst_names: a, postinst_results: b, suspicious: c,
+        needs_daemon_reload: false, generation: 0 }
+end
+
+fn rule(n: int) -> string is
+    return "  " + ui::dim(str::repeat("─", n))
+end
+
+;; ── Drukowanie ───────────────────────────────────────────────────────────
+
+pub fn print_install_summary(plan: solver::TransactionPlan, summary: InstallSummary) is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Podsumowanie instalacji")
+    write(rule(65))
+
+    ;; Zainstalowane/zaktualizowane paczki
+    let total_installed: int = plan.to_install.len() + plan.to_upgrade.len()
+    if total_installed > 0 is
+        let noun: string = if total_installed == 1 then "paczka" else "paczki/paczek"
+        write("  " + ui::bright_green_bold("✔") + " " + ui::bright_green_bold(to_string(total_installed)) + " " + noun + " zainstalowano/zaktualizowano")
+        let mut i: int = 0
+        while i < plan.to_install.len() is
+            let pkg: package::Package = plan.to_install[i]
+            write("    " + ui::dim("·") + " " + ui::cyan_bold(pkg.name) + " " + ui::dim(pkg.version))
+            i += 1
+        end
+        let mut u: int = 0
+        while u < plan.to_upgrade.len() is
+            let pkg2: package::Package = plan.to_upgrade[u]
+            let from_o: string? = solver::plan_upgrade_from(plan, pkg2.name)
+            let from: string = if from_o == nil then "?" else from_o
+            write("    " + ui::yellow("↑") + " " + ui::cyan_bold(pkg2.name) + " " + ui::dim(from) + " → " + ui::bright_yellow(pkg2.version))
+            u += 1
+        end
+    end
+
+    ;; Serwisy
+    let mut all_enabled: [string] = []
+    let mut all_started: [string] = []
+    let mut all_users: [string] = []
+    let mut conf_pkgs: [string] = []
+    let mut conf_files: [string] = []
+    let mut total_skipped: int = 0
+    let mut r: int = 0
+    while r < summary.postinst_results.len() is
+        let res: postinst::PostinstResult = summary.postinst_results[r]
+        let mut a: int = 0
+        while a < res.services_enabled.len() is
+            all_enabled.push(res.services_enabled[a])
+            a += 1
+        end
+        let mut b: int = 0
+        while b < res.services_started.len() is
+            all_started.push(res.services_started[b])
+            b += 1
+        end
+        let mut c: int = 0
+        while c < res.users_created.len() is
+            all_users.push(res.users_created[c])
+            c += 1
+        end
+        let mut d: int = 0
+        while d < res.conffiles_created.len() is
+            conf_pkgs.push(summary.postinst_names[r])
+            conf_files.push(res.conffiles_created[d])
+            d += 1
+        end
+        total_skipped += res.skipped
+        r += 1
+    end
+
+    if all_enabled.len() > 0 || all_started.len() > 0 is
+        write("")
+        write("  " + ui::bright_green("▶") + "  Serwisy systemd:")
+        let mut e: int = 0
+        while e < all_enabled.len() is
+            write("    " + ui::dim("·") + " " + ui::bold(all_enabled[e]) + " " + ui::dim("włączono przy starcie"))
+            e += 1
+        end
+        let mut s: int = 0
+        while s < all_started.len() is
+            write("    " + ui::bright_green("●") + " " + ui::bold(all_started[s]) + " " + ui::bright_green("uruchomiono"))
+            s += 1
+        end
+    end
+
+    ;; Utworzeni uzytkownicy
+    if all_users.len() > 0 is
+        write("")
+        write("  " + ui::dim("👤") + "  Użytkownicy systemowi:")
+        let mut k: int = 0
+        while k < all_users.len() is
+            write("    " + ui::dim("·") + " " + ui::bold(all_users[k]))
+            k += 1
+        end
+    end
+
+    ;; Conffiles (maks. 10)
+    if conf_files.len() > 0 is
+        write("")
+        write("  " + ui::dim("📁") + "  Pliki konfiguracyjne:")
+        let mut f: int = 0
+        while f < conf_files.len() && f < 10 is
+            write("    " + ui::dim("·") + " " + ui::bold(conf_files[f]) + " " + ui::dim("(" + conf_pkgs[f] + ")"))
+            f += 1
+        end
+        if conf_files.len() > 10 is
+            write("    " + ui::dim("·") + " … i " + to_string(conf_files.len() - 10) + " więcej")
+        end
+    end
+
+    ;; Podejrzane paczki
+    if summary.suspicious.len() > 0 is
+        write("")
+        write("  " + ui::yellow_bold("⚠") + "  Uwaga — podejrzane paczki:")
+        let mut p: int = 0
+        while p < summary.suspicious.len() is
+            let sp: SuspiciousPackage = summary.suspicious[p]
+            match sp.reason is
+                SuspiciousReason::InstallsSystemdUnit(unit_name) => is
+                    write("    " + ui::yellow("⚠") + " " + ui::bold(sp.name) + " instaluje unit systemd " + ui::cyan(unit_name) + " — sprawdź źródło paczki")
+                end
+                SuspiciousReason::RecentlyAddedRepo(repo_url, days_ago) => is
+                    write("    " + ui::yellow("⚠") + " " + ui::bold(sp.name) + " pochodzi z repo dodanego " + to_string(days_ago) + " dni temu: " + ui::dim(repo_url))
+                end
+                SuspiciousReason::UnknownPostinstCommands(count) => is
+                    write("    " + ui::yellow("⚠") + " " + ui::bold(sp.name) + " ma " + to_string(count) + " nieznanych komend w postinst")
+                end
+            end
+            p += 1
+        end
+    end
+
+    ;; Pominiete linie postinst
+    if total_skipped > 0 is
+        write("")
+        write("  " + ui::dim("·") + " " + to_string(total_skipped) + " linii skryptów postinst zostało pominiętych (nieznane komendy).")
+        write("  " + ui::dim("·") + " Sprawdź logi: " + ui::cyan("hammer log --postinst"))
+    end
+
+    ;; Nastepne kroki
+    write("")
+    write("  " + ui::dim("·") + " Generacja " + ui::bright_cyan("gen-" + to_string(summary.generation)) + " zaplanowana — aktywna po restarcie.")
+    if summary.needs_daemon_reload is
+        write("  " + ui::dim("→") + " Zalecane: " + ui::cyan("sudo systemctl daemon-reload") + " aby systemd widział nowe unity.")
+    end
+    write("")
+end
+
+;; ── Detekcja podejrzanych paczek ─────────────────────────────────────────
+
+pub struct SuspectResult is
+    pub found: bool
+    pub pkg:   SuspiciousPackage
+end
+
+fn no_suspect() -> SuspectResult is
+    return SuspectResult { found: false, pkg: SuspiciousPackage { name: "", reason: SuspiciousReason::UnknownPostinstCommands(0) } }
+end
+
+;; Reguly: (1) postinst wlacza serwis systemd, (2) repo dodane < 7 dni temu,
+;; (3) wiecej niz 10 pominietych linii postinst. Pierwsza pasujaca wygrywa.
+pub fn detect_suspicious(pkg_name: string, res: postinst::PostinstResult, repo_added_days_ago: int?, repo_url: string?) -> SuspectResult is
+    if res.services_enabled.len() > 0 is
+        return SuspectResult { found: true,
+            pkg: SuspiciousPackage { name: pkg_name, reason: SuspiciousReason::InstallsSystemdUnit(res.services_enabled[0]) } }
+    end
+    if repo_added_days_ago != nil && repo_url != nil is
+        let days: int = repo_added_days_ago
+        let url: string = repo_url
+        if days < 7 is
+            return SuspectResult { found: true,
+                pkg: SuspiciousPackage { name: pkg_name, reason: SuspiciousReason::RecentlyAddedRepo(url, days) } }
+        end
+    end
+    if res.skipped > 10 is
+        return SuspectResult { found: true,
+            pkg: SuspiciousPackage { name: pkg_name, reason: SuspiciousReason::UnknownPostinstCommands(res.skipped) } }
+    end
+    return no_suspect()
+end
+
+;; ── Potwierdzenie ────────────────────────────────────────────────────────
+
+pub fn confirm_suspicious_packages(suspicious: [SuspiciousPackage]) -> bool is
+    if suspicious.len() == 0 is return true end
+
+    write("")
+    write("  " + ui::yellow_bold("⚠") + "  Paczki wymagające potwierdzenia:")
+    write(rule(65))
+
+    let mut i: int = 0
+    while i < suspicious.len() is
+        let sp: SuspiciousPackage = suspicious[i]
+        match sp.reason is
+            SuspiciousReason::InstallsSystemdUnit(unit_name) => is
+                write("  " + ui::yellow("⚠") + " " + ui::bold(sp.name) + " — instaluje usługę systemową '" + ui::cyan(unit_name) + "'")
+                write("    " + ui::dim("  ") + " Paczka uruchomi nowy serwis działający w tle jako root.")
+            end
+            SuspiciousReason::RecentlyAddedRepo(repo_url, days_ago) => is
+                write("  " + ui::yellow("⚠") + " " + ui::bold(sp.name) + " — pochodzi z nowego repozytorium (dodano " + to_string(days_ago) + " dni temu)")
+                write("    " + ui::dim("  ") + " URL: " + ui::dim(repo_url))
+            end
+            SuspiciousReason::UnknownPostinstCommands(count) => is
+                write("  " + ui::yellow("⚠") + " " + ui::bold(sp.name) + " — " + to_string(count) + " nieznanych komend w skrypcie instalacyjnym")
+            end
+        end
+        i += 1
+    end
+
+    write("")
+    return ui::confirm("Kontynuować instalację mimo powyższych ostrzeżeń?")
+end
