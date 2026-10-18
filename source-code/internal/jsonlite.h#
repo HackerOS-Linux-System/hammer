@@ -1,0 +1,210 @@
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+;; hammer -> internal::jsonlite      (PLIK TYLKO H#, bez odpowiednika w Rust)
+;;
+;; Minimalny czytnik/pisarz JSON-a, bo `std -> json` w H# czyta tylko
+;; PLASKIE obiekty, a hammer przechowuje zagniezdzone struktury
+;; (generations.json: tablica generacji, w nich tablice pakietow).
+;; Rust robil to przez `serde_json`.
+;;
+;; Podejscie: `tokenize` zamienia tekst na plaska liste tokenow, a modul
+;; wywolujacy (np. system/profile.h#) czyta ja swoim, znanym schematem
+;; z pomoca `skip_value`. Nie ma drzewa wartosci (H# nie ma pewnych
+;; typow rekurencyjnych) i nie ma ogolnego `Value`.
+;;
+;; Tokeny (jeden element tablicy `[string]` na token):
+;;   "{" "}" "[" "]" ":" ","     — znaki strukturalne
+;;   "\"" + tekst                — string (juz po odescapowaniu)
+;;   "~" + slowo                 — liczba / true / false / null ("~12", "~null")
+;; Blad skladni => pusta lista tokenow (wywolujacy traktuje to jak
+;; `serde_json::from_str(..).unwrap_or_default()`).
+;;
+;; Ograniczenia: `\uXXXX` tylko dla BMP bez par zastepczych (surogaty dla
+;; znakow > U+FFFF zamieniane na '?'); liczby nie sa walidowane;
+;; zagniezdzenie ograniczone tylko pamiecia.
+
+fn hex_val(c: string) -> int is
+    if c >= "0" && c <= "9" is return conv::str_to_int(c) end
+    if c == "a" || c == "A" is return 10 end
+    if c == "b" || c == "B" is return 11 end
+    if c == "c" || c == "C" is return 12 end
+    if c == "d" || c == "D" is return 13 end
+    if c == "e" || c == "E" is return 14 end
+    if c == "f" || c == "F" is return 15 end
+    return -1
+end
+
+fn is_ws(c: string) -> bool is
+    return c == " " || c == "\n" || c == "\t" || c == "\r"
+end
+
+fn is_word_char(c: string) -> bool is
+    if c >= "0" && c <= "9" is return true end
+    if c >= "a" && c <= "z" is return true end
+    if c >= "A" && c <= "Z" is return true end
+    return c == "-" || c == "+" || c == "." 
+end
+
+pub fn tokenize(s: string) -> [string] is
+    let mut toks: [string] = []
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(s, i)
+        if is_ws(c) is
+            i += 1
+        elsif c == "{" || c == "}" || c == "[" || c == "]" || c == ":" || c == "," is
+            toks.push(c)
+            i += 1
+        elsif c == "\"" is
+            let mut out: string = ""
+            i += 1
+            let mut closed: bool = false
+            while i < n && !closed is
+                let d: string = string_at(s, i)
+                if d == "\"" is
+                    closed = true
+                    i += 1
+                elsif d == "\\" is
+                    if i + 1 >= n is
+                        let none: [string] = []
+                        return none
+                    end
+                    let e: string = string_at(s, i + 1)
+                    i += 2
+                    if e == "n" is
+                        out = out + "\n"
+                    elsif e == "t" is
+                        out = out + "\t"
+                    elsif e == "r" is
+                        out = out + "\r"
+                    elsif e == "b" is
+                        out = out + conv::int_to_char(8)
+                    elsif e == "f" is
+                        out = out + conv::int_to_char(12)
+                    elsif e == "u" is
+                        if i + 4 > n is
+                            let none: [string] = []
+                            return none
+                        end
+                        let h1: int = hex_val(string_at(s, i))
+                        let h2: int = hex_val(string_at(s, i + 1))
+                        let h3: int = hex_val(string_at(s, i + 2))
+                        let h4: int = hex_val(string_at(s, i + 3))
+                        i += 4
+                        if h1 < 0 || h2 < 0 || h3 < 0 || h4 < 0 is
+                            let none: [string] = []
+                            return none
+                        end
+                        let cp: int = h1 * 4096 + h2 * 256 + h3 * 16 + h4
+                        if cp >= 55296 && cp <= 57343 is
+                            out = out + "?"
+                        else is
+                            out = out + conv::int_to_char(cp)
+                        end
+                    else is
+                        ;; \" \\ \/ i dowolny inny znak
+                        out = out + e
+                    end
+                else is
+                    out = out + d
+                    i += 1
+                end
+            end
+            if !closed is
+                let none: [string] = []
+                return none
+            end
+            toks.push("\"" + out)
+        elsif is_word_char(c) is
+            let mut w: string = ""
+            while i < n && is_word_char(string_at(s, i)) is
+                w = w + string_at(s, i)
+                i += 1
+            end
+            toks.push("~" + w)
+        else is
+            let none: [string] = []
+            return none
+        end
+    end
+    return toks
+end
+
+pub fn is_string_tok(t: string) -> bool is
+    return string_len(t) >= 1 && string_at(t, 0) == "\""
+end
+
+pub fn is_word_tok(t: string) -> bool is
+    return string_len(t) >= 1 && string_at(t, 0) == "~"
+end
+
+;; Tekst tokenu string/slowo bez prefiksu.
+pub fn tok_text(t: string) -> string is
+    return str::slice(t, 1, string_len(t))
+end
+
+pub fn is_null_tok(t: string) -> bool is
+    return t == "~null"
+end
+
+;; Indeks tokenu PO wartosci zaczynajacej sie na `pos`; -1 przy bledzie.
+pub fn skip_value(toks: [string], pos: int) -> int is
+    if pos < 0 || pos >= toks.len() is return -1 end
+    let t: string = toks[pos]
+    if is_string_tok(t) || is_word_tok(t) is return pos + 1 end
+    if t != "{" && t != "[" is return -1 end
+    let mut depth: int = 0
+    let mut i: int = pos
+    while i < toks.len() is
+        let x: string = toks[i]
+        if x == "{" || x == "[" is
+            depth += 1
+        elsif x == "}" || x == "]" is
+            depth -= 1
+            if depth == 0 is return i + 1 end
+        end
+        i += 1
+    end
+    return -1
+end
+
+;; Escapowanie stringa do zapisu JSON (jak serde_json).
+pub fn escape(s: string) -> string is
+    let mut out: string = ""
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        let c: string = string_at(s, i)
+        if c == "\"" is
+            out = out + "\\\""
+        elsif c == "\\" is
+            out = out + "\\\\"
+        elsif c == "\n" is
+            out = out + "\\n"
+        elsif c == "\r" is
+            out = out + "\\r"
+        elsif c == "\t" is
+            out = out + "\\t"
+        elsif c == "\x08" is
+            out = out + "\\b"
+        elsif c == "\x0c" is
+            out = out + "\\f"
+        elsif conv::char_to_int(c) < 32 && conv::char_to_int(c) >= 0 is
+            ;; pozostale znaki sterujace: \u00XX (jak serde_json)
+            out = out + "\\u00" + str::pad_start(conv::int_to_hex(conv::char_to_int(c)), 2, "0")
+        else is
+            out = out + c
+        end
+        i += 1
+    end
+    return out
+end
+
+;; `"tekst"` albo `null`.
+pub fn str_or_null(v: string?) -> string is
+    if v == nil is return "null" end
+    let s: string = v
+    return "\"" + escape(s) + "\""
+end
