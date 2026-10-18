@@ -1,0 +1,413 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod package
+
+;; hammer -> pkg::deb
+;;
+;; Port of source-code/pkg/deb.rs (Rust) to H#: parsowanie pakietu `.deb`
+;; (kontener `ar` -> `control.tar.*` + `data.tar.*`), skrypty maintainera,
+;; lista plikow, rozpakowanie danych, lista conffiles z oryginalna trescia.
+;;
+;; ── Dlaczego inaczej niz w Rust (swiadoma zmiana architektury) ───────────
+;; Rust trzyma caly `.deb` w pamieci (`&[u8]` / `Vec<u8>`) i dekompresuje
+;; crate'ami (flate2, xz2, zstd, bzip2, tar). W H# bajty to `[int]` (jeden
+;; element na bajt) — dla `.deb` o rozmiarze dziesiatek MB to dziesiatki
+;; milionow elementow, a `libhammer/src/deb.h#` (ktory tak robi) jest przez
+;; to praktyczny tylko dla malych plikow. Dlatego TU pracujemy na PLIKACH:
+;;   - kontener `ar` czytam wlasnym kodem po NAGLOWKACH (60 bajtow na
+;;     czlonek, `dd bs=1 skip=` = lseek) i wycinam czlonki przez
+;;     `tail -c +N | head -c SIZE`; wymaga tylko coreutils, NIE `binutils`
+;;     (`ar` moze nie byc w minimalnym obrazie);
+;;   - dekompresje i obsluge tar-a robi systemowy `tar` (GNU tar sam
+;;     rozpoznaje gzip/xz/bzip2/zstd przy odczycie pliku; wymaga
+;;     zainstalowanych `gzip`/`xz`/`bzip2`/`zstd` — `Essential`/`required`
+;;     w Debianie, tak samo jak zalozyl `libhammer/deb.h#`).
+;;
+;; Konsekwencje dla API:
+;;   1. `DebPackage::parse(&bytes)` -> `parse_file(sciezka)`: wywolujacy ma
+;;      i tak plik na dysku (pobrany `download`-em), wiec nie wczytuje go.
+;;   2. Zamiast `control_tar`/`data_bytes` (`Vec<u8>`) struktura trzyma
+;;      SCIEZKI do wyciętych czlonkow w katalogu roboczym `work_dir`.
+;;      WYWOLUJACY MUSI wolac `cleanup(deb)` po uzyciu (Rust zwalnial
+;;      pamiec automatycznie; tu zostaje katalog w /tmp).
+;;   3. `Result<..>` -> `ParseResult { deb, err }` (`err == ""` = Ok).
+;;   4. `ExtractResult.conffiles` (`Vec<(PathBuf, Vec<u8>)>`) -> dwie rownolegle
+;;      tablice `conf_paths`/`conf_contents`; tresc jako `string` (patrz
+;;      uwaga w `pkg/conffiles.h#` o plikach binarnych).
+;;   5. `decompress(bytes, comp)` (pub w Rust) nie istnieje — nikt poza
+;;      `deb.rs` go nie wola (sprawdzone `grep`); `Compression` zostaje.
+;;   6. Rozpakowanie: `tar -xp --no-same-owner` (Rust: `entry.unpack`, bez
+;;      chown; setuid/setgid/sticky: patrz komentarz w `extract_data`). Ochrona przed `..`/sciezkami bezwzglednymi: GNU tar usuwa
+;;      wiodace `/` i odrzuca `..` domyslnie. `Continuous` (rzadki typ
+;;      '7') traktowany jak zwykly plik.
+;;   7. `file_list`: tylko zwykle pliki (`-`), jak `Regular | Continuous`
+;;      w Rust — twarde dowiazania ('h') NIE wchodza do listy, ale wchodza
+;;      do `regular_files` z `extract_data` (tak samo jak w oryginale).
+
+pub enum Compression is
+    Gz
+    Xz
+    Zst
+    Bz2
+    None
+end
+
+pub fn comp_from_name(name: string) -> Compression is
+    if name.ends_with(".gz") is return Compression::Gz end
+    if name.ends_with(".xz") is return Compression::Xz end
+    if name.ends_with(".zst") is return Compression::Zst end
+    if name.ends_with(".bz2") is return Compression::Bz2 end
+    return Compression::None
+end
+
+pub struct DebPackage is
+    pub control:          package::Package
+    pub control_raw:      string
+    ;; sciezki do czlonkow wycietych z `ar` (patrz naglowek, pkt 2)
+    pub work_dir:         string
+    pub control_tar:      string
+    pub control_comp:     Compression
+    pub data_tar:         string
+    pub data_compression: Compression
+    pub file_list:        [string]
+    ;; tresc skryptow maintainera; nil gdy brak
+    pub postinst:         string?
+    pub preinst:          string?
+    pub postrm:           string?
+    pub prerm:            string?
+end
+
+pub struct ParseResult is
+    pub deb: DebPackage?
+    pub err: string
+end
+
+pub struct ExtractResult is
+    pub regular_files:  [string]
+    pub all_files:      [string]
+    ;; (absolutna sciezka instalacji, oryginalna tresc) — rownolegle tablice
+    pub conf_paths:     [string]
+    pub conf_contents:  [string]
+    pub err:            string
+end
+
+;; ── Pomocnicze ───────────────────────────────────────────────────────────
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn parse_int_or(s: string, default: int) -> int is
+    let t: string = str::trim(s)
+    if t != "" && str::is_numeric(t) is return conv::str_to_int(t) end
+    return default
+end
+
+fn trim_right_char(s: string, ch: string) -> string is
+    let mut n: int = string_len(s)
+    while n > 0 && str::slice(s, n - 1, n) == ch is
+        n -= 1
+    end
+    return str::slice(s, 0, n)
+end
+
+;; Katalog roboczy (`mktemp -d`); "" gdy sie nie udalo.
+fn make_work_dir() -> string is
+    return str::trim(proc::shell("mktemp -d /tmp/hammer-deb.XXXXXX 2>/dev/null"))
+end
+
+;; `cmd` z przekierowaniem do pliku; true gdy exit code == 0.
+fn run_ok(cmd: string) -> bool is
+    return system(cmd) == 0
+end
+
+;; ── Kontener ar ──────────────────────────────────────────────────────────
+
+pub struct ArMember is
+    pub name:   string
+    ;; przesuniecie PIERWSZEGO bajtu danych czlonka w pliku (0-based)
+    pub offset: int
+    pub size:   int
+end
+
+;; Naglowek 60 bajtow: nazwa [0..16), rozmiar [48..58). "" przy bledzie.
+fn read_ar_header(file: string, pos: int) -> string is
+    return proc::shell("dd if=" + shq(file) + " bs=1 skip=" + to_string(pos) +
+        " count=60 2>/dev/null")
+end
+
+;; Wszystkie czlonki; `err` != "" przy zlej magii / ucietym pliku.
+;; (Rust: `bail!("Not a valid .deb file (bad ar magic)")`,
+;;        `bail!("Truncated .deb at ar member '{}'")`.)
+pub struct ArList is
+    pub members: [ArMember]
+    pub err:     string
+end
+
+pub fn ar_list(file: string) -> ArList is
+    let mut members: [ArMember] = []
+    let total: int = fs::size(file)
+    let magic: string = proc::shell("dd if=" + shq(file) + " bs=1 count=8 2>/dev/null")
+    if total < 8 || str::trim(magic) != "!<arch>" is
+        return ArList { members: members, err: "Not a valid .deb file (bad ar magic)" }
+    end
+
+    let mut pos: int = 8
+    while pos + 60 <= total is
+        let header: string = read_ar_header(file, pos)
+        if string_len(header) < 58 is
+            return ArList { members: members, err: "Truncated .deb at ar header (offset " + to_string(pos) + ")" }
+        end
+        let name_raw: string = trim_right_char(str::trim(str::slice(header, 0, 16)), "/")
+        let size: int = parse_int_or(str::slice(header, 48, 58), 0)
+        pos += 60
+        let end_pos: int = pos + size
+        if end_pos > total is
+            return ArList { members: members, err: "Truncated .deb at ar member '" + name_raw + "'" }
+        end
+        members.push(ArMember { name: name_raw, offset: pos, size: size })
+        pos = end_pos + (end_pos % 2)
+    end
+    return ArList { members: members, err: "" }
+end
+
+;; Wycina czlonek do pliku `out`; true gdy sie udalo.
+fn extract_member(file: string, m: ArMember, out: string) -> bool is
+    if m.size == 0 is return run_ok(": > " + shq(out)) end
+    return run_ok("tail -c +" + to_string(m.offset + 1) + " " + shq(file) +
+        " | head -c " + to_string(m.size) + " > " + shq(out))
+end
+
+;; ── tar (systemowy) ──────────────────────────────────────────────────────
+
+;; Tresc jednego pliku z archiwum tar; nil gdy go nie ma. Probuje "./nazwa"
+;; i "nazwa" (jak `name == "./x" || name == "x"` w Rust).
+fn tar_read_member(tar_file: string, name: string, tmp: string) -> string? is
+    let out: string = tmp + "/.member.out"
+    if run_ok("tar -xOf " + shq(tar_file) + " " + shq("./" + name) + " > " + shq(out) + " 2>/dev/null") is
+        let s: string = fs::read(out)
+        fs::remove(out)
+        return s
+    end
+    if run_ok("tar -xOf " + shq(tar_file) + " " + shq(name) + " > " + shq(out) + " 2>/dev/null") is
+        let s: string = fs::read(out)
+        fs::remove(out)
+        return s
+    end
+    if fs::exists(out) is fs::remove(out) end
+    return nil
+end
+
+;; Pomija `n` pierwszych tokenow rozdzielonych spacjami i zwraca reszte
+;; linii (`tar -tv`: perm owner size data godzina NAZWA).
+fn skip_tokens(line: string, n: int) -> string is
+    let len: int = string_len(line)
+    let mut i: int = 0
+    let mut tokens: int = 0
+    while i < len && tokens < n is
+        while i < len && string_at(line, i) == " " is i += 1 end
+        while i < len && string_at(line, i) != " " is i += 1 end
+        tokens += 1
+    end
+    while i < len && string_at(line, i) == " " is i += 1 end
+    return str::slice(line, i, len)
+end
+
+;; Nazwa bez wiodacego "./" i bez " -> cel" / " link to cel" dowiazan.
+fn clean_tar_name(raw: string, kind: string) -> string is
+    let mut name: string = raw
+    if kind == "l" is
+        let p: int = compat::str_index_of(name, " -> ")
+        if p >= 0 is name = str::slice(name, 0, p) end
+    end
+    if kind == "h" is
+        let p: int = compat::str_index_of(name, " link to ")
+        if p >= 0 is name = str::slice(name, 0, p) end
+    end
+    while name.starts_with("./") is
+        name = str::slice(name, 2, string_len(name))
+    end
+    return name
+end
+
+struct TarEntry is
+    pub kind: string   ;; pierwszy znak `tar -tv`: '-' zwykly, 'd', 'l', 'h', ...
+    pub name: string   ;; bez "./"
+end
+
+fn tar_entries(tar_file: string) -> [TarEntry] is
+    let mut out: [TarEntry] = []
+    let listing: string = proc::shell("tar -tvf " + shq(tar_file) + " 2>/dev/null")
+    let lines: [string] = str::split(listing, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = lines[i]
+        i += 1
+        if string_len(line) > 10 is
+            let kind: string = str::slice(line, 0, 1)
+            let name: string = clean_tar_name(skip_tokens(line, 5), kind)
+            if name != "" is out.push(TarEntry { kind: kind, name: name }) end
+        end
+    end
+    return out
+end
+
+;; ── DebPackage ───────────────────────────────────────────────────────────
+
+fn script_of(tar_file: string, name: string, tmp: string) -> string? is
+    return tar_read_member(tar_file, name, tmp)
+end
+
+;; Rust: `DebPackage::parse(&bytes)`. Tu: sciezka pliku `.deb`.
+pub fn parse_file(deb_path: string) -> ParseResult is
+    let none_files: [string] = []
+    let listed: ArList = ar_list(deb_path)
+    if listed.err != "" is return ParseResult { deb: nil, err: listed.err } end
+
+    let work: string = make_work_dir()
+    if work == "" is return ParseResult { deb: nil, err: "Cannot create temp dir for .deb" } end
+
+    let mut control_tar: string = ""
+    let mut control_comp: Compression = Compression::None
+    let mut data_tar: string = ""
+    let mut data_comp: Compression = Compression::None
+
+    let mut i: int = 0
+    while i < listed.members.len() is
+        let m: ArMember = listed.members[i]
+        i += 1
+        if m.name.starts_with("control.tar") is
+            control_comp = comp_from_name(m.name)
+            control_tar = work + "/" + m.name
+            if !extract_member(deb_path, m, control_tar) is
+                return ParseResult { deb: nil, err: "Decompressing " + m.name }
+            end
+        elsif m.name.starts_with("data.tar") is
+            data_comp = comp_from_name(m.name)
+            data_tar = work + "/" + m.name
+            if !extract_member(deb_path, m, data_tar) is
+                return ParseResult { deb: nil, err: "Extracting " + m.name }
+            end
+        end
+    end
+
+    if control_tar == "" is
+        return ParseResult { deb: nil, err: "No control.tar found in .deb" }
+    end
+
+    let control_raw: string? = tar_read_member(control_tar, "control", work)
+    if control_raw == nil is
+        return ParseResult { deb: nil, err: "Extracting ./control: ./control not found in control.tar" }
+    end
+    let raw: string = control_raw
+    if raw == "" is return ParseResult { deb: nil, err: "No control.tar found in .deb" } end
+
+    let parsed: package::Package? = package::parse_block(raw)
+    if parsed == nil is return ParseResult { deb: nil, err: "Parsing control" } end
+    let pkg: package::Package = parsed
+
+    ;; lista zwyklych plikow ("/ścieżka"); blad dekompresji data.tar = pusta lista
+    let mut files: [string] = none_files
+    if data_tar != "" is
+        let entries: [TarEntry] = tar_entries(data_tar)
+        let mut k: int = 0
+        while k < entries.len() is
+            if entries[k].kind == "-" is files.push("/" + entries[k].name) end
+            k += 1
+        end
+    end
+
+    let deb: DebPackage = DebPackage {
+        control: pkg, control_raw: raw,
+        work_dir: work, control_tar: control_tar, control_comp: control_comp,
+        data_tar: data_tar, data_compression: data_comp,
+        file_list: files,
+        postinst: script_of(control_tar, "postinst", work),
+        preinst:  script_of(control_tar, "preinst", work),
+        postrm:   script_of(control_tar, "postrm", work),
+        prerm:    script_of(control_tar, "prerm", work)
+    }
+    return ParseResult { deb: deb, err: "" }
+end
+
+;; Dowolny plik z control.tar (np. "conffiles", "md5sums"); nil gdy brak.
+pub fn extract_script(deb: DebPackage, name: string) -> string? is
+    if deb.control_tar == "" is return nil end
+    return tar_read_member(deb.control_tar, name, deb.work_dir)
+end
+
+;; Rozpakowuje data.tar do `root`; zapisuje tez oryginaly conffiles.
+pub fn extract_data(deb: DebPackage, root: string) -> ExtractResult is
+    let mut regular: [string] = []
+    let mut all: [string] = []
+    let mut cpaths: [string] = []
+    let mut ccontents: [string] = []
+
+    if deb.data_tar == "" is
+        return ExtractResult { regular_files: regular, all_files: all,
+            conf_paths: cpaths, conf_contents: ccontents, err: "Decompressing data.tar" }
+    end
+
+    if !fs::exists(root) is fs::mkdir(root) end
+    let ok: bool = run_ok("tar -xf " + shq(deb.data_tar) + " -C " + shq(root) +
+        " -p --no-same-owner 2>/dev/null")
+    if !ok is
+        return ExtractResult { regular_files: regular, all_files: all,
+            conf_paths: cpaths, conf_contents: ccontents, err: "Extracting data.tar" }
+    end
+    ;; `-p`: tryby z archiwum bez umask (jak `entry.unpack` w Rust). Roznica:
+    ;; tar-rs maskuje setuid/setgid/sticky, GNU tar z `-p` je zachowuje.
+
+    let entries: [TarEntry] = tar_entries(deb.data_tar)
+    let mut i: int = 0
+    while i < entries.len() is
+        let e: TarEntry = entries[i]
+        i += 1
+        let dest: string = compat::path_join(root, e.name)
+        if e.kind == "-" || e.kind == "h" is
+            regular.push(dest)
+            all.push(dest)
+        elsif e.kind == "l" is
+            all.push(dest)
+        end
+    end
+
+    ;; conffiles: oryginalna tresc z wyodrebnionych plikow
+    let list: string? = extract_script(deb, "conffiles")
+    if list != nil is
+        let text: string = list
+        let lines: [string] = str::split(text, "\n")
+        let mut k: int = 0
+        while k < lines.len() is
+            let p: string = str::trim(lines[k])
+            k += 1
+            if p != "" is
+                let rel: string = if p.starts_with("/") then str::slice(p, 1, string_len(p)) else p
+                let extracted: string = compat::path_join(root, rel)
+                if fs::exists(extracted) && fs::is_file(extracted) is
+                    cpaths.push(p)
+                    ccontents.push(fs::read(extracted))
+                end
+            end
+        end
+    end
+
+    return ExtractResult { regular_files: regular, all_files: all,
+        conf_paths: cpaths, conf_contents: ccontents, err: "" }
+end
+
+;; Rust: `unpack` = `extract_data` (nazwa zgodna z konwencja Debiana).
+pub fn unpack(deb: DebPackage, root: string) -> ExtractResult is
+    return extract_data(deb, root)
+end
+
+;; Katalog roboczy z wycietymi czlonkami (patrz naglowek, pkt 2).
+pub fn cleanup(deb: DebPackage) is
+    if deb.work_dir != "" && deb.work_dir.starts_with("/tmp/hammer-deb.") is
+        system("rm -rf " + shq(deb.work_dir))
+    end
+end
