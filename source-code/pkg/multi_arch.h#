@@ -1,0 +1,534 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> fmt"     from "fmt"
+
+mod internal
+mod ui
+mod cache
+mod db
+mod userenv
+
+;; hammer -> pkg::multi_arch
+;;
+;; Port of source-code/pkg/multi_arch.rs (Rust) to H#: obsluga wielu
+;; architektur (foreign arches w /etc/hammer/foreign-arches), `name:arch`,
+;; spelnianie zaleznosci miedzy architekturami, `hammer arch ...`,
+;; `hammer dpkg-arch ...` i wykrywanie konfliktow Multi-Arch.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `MultiArchDb` niemutowalny: `add_arch`/`remove_arch` zwracaja
+;;    `ArchUpdate { db, err }` (nowa baza + ewentualny blad), a nie `&mut self`.
+;; 2. `trait InstalledView` -> struct-migawka `InstalledView` (plaskie
+;;    tablice nazwa/arch/wersja). Rust pytal baze na zadanie (`get(name)`
+;;    oraz `get("name:i386")` ...); `view_from_installed` buduje z listy
+;;    zainstalowanych ten sam widok: wpis o nazwie "pkg:arch" (dla arch z
+;;    listy obcych) liczy sie jako "pkg". Roznica brzegowa: zapytanie o
+;;    doslowna nazwe "x:i386" nie trafi w wiersz "x:i386".
+;; 3. `Option<MultiArchMode>` zwracane z `get_mode` -> `MultiArchMode?`;
+;;    `(String, Option<String>)` -> struct `PkgSpec`;
+;;    `conflicts: &[(String, Option<String>)]` -> tablica `ConflictSpec`.
+;; 4. `ConflictReason` (enum z danymi) -> struct z polem `kind`
+;;    ("any-arch" | "specific-arch" | "same-version-required") plus
+;;    `installed_version`/`required_version` (puste gdy nie dotyczy).
+;; 5. `Result<()>` -> `string` ("" = Ok). `#[cfg(test)]` -> `self_test()`
+;;    (te same przypadki co testy Rusta; zwraca liczbe niepowodzen).
+;; 6. `parse_pkg_spec`: `chars().all(is_alphanumeric || '_')` — tu tylko
+;;    ASCII [A-Za-z0-9_] (nazwy architektur Debiana sa ASCII).
+
+pub fn foreign_arches_file() -> string is return "/etc/hammer/foreign-arches" end
+
+;; ── MultiArchMode ────────────────────────────────────────────────────────
+
+pub enum MultiArchMode is
+    No
+    Same
+    Foreign
+    Allowed
+end
+
+pub fn mode_parse(s: string) -> MultiArchMode is
+    let v: string = str::to_lower(str::trim(s))
+    if v == "same" is return MultiArchMode::Same end
+    if v == "foreign" is return MultiArchMode::Foreign end
+    if v == "allowed" is return MultiArchMode::Allowed end
+    return MultiArchMode::No
+end
+
+fn is_same_mode(m: MultiArchMode) -> bool is
+    match m is
+        MultiArchMode::Same => is return true end
+        _ => is return false end
+    end
+end
+
+fn is_foreign_or_allowed(m: MultiArchMode) -> bool is
+    match m is
+        MultiArchMode::Foreign => is return true end
+        MultiArchMode::Allowed => is return true end
+        _ => is return false end
+    end
+end
+
+;; ── name:arch ────────────────────────────────────────────────────────────
+
+pub struct PkgSpec is
+    pub name: string
+    pub arch: string?
+end
+
+fn is_arch_char(c: string) -> bool is
+    if c == "_" is return true end
+    if c >= "0" && c <= "9" is return true end
+    if c >= "a" && c <= "z" is return true end
+    if c >= "A" && c <= "Z" is return true end
+    return false
+end
+
+fn all_arch_chars(s: string) -> bool is
+    let n: int = string_len(s)
+    let mut i: int = 0
+    while i < n is
+        if !is_arch_char(string_at(s, i)) is return false end
+        i += 1
+    end
+    return true
+end
+
+;; Indeks OSTATNIEGO ':' albo -1 (`rsplit_once(':')`).
+fn last_colon(s: string) -> int is
+    let mut i: int = string_len(s) - 1
+    while i >= 0 is
+        if string_at(s, i) == ":" is return i end
+        i -= 1
+    end
+    return -1
+end
+
+pub fn parse_pkg_spec(spec: string) -> PkgSpec is
+    let c: int = last_colon(spec)
+    if c >= 0 is
+        let name: string = str::slice(spec, 0, c)
+        let arch: string = str::slice(spec, c + 1, string_len(spec))
+        if all_arch_chars(arch) && string_len(arch) <= 10 is
+            return PkgSpec { name: name, arch: arch }
+        end
+    end
+    return PkgSpec { name: spec, arch: nil }
+end
+
+;; ── MultiArchDb ──────────────────────────────────────────────────────────
+
+pub struct MultiArchDb is
+    pub foreign_arches: [string]
+end
+
+pub struct ArchUpdate is
+    pub db:  MultiArchDb
+    pub err: string
+end
+
+fn contains(list: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < list.len() is
+        if list[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn multi_arch_db_load() -> MultiArchDb is
+    let native: string = cache::detect_arch()
+    let mut arches: [string] = []
+    let file: string = foreign_arches_file()
+    if fs::exists(file) is
+        let lines: [string] = str::split(fs::read(file), "\n")
+        let mut i: int = 0
+        while i < lines.len() is
+            let arch: string = str::trim(lines[i])
+            if arch != "" && arch != native is arches.push(arch) end
+            i += 1
+        end
+    end
+    return MultiArchDb { foreign_arches: arches }
+end
+
+;; Zapis: arch-e po jednej w linii + koncowy '\n' (jak `join("\n") + "\n"`).
+pub fn multi_arch_db_save(d: MultiArchDb) -> string is
+    if !fs::exists("/etc/hammer") is fs::mkdir("/etc/hammer") end
+    fs::write(foreign_arches_file(), str::join(d.foreign_arches, "\n") + "\n")
+    return ""
+end
+
+;; Uwaga: Rust sprawdza `normalise_arch(arch)`, ale dopisuje ORYGINALNY
+;; `arch` (nie znormalizowany) — zachowane.
+pub fn add_arch(d: MultiArchDb, arch: string) -> ArchUpdate is
+    let n: userenv::ArchResult = userenv::normalise_arch(arch)
+    if !n.ok is
+        return ArchUpdate { db: d, err: "Unknown architecture: '" + arch + "'" }
+    end
+    if !contains(d.foreign_arches, arch) is
+        let mut arches: [string] = d.foreign_arches
+        arches.push(arch)
+        let updated: MultiArchDb = MultiArchDb { foreign_arches: arches }
+        let err: string = multi_arch_db_save(updated)
+        return ArchUpdate { db: updated, err: err }
+    end
+    return ArchUpdate { db: d, err: "" }
+end
+
+pub fn remove_arch(d: MultiArchDb, arch: string) -> ArchUpdate is
+    let mut arches: [string] = []
+    let mut i: int = 0
+    while i < d.foreign_arches.len() is
+        if d.foreign_arches[i] != arch is arches.push(d.foreign_arches[i]) end
+        i += 1
+    end
+    let updated: MultiArchDb = MultiArchDb { foreign_arches: arches }
+    let err: string = multi_arch_db_save(updated)
+    return ArchUpdate { db: updated, err: err }
+end
+
+pub fn all_arches(d: MultiArchDb) -> [string] is
+    let mut out: [string] = [cache::detect_arch()]
+    let mut i: int = 0
+    while i < d.foreign_arches.len() is
+        out.push(d.foreign_arches[i])
+        i += 1
+    end
+    return out
+end
+
+pub fn supports_arch(d: MultiArchDb, arch: string) -> bool is
+    return arch == "all" || arch == cache::detect_arch() || contains(d.foreign_arches, arch)
+end
+
+;; Tryb Multi-Arch z kolumny `multi_arch` bazy zainstalowanych; nil gdy pakiet
+;; nie jest zainstalowany albo nie ma pola (wtedy = "no").
+pub fn get_mode(d: MultiArchDb, pkg_name: string) -> MultiArchMode? is
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let inst: db::InstalledPackage? = idb.get(pkg_name)
+    if inst == nil is return nil end
+    let p: db::InstalledPackage = inst
+    if p.multi_arch == nil is return nil end
+    let v: string = p.multi_arch
+    return mode_parse(v)
+end
+
+;; ── Spelnianie zaleznosci miedzy architekturami ──────────────────────────
+
+pub fn can_satisfy_dep(candidate_arch: string, candidate_ma: MultiArchMode, requirer_arch: string) -> bool is
+    if candidate_arch == "all" || candidate_arch == "any" is return true end
+    if is_foreign_or_allowed(candidate_ma) is return true end
+    return candidate_arch == requirer_arch
+end
+
+;; ── CLI: hammer arch list/add/remove ─────────────────────────────────────
+
+
+pub fn cmd_arch(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "list"
+
+    if sub == "list" || sub == "ls" is
+        let d: MultiArchDb = multi_arch_db_load()
+        let native: string = cache::detect_arch()
+        write("")
+        write("  " + ui::accent_bold("⬡") + "  Configured architectures")
+        write("  " + ui::dim(str::repeat("─", 50)))
+        write("  " + ui::bright_green("●") + " " + ui::bold(native) + " (native)")
+        if d.foreign_arches.len() == 0 is
+            write("  " + ui::dim("·") + " No foreign architectures configured.")
+        else is
+            let mut i: int = 0
+            while i < d.foreign_arches.len() is
+                write("  " + ui::cyan("○") + " " + ui::bold(d.foreign_arches[i]) + " (foreign)")
+                i += 1
+            end
+        end
+        write("")
+        write("  Add:    " + ui::cyan("hammer arch add i386"))
+        write("  Remove: " + ui::cyan("hammer arch remove i386"))
+        return ""
+    end
+
+    if sub == "add" is
+        if args.len() < 2 is return "Usage: hammer arch add <arch>" end
+        let r: ArchUpdate = add_arch(multi_arch_db_load(), args[1])
+        if r.err != "" is return r.err end
+        write("  " + ui::bright_green("✔") + " Added foreign architecture '" + ui::bold(args[1]) + "'.")
+        write("  Run " + ui::cyan("hammer sync") + " to fetch packages for this architecture.")
+        return ""
+    end
+
+    if sub == "remove" is
+        if args.len() < 2 is return "Usage: hammer arch remove <arch>" end
+        let r: ArchUpdate = remove_arch(multi_arch_db_load(), args[1])
+        if r.err != "" is return r.err end
+        write("  " + ui::bright_green("✔") + " Removed foreign architecture '" + ui::bold(args[1]) + "'.")
+        return ""
+    end
+
+    return "Unknown arch subcommand '" + sub + "'. Try: list, add, remove"
+end
+
+;; ── Sciezka w store dla pakietow z architektura ──────────────────────────
+
+pub fn store_path_multi_arch(store_dir: string, name: string, version: string, arch: string, hash: string) -> string is
+    let native: string = cache::detect_arch()
+    if arch == "all" || arch == native || arch == "" is
+        return compat::path_join(store_dir, name + "-" + version + "-" + hash)
+    end
+    return compat::path_join(store_dir, name + "-" + arch + "-" + version + "-" + hash)
+end
+
+;; ── hammer dpkg-arch (odpowiednik `dpkg --print-architecture` itd.) ──────
+
+pub fn cmd_dpkg_arch(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "print"
+
+    if sub == "--print-architecture" || sub == "print" || sub == "" is
+        write(cache::detect_arch())
+        return ""
+    end
+    if sub == "--print-foreign-architectures" || sub == "foreign" is
+        let d: MultiArchDb = multi_arch_db_load()
+        let mut i: int = 0
+        while i < d.foreign_arches.len() is
+            write(d.foreign_arches[i])
+            i += 1
+        end
+        return ""
+    end
+    if sub == "--add-architecture" || sub == "add" is
+        if args.len() < 2 is return "Usage: hammer dpkg-arch add <arch>" end
+        let r: ArchUpdate = add_arch(multi_arch_db_load(), args[1])
+        if r.err != "" is return r.err end
+        write("  " + ui::bright_green("✔") + " Added " + ui::bold(args[1]))
+        return ""
+    end
+    if sub == "--remove-architecture" || sub == "remove" is
+        if args.len() < 2 is return "Usage: hammer dpkg-arch remove <arch>" end
+        let r: ArchUpdate = remove_arch(multi_arch_db_load(), args[1])
+        if r.err != "" is return r.err end
+        write("  " + ui::bright_green("✔") + " Removed " + ui::bold(args[1]))
+        return ""
+    end
+    if sub == "--assert-multi-arch" || sub == "assert" is
+        let d: MultiArchDb = multi_arch_db_load()
+        if d.foreign_arches.len() == 0 is return "Multi-arch is not enabled" end
+        return ""
+    end
+    return "Unknown dpkg-arch subcommand '" + sub + "'\n  " +
+        "Usage: hammer dpkg-arch [print|foreign|add <arch>|remove <arch>|assert]"
+end
+
+;; ── Konflikty Multi-Arch ─────────────────────────────────────────────────
+;;   `Conflicts: pkg`        -> z pkg KAZDEJ architektury
+;;   `Conflicts: pkg:amd64`  -> tylko z pkg:amd64
+;;   `Conflicts: pkg:any`    -> tak jak "kazda"
+;; `Multi-Arch: Same` dodatkowo: wszystkie zainstalowane arch-e musza miec te
+;; sama wersje.
+
+pub struct MultiArchConflict is
+    pub requirer:          string
+    pub requirer_arch:     string
+    pub conflicting:       string
+    pub conflicting_arch:  string?
+    ;; "any-arch" | "specific-arch" | "same-version-required"
+    pub kind:              string
+    pub installed_version: string
+    pub required_version:  string
+end
+
+pub struct ConflictSpec is
+    pub name: string
+    pub arch: string?
+end
+
+;; Migawka zainstalowanych: rownolegle tablice (nazwa, arch, wersja).
+pub struct InstalledView is
+    pub names:    [string]
+    pub arches:   [string]
+    pub versions: [string]
+end
+
+pub fn view_empty() -> InstalledView is
+    let a: [string] = []
+    let b: [string] = []
+    let c: [string] = []
+    return InstalledView { names: a, arches: b, versions: c }
+end
+
+pub fn view_add(v: InstalledView, name: string, arch: string, version: string) -> InstalledView is
+    let mut n: [string] = v.names
+    let mut a: [string] = v.arches
+    let mut ver: [string] = v.versions
+    n.push(name)
+    a.push(arch)
+    ver.push(version)
+    return InstalledView { names: n, arches: a, versions: ver }
+end
+
+;; Widok z listy zainstalowanych (patrz odejscie 2).
+pub fn view_from_installed(all: [db::InstalledPackage]) -> InstalledView is
+    let foreign: [string] = ["i386", "arm64", "armhf", "armel", "ppc64el", "s390x"]
+    let mut v: InstalledView = view_empty()
+    let mut i: int = 0
+    while i < all.len() is
+        let p: db::InstalledPackage = all[i]
+        let mut key: string = p.name
+        let c: int = last_colon(p.name)
+        if c >= 0 && contains(foreign, str::slice(p.name, c + 1, string_len(p.name))) is
+            key = str::slice(p.name, 0, c)
+        end
+        v = view_add(v, key, p.architecture, p.version)
+        i += 1
+    end
+    return v
+end
+
+;; Elementy "arch\twersja" dla pakietu `name`.
+pub fn installed_arches(v: InstalledView, name: string) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < v.names.len() is
+        if v.names[i] == name is out.push(v.arches[i] + "\t" + v.versions[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn tab_first(s: string) -> string is
+    let p: int = compat::str_index_of(s, "\t")
+    if p < 0 is return s end
+    return str::slice(s, 0, p)
+end
+
+fn tab_second(s: string) -> string is
+    let p: int = compat::str_index_of(s, "\t")
+    if p < 0 is return "" end
+    return str::slice(s, p + 1, string_len(s))
+end
+
+pub fn check_multi_arch_conflicts(new_name: string, new_arch: string, new_version: string, new_ma: MultiArchMode, new_conflicts: [ConflictSpec], installed: InstalledView) -> [MultiArchConflict] is
+    let mut found: [MultiArchConflict] = []
+
+    let mut c: int = 0
+    while c < new_conflicts.len() is
+        let spec: ConflictSpec = new_conflicts[c]
+        c += 1
+        let inst: [string] = installed_arches(installed, spec.name)
+        let mut k: int = 0
+        while k < inst.len() is
+            let inst_arch: string = tab_first(inst[k])
+            k += 1
+            let mut conflicts: bool = false
+            let mut kind: string = "specific-arch"
+            if spec.arch == nil is
+                conflicts = true
+                kind = "any-arch"
+            else is
+                let sa: string = spec.arch
+                if sa == "any" is
+                    conflicts = true
+                    kind = "any-arch"
+                elsif inst_arch == sa is
+                    conflicts = true
+                end
+            end
+            if conflicts is
+                found.push(MultiArchConflict {
+                    requirer: new_name, requirer_arch: new_arch,
+                    conflicting: spec.name, conflicting_arch: inst_arch,
+                    kind: kind, installed_version: "", required_version: ""
+                })
+            end
+        end
+    end
+
+    ;; Multi-Arch: Same — wszystkie zainstalowane arch-e musza miec te sama wersje
+    if is_same_mode(new_ma) is
+        let inst: [string] = installed_arches(installed, new_name)
+        let mut k: int = 0
+        while k < inst.len() is
+            let inst_arch: string = tab_first(inst[k])
+            let inst_ver: string = tab_second(inst[k])
+            k += 1
+            ;; ta sama architektura, inna instalacja = upgrade
+            if inst_arch != new_arch && inst_ver != new_version is
+                found.push(MultiArchConflict {
+                    requirer: new_name, requirer_arch: new_arch,
+                    conflicting: new_name, conflicting_arch: inst_arch,
+                    kind: "same-version-required",
+                    installed_version: inst_ver, required_version: new_version
+                })
+            end
+        end
+    end
+    return found
+end
+
+;; Czytelna lista konfliktow (uzywane przez solver/transaction).
+pub fn format_conflicts(conflicts: [MultiArchConflict]) -> string is
+    let mut lines: [string] = []
+    let mut i: int = 0
+    while i < conflicts.len() is
+        let c: MultiArchConflict = conflicts[i]
+        i += 1
+        if c.kind == "same-version-required" is
+            let carch: string = if c.conflicting_arch == nil then "?" else c.conflicting_arch
+            lines.push("  " + c.requirer + ":" + c.requirer_arch + " (Multi-Arch: Same) requires version " +
+                c.required_version + " but " + c.conflicting + ":" + carch + " has " + c.installed_version)
+        else is
+            let carch: string = if c.conflicting_arch == nil then "*" else c.conflicting_arch
+            lines.push("  " + c.requirer + ":" + c.requirer_arch + " conflicts with " + c.conflicting + ":" + carch)
+        end
+    end
+    return str::join(lines, "\n")
+end
+
+;; ── Testy z Rusta (`#[cfg(test)]`) — `self_test()` zwraca liczbe bledow ──
+
+fn expect(name: string, ok: bool) -> int is
+    if ok is return 0 end
+    write("  FAIL: " + name)
+    return 1
+end
+
+pub fn self_test() -> int is
+    let mut fails: int = 0
+
+    let s1: PkgSpec = parse_pkg_spec("curl")
+    fails += expect("spec curl", s1.name == "curl" && s1.arch == nil)
+    let s2: PkgSpec = parse_pkg_spec("curl:amd64")
+    fails += expect("spec curl:amd64", s2.name == "curl" && s2.arch == "amd64")
+    let s3: PkgSpec = parse_pkg_spec("libc6:i386")
+    fails += expect("spec libc6:i386", s3.name == "libc6" && s3.arch == "i386")
+    let s4: PkgSpec = parse_pkg_spec("python3.11")
+    fails += expect("spec python3.11", s4.name == "python3.11" && s4.arch == nil)
+
+    fails += expect("sat i386 Foreign amd64", can_satisfy_dep("i386", MultiArchMode::Foreign, "amd64"))
+    fails += expect("sat i386 Foreign i386", can_satisfy_dep("i386", MultiArchMode::Foreign, "i386"))
+    fails += expect("sat amd64 Same amd64", can_satisfy_dep("amd64", MultiArchMode::Same, "amd64"))
+    fails += expect("!sat i386 Same amd64", !can_satisfy_dep("i386", MultiArchMode::Same, "amd64"))
+    fails += expect("sat all No amd64", can_satisfy_dep("all", MultiArchMode::No, "amd64"))
+    fails += expect("sat all No i386", can_satisfy_dep("all", MultiArchMode::No, "i386"))
+
+    let none_spec: [ConflictSpec] = []
+    let v1: InstalledView = view_add(view_empty(), "libssl1.1", "i386", "1.1.1")
+    let c1: [MultiArchConflict] = check_multi_arch_conflicts("libssl1.1", "amd64", "1.1.1",
+        MultiArchMode::No, [ConflictSpec { name: "libssl1.1", arch: nil }], v1)
+    fails += expect("any-arch conflict", c1.len() == 1 && c1[0].kind == "any-arch")
+
+    let v2: InstalledView = view_add(view_empty(), "curl", "i386", "7.88.0")
+    let c2: [MultiArchConflict] = check_multi_arch_conflicts("curl", "amd64", "8.0.0",
+        MultiArchMode::Same, none_spec, v2)
+    fails += expect("same-version conflict",
+        c2.len() == 1 && c2[0].kind == "same-version-required" &&
+        c2[0].installed_version == "7.88.0" && c2[0].required_version == "8.0.0")
+
+    let v3: InstalledView = view_add(view_empty(), "curl", "i386", "8.0.0")
+    let c3: [MultiArchConflict] = check_multi_arch_conflicts("curl", "amd64", "8.0.0",
+        MultiArchMode::Same, none_spec, v3)
+    fails += expect("no conflict when same version", c3.len() == 0)
+    return fails
+end
