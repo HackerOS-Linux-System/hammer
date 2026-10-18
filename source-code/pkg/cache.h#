@@ -1,0 +1,703 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+use "std -> collections" from "col"
+use "bit -> progress-bar" from "pb"
+
+mod internal
+mod package
+mod repo
+;; [mod download pominiete: source-code/ui/download.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez ui/mod.h# — wywolania download::fn dzialaja bez zmian]
+;; [mod gpg_verify pominiete: source-code/system/gpg_verify.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania gpg_verify::fn dzialaja bez zmian]
+mod multi_arch
+mod ui
+
+;; hammer -> pkg::cache
+;;
+;; Port of source-code/pkg/cache.rs (Rust) to H# (offline cache + `hammer sync`).
+;; `PackageCache` (ladowanie indeksow z /var/lib/hammer/lists, deduplikacja
+;; po najwyzszej wersji, get/get_exact/search/all_packages/len) oraz
+;; `detect_arch`, `url_to_cache_name`, `extract_base_uri_comment`.
+;;
+;; ── CALOSC (offline + sync) — `PackageCache::update` zwie sie `cache_update` ─────────────────────────────────────────────
+;; `update` (= `hammer sync`), `fetch_and_verify_index`, `fetch_packages_file`,
+;; `decompress` i `sync_all` sa na koncu pliku. Pobieranie idzie przez
+;; `curl` w rownoleglych skryptach roboczych (patrz ui/download.h#).
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `HashMap<String,Package>` -> tablice (`names`/`by_name`, `all_keys`/`all`)
+;;    + indeksy `name_idx`/`key_idx` (mapy z `std -> collections`, nazwa/klucz
+;;    -> pozycja). `get`/`get_exact`/`insert` sa O(1). Sortowanie
+;;    (`all_packages`, `search`) to scalanie O(n log n), nie wstawianie.
+;;    Semantyka (klucz `name:arch:version`, nadpisanie duplikatu, "zostaw
+;;    wyzsza wersje") jest zachowana.
+;; 2. Stan jest niemutowalny: `insert`/`ingest` zwracaja NOWY `PackageCache`.
+;; 3. `Result<Self>` -> `PackageCache` (brak katalogu = pusty cache, jak w
+;;    Rust; nieczytelny plik jest pomijany — w Rust `if let Ok(..)`).
+;; 4. `detect_arch` bez `cfg!(target_arch)` (H# nie ma kompilacji
+;;    warunkowej): gdy `uname -m` zawiedzie, zwraca "amd64" — jedyny
+;;    fallback dostepny w czasie dzialania.
+
+pub fn lists_dir() -> string is return "/var/lib/hammer/lists" end
+
+pub fn cache_dir() -> string is return "/var/cache/hammer" end
+
+pub struct PackageCache is
+    ;; najnowsza wersja danej nazwy
+    pub names:     [string]
+    pub by_name:   [package::Package]
+    ;; wszystkie wersje, klucz "name:arch:version"
+    pub all_keys:  [string]
+    pub all:       [package::Package]
+    ;; Indeksy (mapy z std -> collections; wartosc = pozycja w tablicy jako
+    ;; tekst): nazwa -> pozycja w `names`/`by_name`, klucz -> pozycja w
+    ;; `all_keys`/`all`. Daja O(1) zamiast liniowego przegladania ~60k
+    ;; pakietow. Uchwyt mapy jest WSPOLDZIELONY miedzy kopiami struktury
+    ;; (mutowany w miejscu) — po `cache_insert` uzywaj tylko zwroconej wartosci.
+    pub name_idx:  any
+    pub key_idx:   any
+end
+
+pub fn cache_empty() -> PackageCache is
+    let n: [string] = []
+    let b: [package::Package] = []
+    let k: [string] = []
+    let a: [package::Package] = []
+    return PackageCache { names: n, by_name: b, all_keys: k, all: a,
+        name_idx: col::hashmap_new(), key_idx: col::hashmap_new() }
+end
+
+fn index_of_name(c: PackageCache, name: string) -> int is
+    if !col::hashmap_contains(c.name_idx, name) is return -1 end
+    return conv::str_to_int(col::hashmap_get(c.name_idx, name))
+end
+
+fn index_of_key(c: PackageCache, key: string) -> int is
+    if !col::hashmap_contains(c.key_idx, key) is return -1 end
+    return conv::str_to_int(col::hashmap_get(c.key_idx, key))
+end
+
+;; Rust: `ingest` (+ publiczne `insert`). Zachowuje najwyzsza wersje per nazwa.
+;; Semantyka tablic H#: `push` zwraca (byc moze nowy) wskaznik do zmiennej —
+;; dlatego pracujemy na lokalnych kopiach i zwracamy NOWA strukture.
+pub fn cache_insert(c: PackageCache, pkg: package::Package) -> PackageCache is
+    let mut names: [string] = c.names
+    let mut by_name: [package::Package] = c.by_name
+    let mut all_keys: [string] = c.all_keys
+    let mut all: [package::Package] = c.all
+
+    let key: string = pkg.name + ":" + pkg.architecture + ":" + pkg.version
+    let ki: int = index_of_key(c, key)
+    if ki >= 0 is
+        all[ki] = pkg
+    else is
+        col::hashmap_insert(c.key_idx, key, to_string(all_keys.len()))
+        all_keys.push(key)
+        all.push(pkg)
+    end
+
+    let ni: int = index_of_name(c, pkg.name)
+    if ni < 0 is
+        col::hashmap_insert(c.name_idx, pkg.name, to_string(names.len()))
+        names.push(pkg.name)
+        by_name.push(pkg)
+    else is
+        ;; existing_newer: istniejaca STRICTLY wyzsza -> zostaje
+        let existing_newer: bool = package::version_cmp(by_name[ni].version, pkg.version) > 0
+        if !existing_newer is by_name[ni] = pkg end
+    end
+    return PackageCache { names: names, by_name: by_name, all_keys: all_keys, all: all,
+        name_idx: c.name_idx, key_idx: c.key_idx }
+end
+
+;; `# hammer-base-uri: <uri>` z naglowka pliku `.pkgs`; nil gdy brak.
+pub fn extract_base_uri_comment(content: string) -> string? is
+    let prefix: string = "# hammer-base-uri:"
+    let lines: [string] = str::split(content, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i].starts_with(prefix) is
+            return str::trim(str::slice(lines[i], string_len(prefix), string_len(lines[i])))
+        end
+        i += 1
+    end
+    return nil
+end
+
+;; Zamiana URL-a na nazwe pliku: znaki inne niz [A-Za-z0-9_-] -> '_', max 120 znakow.
+pub fn url_to_cache_name(url: string) -> string is
+    let mut out: string = ""
+    let n: int = string_len(url)
+    let limit: int = if n > 120 then 120 else n
+    let mut i: int = 0
+    while i < limit is
+        let c: string = string_at(url, i)
+        if is_name_char(c) is out = out + c else is out = out + "_" end
+        i += 1
+    end
+    return out
+end
+
+fn is_name_char(c: string) -> bool is
+    if c == "-" || c == "_" is return true end
+    if c >= "0" && c <= "9" is return true end
+    if c >= "a" && c <= "z" is return true end
+    if c >= "A" && c <= "Z" is return true end
+    return false
+end
+
+;; Wczytuje wszystkie *.pkgs z katalogu list. Brak katalogu = pusty cache.
+pub fn cache_load() -> PackageCache is
+    let mut c: PackageCache = cache_empty()
+    let dir: string = lists_dir()
+    if !fs::exists(dir) is return c end
+
+    let files: [string] = fs::walk(dir)
+    let mut f: int = 0
+    while f < files.len() is
+        let file: string = files[f]
+        f += 1
+        if file.ends_with(".pkgs") && fs::is_file(file) is
+            let content: string = fs::read(file)
+            let base_uri: string? = extract_base_uri_comment(content)
+            let pkgs: [package::Package] = package::parse_index(content)
+            let mut i: int = 0
+            while i < pkgs.len() is
+                let mut pk: package::Package = pkgs[i]
+                if pk.repo_base_uri == nil is pk.repo_base_uri = base_uri end
+                c = cache_insert(c, pk)
+                i += 1
+            end
+        end
+    end
+    return c
+end
+
+;; Rust: `load_for_arch(_arch)` — argument ignorowany tak samo jak w oryginale.
+pub fn cache_load_for_arch(arch: string) -> PackageCache is
+    return cache_load()
+end
+
+pub fn cache_get(c: PackageCache, name: string) -> package::Package? is
+    let i: int = index_of_name(c, name)
+    if i < 0 is return nil end
+    return c.by_name[i]
+end
+
+pub fn cache_get_exact(c: PackageCache, name: string, version: string, arch: string) -> package::Package? is
+    let i: int = index_of_key(c, name + ":" + arch + ":" + version)
+    if i < 0 is return nil end
+    return c.all[i]
+end
+
+pub fn cache_len(c: PackageCache) -> int is return c.names.len() end
+
+;; Sortowanie przez scalanie od dolu (stabilne, O(n log n)); `before(r, l)`
+;; = true gdy prawy element ma isc PRZED lewym (przy rownosci zostaje lewy).
+;; Uwaga: `std -> sort`::`sort_strings` nie nadaje sie — wrapper odrzuca wynik
+;; builtina (runtime zwraca NOWA tablice), wiec nic by nie posortowal.
+fn sort_pkgs_by_name(items: [package::Package]) -> [package::Package] is
+    let n: int = items.len()
+    if n < 2 is return items end
+    let mut src: [package::Package] = items
+    let mut width: int = 1
+    while width < n is
+        let mut dst: [package::Package] = []
+        let mut i: int = 0
+        while i < n is
+            let mid: int = if i + width < n then i + width else n
+            let hi: int = if i + 2 * width < n then i + 2 * width else n
+            let mut l: int = i
+            let mut r: int = mid
+            while l < mid && r < hi is
+                if src[r].name < src[l].name is
+                    dst.push(src[r])
+                    r += 1
+                else is
+                    dst.push(src[l])
+                    l += 1
+                end
+            end
+            while l < mid is
+                dst.push(src[l])
+                l += 1
+            end
+            while r < hi is
+                dst.push(src[r])
+                r += 1
+            end
+            i += 2 * width
+        end
+        src = dst
+        width = width * 2
+    end
+    return src
+end
+
+;; Posortowane po nazwie (stabilne).
+pub fn cache_all_packages(c: PackageCache) -> [package::Package] is
+    return sort_pkgs_by_name(c.by_name)
+end
+
+fn desc_contains(p: package::Package, q: string) -> bool is
+    if p.description_short == nil is return false end
+    let d: string = p.description_short
+    return compat::str_index_of(str::to_lower(d), q) >= 0
+end
+
+;; Wyszukiwanie: nazwa albo krotki opis zawiera zapytanie (bez rozrozniania
+;; wielkosci liter). Kolejnosc: dokladne trafienie nazwy, potem nazwy
+;; zaczynajace sie od zapytania, potem alfabetycznie.
+fn sort_hits(items: [package::Package], q: string) -> [package::Package] is
+    let n: int = items.len()
+    if n < 2 is return items end
+    let mut src: [package::Package] = items
+    let mut width: int = 1
+    while width < n is
+        let mut dst: [package::Package] = []
+        let mut i: int = 0
+        while i < n is
+            let mid: int = if i + width < n then i + width else n
+            let hi: int = if i + 2 * width < n then i + 2 * width else n
+            let mut l: int = i
+            let mut r: int = mid
+            while l < mid && r < hi is
+                if search_before(src[r], src[l], q) is
+                    dst.push(src[r])
+                    r += 1
+                else is
+                    dst.push(src[l])
+                    l += 1
+                end
+            end
+            while l < mid is
+                dst.push(src[l])
+                l += 1
+            end
+            while r < hi is
+                dst.push(src[r])
+                r += 1
+            end
+            i += 2 * width
+        end
+        src = dst
+        width = width * 2
+    end
+    return src
+end
+
+pub fn cache_search(c: PackageCache, query: string) -> [package::Package] is
+    let q: string = str::to_lower(query)
+    let mut hits: [package::Package] = []
+    let mut i: int = 0
+    while i < c.by_name.len() is
+        let p: package::Package = c.by_name[i]
+        if compat::str_index_of(str::to_lower(p.name), q) >= 0 || desc_contains(p, q) is hits.push(p) end
+        i += 1
+    end
+
+    ;; sort: a przed b gdy (exact, starts, name) jest "mniejsze" (scalanie, stabilne)
+    hits = sort_hits(hits, q)
+    return hits
+end
+
+;; `true` gdy `a` ma isc przed `b`.
+fn search_before(a: package::Package, b: package::Package, q: string) -> bool is
+    let a_exact: bool = str::to_lower(a.name) == q
+    let b_exact: bool = str::to_lower(b.name) == q
+    if a_exact != b_exact is return a_exact end
+    let a_starts: bool = str::to_lower(a.name).starts_with(q)
+    let b_starts: bool = str::to_lower(b.name).starts_with(q)
+    if a_starts != b_starts is return a_starts end
+    return a.name < b.name
+end
+
+;; `uname -m` -> nazwa architektury Debiana.
+pub fn detect_arch() -> string is
+    let m: string = str::trim(proc::shell("uname -m 2>/dev/null"))
+    if m == "x86_64" is return "amd64" end
+    if m == "aarch64" || m == "arm64" is return "arm64" end
+    if m == "armv7l" is return "armhf" end
+    if m == "i686" || m == "i386" is return "i386" end
+    if m == "riscv64" is return "riscv64" end
+    if m != "" is return m end
+    return "amd64"
+end
+
+;; ══════════════════════════════════════════════════════════════════════
+;;  Sync (`hammer sync`): update / fetch_and_verify_index / sync_all
+;; ══════════════════════════════════════════════════════════════════════
+;;
+;; ── Odejscia od oryginalu (sync) ────────────────────────────────────────
+;; 5. Wspolbieznosc: `tokio::spawn` bez limitu -> skrypty robocze przez
+;;    `xargs -P 8` (kazde zrodlo = jeden skrypt: probuje `.zst .xz .gz .bz2`
+;;    i brak rozszerzenia, jak `fetch_packages_file`; pierwszy udany
+;;    wariant jest dekompresowany; blad dekompresji konczy to zrodlo —
+;;    jak w Rust). `InRelease` pobierany RAZ na unikalny adres (Rust pobieral
+;;    go osobno dla kazdego komponentu i architektury) i weryfikowany RAZ.
+;; 6. Dekompresja przez systemowe `zstd`, `xz`, `gzip`, `bzip2` (`-dc`).
+;;    **BLAD W ORYGINALE, NAPRAWIONY:** `decompress` nie obslugiwal `.zst`
+;;    — wpadal w galez domyslna i traktowal skompresowane bajty jako
+;;    tekst. `.zst` jest PIERWSZYM probowanym wariantem, wiec dla
+;;    repozytorium publikujacego `Packages.zst` indeks byl smieciem (0
+;;    pakietow), a test SHA-256 (liczony po skompresowanych bajtach) i tak
+;;    przechodzil — cicho zapisywany pusty indeks.
+;; 7. Liczba pakietow: `grep -c '^Package:'` zamiast pelnego
+;;    `Package::parse_index` (60 tys. stanz w H# to minuty); rozni sie tylko
+;;    dla stanz bez `Version:`.
+;; 8. Plik `.pkgs` zapisywany ATOMOWO (`*.tmp` + `mv`), Rust pisal wprost.
+;; 9. `dedup_by` usuwa tylko SASIADUJACE duplikaty adresow — zachowane.
+;; 10. Wyswietlanie: interaktywnie (stderr = terminal) pasek ze spinnerami
+;;    rysowany na stderr; po zakonczeniu zawsze drukowane linie zrodel i
+;;    podsumowanie. (Rust w trybie interaktywnym kasowal wszystko
+;;    `mp.clear()` — podsumowanie znikalo.)
+;; H. **LUKA W ORYGINALE, NAPRAWIONA:** niezgodnosc SHA-256 pobranego indeksu
+;;    z podpisanym InRelease (albo brak wpisu o tym pliku) dawala TYLKO
+;;    dopisek "⚠sha256" — indeks i tak byl zapisywany, a znacznik
+;;    `.gpg-verified` zalezal wylacznie od podpisu. Razem z wstrzyknieciem
+;;    prefiksu (gpg_verify.h#, G) pozwalalo to podac dowolny indeks. Teraz
+;;    przy PODPISANYM InRelease rozbieznosc skrotu odrzuca zrodlo (jak apt:
+;;    "Hash Sum mismatch"); bez podpisu zachowanie bez zmian (tylko ostrzezenie).
+;;    Skutek uboczny: zrodlo publikujace NIEWYMIENIONY w InRelease wariant
+;;    (np. dodatkowy `Packages.zst`) jest odrzucane zamiast cicho przyjete.
+;; 11. **DECYZJA BEZPIECZENSTWA (zmiana wzgledem Rust):** `verify_inrelease`
+;;    zwraca sukces rowniez gdy weryfikacje POMINIETO (brak kluczy / brak
+;;    `gpgv`). Rust liczyl to jako `gpg_ok = true` i zapisywal znacznik
+;;    `.gpg-verified`, ktorego `verify_package_signature` uzywa jako
+;;    "repo jest zaufane" — czyli na systemie bez `gnupg` KAZDA paczka
+;;    wygladala na zweryfikowana. Tu "pominieto" liczy sie jako
+;;    NIEzweryfikowane (ikona ostrzezenia, brak znacznika). Wlacznik:
+;;    `skipped_counts_as_verified()` ponizej (true = zachowanie Rust).
+
+fn skipped_counts_as_verified() -> bool is return false end
+
+fn max_parallel_sync() -> int is return 8 end
+
+pub struct FetchResult is
+    pub content_file: string   ;; zdekompresowany tekst (plik tymczasowy)
+    pub gpg_ok:       bool
+    pub sha256_ok:    bool
+    pub err:          string   ;; "" = Ok
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sys_ok(cmd: string) -> bool is return system(cmd) == 0 end
+
+fn plural(n: int) -> string is
+    if n == 1 is return "" end
+    return "s"
+end
+
+fn int_of(s: string, default: int) -> int is
+    let t: string = str::trim(s)
+    if t != "" && str::is_numeric(t) is return conv::str_to_int(t) end
+    return default
+end
+
+fn spin_frame(tick: int) -> string is
+    ;; klatki z biblioteki `progress-bar` (zestaw "dots" — ten sam co w `bit`)
+    return spinner_frames::spinner_frame_at(spinner_frames::spinner_frames("dots"), tick)
+end
+
+fn user_agent_sync() -> string is
+    return "hammer/" + log::hammer_version() + " (https://github.com/HackerOS-Linux-System/hammer)"
+end
+
+;; Skrypt: pobierz warianty Packages dla jednego zrodla (patrz odejscie 5).
+fn index_job(url: string, out: string) -> string is
+    return "base=" + shq(url) + "; out=" + shq(out) + "; ua=" + shq(user_agent_sync()) + "\n" +
+        "fin() {{ printf '%s' \"$1\" > \"$out.res.tmp\"; mv -f \"$out.res.tmp\" \"$out.res\"; exit 0; }}\n" +
+        "for suf in .zst .xz .gz .bz2 ''; do\n" +
+        "  u=\"$base$suf\"\n" +
+        "  if curl -sS -f -L -A \"$ua\" --connect-timeout 20 --max-time 300 -o \"$out.raw\" \"$u\" 2>/dev/null; then\n" +
+        "    case \"$suf\" in\n" +
+        "      .zst) zstd -dc -- \"$out.raw\" > \"$out.txt\" 2>\"$out.dec\" ;;\n" +
+        "      .xz)  xz -dc -- \"$out.raw\" > \"$out.txt\" 2>\"$out.dec\" ;;\n" +
+        "      .gz)  gzip -dc -- \"$out.raw\" > \"$out.txt\" 2>\"$out.dec\" ;;\n" +
+        "      .bz2) bzip2 -dc -- \"$out.raw\" > \"$out.txt\" 2>\"$out.dec\" ;;\n" +
+        "      *)    cp -- \"$out.raw\" \"$out.txt\" 2>\"$out.dec\" ;;\n" +
+        "    esac\n" +
+        "    if [ $? -eq 0 ]; then fin \"ok:$suf\"; fi\n" +
+        "    fin \"err:Decompression failed for $u: $(head -c 200 \"$out.dec\" 2>/dev/null | tr '\\n' ' ')\"\n" +
+        "  fi\n" +
+        "  rm -f -- \"$out.raw\"\n" +
+        "done\n" +
+        "fin \"err:All variants failed for $base\"\n"
+end
+
+;; Skrypt: pobierz InRelease (jeden na unikalny adres).
+fn release_job(url: string, out: string) -> string is
+    return "url=" + shq(url) + "; out=" + shq(out) + "; ua=" + shq(user_agent_sync()) + "\n" +
+        "fin() {{ printf '%s' \"$1\" > \"$out.res.tmp\"; mv -f \"$out.res.tmp\" \"$out.res\"; exit 0; }}\n" +
+        "if curl -sS -f -L -A \"$ua\" --connect-timeout 20 --max-time 300 -o \"$out.file\" \"$url\" 2>\"$out.err\"; then fin ok; fi\n" +
+        "fin \"err:$(head -c 300 \"$out.err\" 2>/dev/null | tr '\\n' ' ')\"\n"
+end
+
+fn contains_str(list: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < list.len() is
+        if list[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+fn index_of_str(list: [string], v: string) -> int is
+    let mut i: int = 0
+    while i < list.len() is
+        if list[i] == v is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; Zebranie adresow indeksow dla wszystkich architektur (native + obce).
+fn collect_urls(sources: repo::SourcesList, all_arches: [string]) -> [repo::IndexUrl] is
+    let mut urls: [repo::IndexUrl] = []
+    let mut a: int = 0
+    while a < all_arches.len() is
+        let more: [repo::IndexUrl] = repo::index_urls(sources, all_arches[a])
+        let mut m: int = 0
+        while m < more.len() is
+            urls.push(more[m])
+            m += 1
+        end
+        a += 1
+    end
+    ;; `dedup_by` — tylko sasiadujace duplikaty (odejscie 9)
+    let mut out: [repo::IndexUrl] = []
+    let mut i: int = 0
+    while i < urls.len() is
+        if out.len() == 0 || out[out.len() - 1].url != urls[i].url is out.push(urls[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; Odpowiednik `PackageCache::update`. "" = Ok, inaczej tresc bledu.
+pub fn cache_update(sources: repo::SourcesList, client: download::HttpClient) -> string is
+    let native: string = detect_arch()
+    let mad: multi_arch::MultiArchDb = multi_arch::multi_arch_db_load()
+    let mut all_arches: [string] = multi_arch::all_arches(mad)
+    if all_arches.len() == 0 is all_arches.push(native) end
+
+    let urls: [repo::IndexUrl] = collect_urls(sources, all_arches)
+    ui::trace("cache_update: " + to_string(urls.len()) + " index url(s), arches=" + to_string(all_arches.len()))
+    if urls.len() == 0 is
+        return "No repositories configured. Check " + repo::sources_hk()
+    end
+
+    fs::mkdir(lists_dir())
+    if !fs::is_dir(lists_dir()) is return "Cannot create lists directory" end
+
+    let interactive: bool = sys_ok("test -t 2")
+    let header_msg: string = "Refreshing " + to_string(urls.len()) + " source" + plural(urls.len()) + " for " +
+        to_string(all_arches.len()) + " arch" + (if all_arches.len() == 1 then "" else "es") + " (native: " + native + ")…"
+    if !interactive is
+        write("  " + ui::cyan_bold("hammer sync") + "  " + header_msg)
+    end
+
+    ;; ── katalog roboczy + skrypty ────────────────────────────────────────
+    let work: string = str::trim(proc::shell("mktemp -d /tmp/hammer-sync.XXXXXX 2>/dev/null"))
+    if work == "" is return "Cannot create temp dir for sync" end
+
+    let mut rel_urls: [string] = []
+    let mut i: int = 0
+    while i < urls.len() is
+        if !contains_str(rel_urls, urls[i].inrelease_url) is rel_urls.push(urls[i].inrelease_url) end
+        fs::write(work + "/i-" + to_string(i) + ".sh", index_job(urls[i].url, work + "/i-" + to_string(i)))
+        i += 1
+    end
+    let mut r: int = 0
+    while r < rel_urls.len() is
+        fs::write(work + "/r-" + to_string(r) + ".sh", release_job(rel_urls[r], work + "/r-" + to_string(r)))
+        r += 1
+    end
+
+    ui::trace("cache_update: starting workers in " + work)
+    system("( ls " + shq(work) + "/*.sh | xargs -n1 -P " + to_string(max_parallel_sync()) +
+        " sh >/dev/null 2>&1; : > " + shq(work + "/done") + " ) >/dev/null 2>&1 &")
+
+    ;; ── czekanie z paskiem (tylko interaktywnie) ─────────────────────────
+    let mut labels: [string] = []
+    let mut li: int = 0
+    while li < urls.len() is
+        labels.push(urls[li].suite + "/" + urls[li].component + " [" + urls[li].arch + "]")
+        li += 1
+    end
+    let mut tick: int = 0
+    let mut drawn: int = 0
+    let mut finished: bool = false
+    while !finished is
+        let mut pending: int = 0
+        let mut k: int = 0
+        while k < urls.len() is
+            if !fs::exists(work + "/i-" + to_string(k) + ".res") is pending += 1 end
+            k += 1
+        end
+        if interactive is
+            let mut frame: string = ""
+            if drawn > 0 is frame = "\x1b[" + to_string(drawn) + "A" end
+            frame = frame + "\x1b[2K  " + ui::cyan_bold("hammer sync") + "  " + header_msg + "\n"
+            let mut n: int = 0
+            while n < urls.len() is
+                let done_one: bool = fs::exists(work + "/i-" + to_string(n) + ".res")
+                let sp: string = if done_one then "·" else spin_frame(tick)
+                frame = frame + "\x1b[2K  " + ui::cyan(sp) + "  " + ui::bold(ui::pad(labels[n], 42)) + "  " +
+                    (if done_one then ui::dim("fetched") else ui::dim("connecting…")) + "\n"
+                n += 1
+            end
+            ui::eprint_raw(frame)
+            drawn = urls.len() + 1
+        end
+        tick += 1
+        if tick % 20 == 1 is ui::trace("cache_update: waiting, pending=" + to_string(pending) + " tick=" + to_string(tick)) end
+        if pending == 0 && fs::exists(work + "/done") is
+            finished = true
+        elsif fs::exists(work + "/done") is
+            finished = true
+        else is
+            compat::time_sleep_ms(100)
+        end
+    end
+    if interactive && drawn > 0 is ui::eprint_raw("\x1b[" + to_string(drawn) + "A\x1b[J") end
+
+    ;; ── weryfikacja InRelease (raz na adres) ─────────────────────────────
+    let mut rel_ir: [gpg_verify::InRelease] = []
+    let mut rel_have: [bool] = []
+    let mut rel_gpg_ok: [bool] = []
+    let mut rr: int = 0
+    while rr < rel_urls.len() is
+        let res_file: string = work + "/r-" + to_string(rr) + ".res"
+        let res: string = if fs::exists(res_file) then str::trim(fs::read(res_file)) else "err:worker aborted"
+        if res == "ok" is
+            let content: string = fs::read(work + "/r-" + to_string(rr) + ".file")
+            let vs: gpg_verify::VerifyStatus = gpg_verify::verify_inrelease_status(content, gpg_verify::keyring_dir())
+            let mut ok: bool = false
+            let mut parse_src: string = content
+            if vs.state == "verified" is
+                ok = true
+                ;; WYLACZNIE podpisana tresc (gpg_verify.h#, G): nie surowy plik z ewentualnym prefiksem
+                parse_src = vs.content
+            elsif vs.state == "skipped" is
+                ok = skipped_counts_as_verified()
+            else is
+                log::warn("cache: GPG failed for " + rel_urls[rr] + ": " + vs.err)
+            end
+            rel_gpg_ok.push(ok)
+            rel_ir.push(gpg_verify::inrelease_parse(parse_src))
+            rel_have.push(true)
+        else is
+            log::warn("cache: cannot fetch InRelease for " + rel_urls[rr] + ": " + str::slice(res, 4, string_len(res)))
+            rel_gpg_ok.push(false)
+            rel_ir.push(gpg_verify::inrelease_parse(""))
+            rel_have.push(false)
+        end
+        rr += 1
+    end
+
+    ;; ── przetwarzanie zrodel ─────────────────────────────────────────────
+    let mut ok_count: int = 0
+    let mut err_count: int = 0
+    let mut total_pkgs: int = 0
+    let mut gpg_failed: int = 0
+    let mut lines: [string] = []
+
+    let mut x: int = 0
+    while x < urls.len() is
+        let info: repo::IndexUrl = urls[x]
+        let res_file: string = work + "/i-" + to_string(x) + ".res"
+        let res: string = if fs::exists(res_file) then str::trim(fs::read(res_file)) else "err:worker aborted"
+        let label: string = labels[x]
+        if !res.starts_with("ok:") is
+            let msg: string = if res.starts_with("err:") then str::slice(res, 4, string_len(res)) else res
+            lines.push("  " + ui::bold(ui::pad(label, 42)) + "  " + ui::red_bold("✗") + "  " + ui::dim(msg))
+            err_count += 1
+        else is
+            let suffix: string = str::slice(res, 3, string_len(res))
+            let rel_path: string = info.component + "/binary-" + info.arch + "/Packages" + suffix
+            let ridx: int = index_of_str(rel_urls, info.inrelease_url)
+            let gpg_ok: bool = ridx >= 0 && rel_gpg_ok[ridx]
+            let mut sha256_ok: bool = false
+            let mut hash_fail: string = ""
+            if ridx >= 0 && rel_have[ridx] is
+                let verr: string = gpg_verify::inrelease_verify_file(rel_ir[ridx], rel_path, work + "/i-" + to_string(x) + ".raw")
+                if verr == "" is
+                    sha256_ok = true
+                else is
+                    log::warn("cache: SHA256 check failed for " + rel_path + ": " + verr)
+                    ;; Gdy InRelease jest PODPISANY (gpg_ok), rozbieznosc/brak wpisu = odrzucenie
+                    ;; zrodla (jak apt: "Hash Sum mismatch"). Rust tylko dopisywal "⚠sha256" i
+                    ;; mimo to zapisywal indeks oraz znacznik zaufania — patrz H w naglowku sync.
+                    if gpg_ok is hash_fail = verr end
+                end
+            end
+
+            if hash_fail != "" is
+                lines.push("  " + ui::bold(ui::pad(label, 42)) + "  " + ui::red_bold("✗") + "  " + ui::dim("index hash check failed: " + hash_fail))
+                err_count += 1
+            else is
+                let fname: string = url_to_cache_name(info.url)
+                let dest: string = compat::path_join(lists_dir(), fname + ".pkgs")
+                let txt: string = work + "/i-" + to_string(x) + ".txt"
+                let tmp_dest: string = dest + ".tmp"
+                if !sys_ok("{ printf '# hammer-base-uri: %s\\n' " + shq(info.base_uri) + "; cat -- " + shq(txt) + "; } > " +
+                           shq(tmp_dest) + " && mv -f -- " + shq(tmp_dest) + " " + shq(dest)) is
+                    lines.push("  " + ui::bold(ui::pad(label, 42)) + "  " + ui::red_bold("✗") + "  " + ui::dim("Cannot write " + dest))
+                    err_count += 1
+                else is
+                    let count: int = int_of(proc::shell("grep -c '^Package:' " + shq(txt) + " 2>/dev/null"), 0)
+                    total_pkgs += count
+                    let sig_icon: string = if gpg_ok then "🔒" else ui::yellow("⚠")
+                    let sha_note: string = if sha256_ok then "" else " ⚠sha256"
+                    let nosig: string = if !gpg_ok then ui::yellow("(no signature)") else ""
+                    lines.push("  " + ui::bold(ui::pad(label, 42)) + "  " + sig_icon + "  " + ui::cyan(to_string(count)) +
+                        " packages" + sha_note + "  " + nosig)
+                    if !gpg_ok is gpg_failed += 1 end
+                    ok_count += 1
+                end
+            end
+        end
+        x += 1
+    end
+    system("rm -rf -- " + shq(work))
+
+    ;; ── wynik ────────────────────────────────────────────────────────────
+    let mut li2: int = 0
+    while li2 < lines.len() is
+        write(lines[li2])
+        li2 += 1
+    end
+    let summary: string = "Synced " + ui::bright_green_bold(to_string(ok_count) + " source" + plural(ok_count)) +
+        (if err_count > 0 then ui::red(", " + to_string(err_count) + " failed") else "") +
+        (if gpg_failed > 0 then ui::yellow(", " + to_string(gpg_failed) + " unverified") else "") +
+        " — " + ui::cyan_bold(to_string(total_pkgs)) + " packages indexed."
+    write("  " + ui::cyan_bold("hammer sync") + "  " + summary)
+
+    if gpg_failed > 0 is
+        write("")
+        write("  " + ui::yellow_bold("!") + " " + ui::yellow_bold(to_string(gpg_failed)) + " source(s) could not be verified by GPG.")
+        write("  Add trusted keys with: " + ui::cyan("hammer key add <url>"))
+    end
+
+    ;; Znacznik zaufania: tylko gdy KAZDE zrodlo zweryfikowano w tej synchronizacji.
+    let marker: string = compat::path_join(download::dl_dir(), ".gpg-verified")
+    if gpg_failed == 0 && ok_count > 0 is
+        fs::mkdir(download::dl_dir())
+        fs::write(marker, str::trim(proc::shell("date -u +%Y-%m-%dT%H:%M:%SZ")))
+    else is
+        if fs::exists(marker) is fs::remove(marker) end
+    end
+    return ""
+end
+
+;; Odpowiednik `sync_all()`. "" = Ok.
+pub fn sync_all() -> string is
+    let lr: repo::RepoLoad = repo::load()
+    if lr.err != "" is return lr.err end
+    return cache_update(lr.list, download::client_new())
+end
