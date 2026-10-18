@@ -1,0 +1,1034 @@
+use "std -> fs"          from "fs"
+use "std -> strings"     from "str"
+use "std -> process"     from "proc"
+use "std -> fmt"         from "fmt"
+use "std -> collections" from "col"
+use "std -> conv"        from "conv"
+
+mod internal
+mod package
+mod cache
+mod db
+mod multi_arch
+mod pins
+mod ui
+;; [mod profile pominiete: source-code/system/profile.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania profile::fn dzialaja bez zmian]
+mod conffiles
+;; [mod json_output pominiete: source-code/ui/json_output.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez ui/mod.h# — wywolania json_output::fn dzialaja bez zmian]
+;; [mod version pominiete: source-code/pkg/solver/version.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania version::fn dzialaja bez zmian]
+mod store
+mod tools
+;; [mod download pominiete: source-code/ui/download.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez ui/mod.h# — wywolania download::fn dzialaja bez zmian]
+
+;; hammer -> pkg::query
+;;
+;; Port of source-code/pkg/query.rs (Rust) to H#: komendy odczytu —
+;; why, why-not, show-deps, files, owns, changelog, stats, show, depends,
+;; rdepends, which, policy.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `anyhow::Result<()>` -> `string` ("" = OK, inaczej tresc bledu).
+;; 2. `walkdir` -> `find` (jedno wywolanie na pakiet). `cmd_files` sortuje
+;;    wyjscie `sort` w locale C (Rust: `sort_by_file_name` sortuje rodzenstwo
+;;    w kazdym katalogu — dla zwyklych nazw wynik jest ten sam; roznia sie
+;;    tylko nazwy zawierajace znaki mniejsze niz `/`, np. `-`).
+;; 3. `cmd_changelog` (async, `HttpClient`) -> `curl`; URL z indeksu Sources
+;;    (`build_dep::sources_find_for_binary`), a gdy go brak — heurystyczny.
+;; 4. `cmd_show(args, flags)` -> `cmd_show(args, json)`: z `GlobalFlags` uzywane
+;;    jest tylko `json`.
+;; 5. `HashMap`/`HashSet`/`VecDeque` -> mapy `std -> collections` (tylko
+;;    LLVM) + tablice z indeksem glowy.
+;; 6. `cmd_which`: `read_dir` + `read_to_string` kazdego `.list` -> jedno
+;;    `grep -lxF`. Rust bral PIERWSZY plik w kolejnosci `read_dir` (losowej);
+;;    tu pierwszy w kolejnosci alfabetycznej.
+;; 7. `{:<22}` -> `fmt::pad_right` na tekscie BEZ kolorow (kolumny rowne).
+;; 8. ZACHOWANE: `cmd_show` pokazuje `SHA256` jako pierwsze 16 znakow + `…`
+;;    (panika w Rust, gdy skrot krotszy niz 16 znakow; tu `slice` ucina).
+;; 9. ZACHOWANE: `cmd_owns` uznaje trafienie, gdy sciezka pakietu ZAWIERA
+;;    podany tekst (nie tylko rowna sie) — `hammer owns bin` zwroci kazdy
+;;    plik z `bin` w sciezce.
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn append_str(a: [string], x: string) -> [string] is
+    let mut o: [string] = a
+    o.push(x)
+    return o
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+fn rule(n: int) -> string is
+    return "  " + ui::dim(str::repeat("─", n))
+end
+
+fn header(title: string) is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  " + title)
+end
+
+fn constraint_text(alt: package::DepAlternative) -> string is
+    if alt.constraint == nil is return "" end
+    let c: package::VersionConstraint = alt.constraint
+    return " (" + package::op_to_str(c.op) + " " + c.version + ")"
+end
+
+pub struct StrList is
+    pub items: [string]
+end
+
+fn append_list(a: [StrList], x: StrList) -> [StrList] is
+    let mut o: [StrList] = a
+    o.push(x)
+    return o
+end
+
+fn line_list(text: string) -> [string] is
+    let mut out: [string] = []
+    let lines: [string] = str::split(text, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i] != "" is out.push(lines[i]) end
+        i += 1
+    end
+    return out
+end
+
+fn is_user(idb: db::InstalledDb, name: string) -> bool is
+    let io: db::InstalledPackage? = idb.get(name)
+    if io == nil is return false end
+    let p: db::InstalledPackage = io
+    return db::reason_to_str(p.reason) == "user"
+end
+
+;; ── hammer why <pkg> ─────────────────────────────────────────────────────
+
+;; Lancuchy (maks. 5) od pakietu uzytkownika do `target`, odwrocone tak, ze
+;; pierwszy element to pakiet uzytkownika.
+fn find_install_chains(target: string, idb: db::InstalledDb, all: [db::InstalledPackage]) -> [StrList] is
+    ;; rdeps: nazwa zaleznosci -> indeks listy pakietow, ktore od niej zaleza
+    let rd_idx: any = col::hashmap_new()
+    let mut rd_lists: [StrList] = []
+    let mut i: int = 0
+    while i < all.len() is
+        let inst: db::InstalledPackage = all[i]
+        if inst.depends != nil is
+            let dep_str: string = inst.depends
+            let groups: [package::DepGroup] = package::parse_dep_field(dep_str)
+            let mut gi: int = 0
+            while gi < groups.len() is
+                let alts: [package::DepAlternative] = groups[gi].alternatives
+                let mut ai: int = 0
+                while ai < alts.len() is
+                    let key: string = alts[ai].name
+                    if col::hashmap_contains(rd_idx, key) is
+                        let k: int = conv::str_to_int(col::hashmap_get(rd_idx, key))
+                        rd_lists[k] = StrList { items: append_str(rd_lists[k].items, inst.name) }
+                    else is
+                        col::hashmap_insert(rd_idx, key, to_string(rd_lists.len()))
+                        let first: [string] = [inst.name]
+                        rd_lists = append_list(rd_lists, StrList { items: first })
+                    end
+                    ai += 1
+                end
+                gi += 1
+            end
+        end
+        i += 1
+    end
+
+    let mut chains: [StrList] = []
+    let start: [string] = [target]
+    let mut queue: [StrList] = [StrList { items: start }]
+    let visited: any = col::hashmap_new()
+    col::hashmap_insert(visited, target, "1")
+    let mut head: int = 0
+
+    while head < queue.len() && chains.len() < 5 is
+        let chain: [string] = queue[head].items
+        head += 1
+        let last: string = chain[chain.len() - 1]
+
+        if is_user(idb, last) && last != target is
+            chains = append_list(chains, StrList { items: chain })
+        elsif col::hashmap_contains(rd_idx, last) is
+            let deps: [string] = rd_lists[conv::str_to_int(col::hashmap_get(rd_idx, last))].items
+            let mut k: int = 0
+            while k < deps.len() is
+                if !col::hashmap_contains(visited, deps[k]) is
+                    col::hashmap_insert(visited, deps[k], "1")
+                    queue = append_list(queue, StrList { items: append_str(chain, deps[k]) })
+                end
+                k += 1
+            end
+        end
+    end
+
+    ;; odwroc kazdy lancuch
+    let mut out: [StrList] = []
+    let mut c: int = 0
+    while c < chains.len() is
+        let mut rev: [string] = []
+        let mut j: int = chains[c].items.len() - 1
+        while j >= 0 is
+            rev.push(chains[c].items[j])
+            j -= 1
+        end
+        out = append_list(out, StrList { items: rev })
+        c += 1
+    end
+    return out
+end
+
+pub fn cmd_why(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer why <package>" end
+    let name: string = args[0]
+    let idb: db::InstalledDb = db::InstalledDb::open()
+
+    if !idb.is_installed(name) is
+        write("  " + ui::dim("·") + " Package '" + ui::bold(name) + "' is not installed.")
+        return ""
+    end
+    if is_user(idb, name) is
+        write("  " + ui::bright_green("✔") + " " + ui::bold(name) + " was explicitly installed by the user.")
+        return ""
+    end
+
+    let all: [db::InstalledPackage] = idb.list_all()
+    header("Why is " + ui::bold(name) + " installed?")
+    write(rule(60))
+
+    let chains: [StrList] = find_install_chains(name, idb, all)
+    if chains.len() == 0 is
+        write("  " + ui::dim("·") + " No dependency chain found — may be a manually imported package.")
+    else is
+        let mut ci: int = 0
+        while ci < chains.len() is
+            let chain: [string] = chains[ci].items
+            let mut parts: [string] = []
+            let mut k: int = 0
+            while k < chain.len() is
+                let n: string = chain[k]
+                if is_user(idb, n) is
+                    parts.push(ui::bright_green_bold(n))
+                elsif n == name is
+                    parts.push(ui::cyan_bold(n))
+                else is
+                    parts.push(ui::bold(n))
+                end
+                k += 1
+            end
+            write("  " + str::join(parts, " " + ui::dim("→") + " "))
+            write("")
+            ci += 1
+        end
+    end
+    write("")
+    return ""
+end
+
+;; ── hammer why-not <pkg> ─────────────────────────────────────────────────
+
+pub fn cmd_why_not(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer why-not <package>" end
+    let name: string = args[0]
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+    let arch: string = cache::detect_arch()
+
+    header("Why can't '" + ui::bold(name) + "' be installed?")
+    write(rule(65))
+
+    let po: package::Package? = cache::cache_get(c, name)
+    if po == nil is
+        write("  " + ui::red_bold("✗") + " Package '" + ui::bold(name) + "' not found in any repository.")
+        write("  Run " + ui::cyan("hammer sync") + " to refresh.")
+        return ""
+    end
+    if idb.is_installed(name) is
+        let io: db::InstalledPackage? = idb.get(name)
+        let mut v: string = ""
+        if io != nil is
+            let inst: db::InstalledPackage = io
+            v = inst.version
+        end
+        write("  " + ui::bright_green("✔") + " '" + ui::bold(name) + "' IS installed (version " + ui::cyan(v) + ").")
+        return ""
+    end
+
+    let pkg: package::Package = po
+    let mut reasons: [string] = []
+
+    if pkg.architecture != "all" && pkg.architecture != "any" && pkg.architecture != "" && pkg.architecture != arch is
+        reasons.push("Architecture mismatch: package is '" + ui::yellow(pkg.architecture) + "' but system is '" + ui::cyan(arch) + "'")
+    end
+
+    let pdb: pins::PinDb = pins::pindb_load()
+    if pins::pindb_is_forbidden(pdb, name, pkg.version) is
+        reasons.push("Pinned with priority < 0 (forbidden). See: " + ui::cyan("hammer pin list"))
+    end
+
+    if pkg.depends != nil is
+        let dep_str: string = pkg.depends
+        let groups: [package::DepGroup] = package::parse_dep_field(dep_str)
+        let mut gi: int = 0
+        while gi < groups.len() is
+            let alts: [package::DepAlternative] = groups[gi].alternatives
+            let mut sat_ok: bool = false
+            let mut names: [string] = []
+            let mut ai: int = 0
+            while ai < alts.len() is
+                names.push(alts[ai].name)
+                if cache::cache_get(c, alts[ai].name) != nil is sat_ok = true end
+                ai += 1
+            end
+            if !sat_ok is
+                reasons.push("Dependency not available in repo: " + ui::yellow(str::join(names, " | ")))
+            end
+            gi += 1
+        end
+    end
+
+    if pkg.conflicts != nil is
+        let c_str: string = pkg.conflicts
+        let cgroups: [package::DepGroup] = package::parse_dep_field(c_str)
+        let mut cg: int = 0
+        while cg < cgroups.len() is
+            let calts: [package::DepAlternative] = cgroups[cg].alternatives
+            let mut ca: int = 0
+            while ca < calts.len() is
+                let io2: db::InstalledPackage? = idb.get(calts[ca].name)
+                if io2 != nil is
+                    let inst2: db::InstalledPackage = io2
+                    let mut applies: bool = true
+                    if calts[ca].constraint != nil is
+                        let cc: package::VersionConstraint = calts[ca].constraint
+                        applies = version::satisfies(inst2.version, package::op_to_str(cc.op), cc.version)
+                    end
+                    if applies is
+                        reasons.push("Conflicts with installed '" + ui::red_bold(inst2.name) + "' " + ui::dim(inst2.version))
+                    end
+                end
+                ca += 1
+            end
+            cg += 1
+        end
+    end
+
+    ;; Breaks: deklaruje go dostepny `Package` zainstalowanego pakietu
+    let installed: [db::InstalledPackage] = idb.list_all()
+    let mut ii: int = 0
+    while ii < installed.len() is
+        let inst: db::InstalledPackage = installed[ii]
+        let ipo: package::Package? = cache::cache_get(c, inst.name)
+        if ipo != nil is
+            let ip: package::Package = ipo
+            if ip.breaks != nil is
+                let b_str: string = ip.breaks
+                let bgroups: [package::DepGroup] = package::parse_dep_field(b_str)
+                let mut bg: int = 0
+                while bg < bgroups.len() is
+                    let balts: [package::DepAlternative] = bgroups[bg].alternatives
+                    let mut ba: int = 0
+                    while ba < balts.len() is
+                        if balts[ba].name == name is
+                            let mut breaks_it: bool = true
+                            if balts[ba].constraint != nil is
+                                let bc: package::VersionConstraint = balts[ba].constraint
+                                breaks_it = version::satisfies(pkg.version, package::op_to_str(bc.op), bc.version)
+                            end
+                            if breaks_it is
+                                reasons.push("Installed '" + ui::red_bold(inst.name) + "' " + ui::dim(inst.version) + " has Breaks: " + ui::yellow(name))
+                            end
+                        end
+                        ba += 1
+                    end
+                    bg += 1
+                end
+            end
+        end
+        ii += 1
+    end
+
+    if reasons.len() == 0 is
+        write("  " + ui::dim("·") + " No obvious reason found. Try: " + ui::cyan("hammer install --dry-run"))
+        write("  Run " + ui::cyan("hammer sync") + " first if the package was just added.")
+    else is
+        let mut r: int = 0
+        while r < reasons.len() is
+            write("  " + ui::red_bold("✗") + " " + reasons[r])
+            r += 1
+        end
+    end
+    write("")
+    return ""
+end
+
+;; ── hammer show-deps <pkg>[:arch] [--depth=N] ────────────────────────────
+
+fn parse_depth(args: [string]) -> int is
+    let mut i: int = 0
+    while i < args.len() is
+        if str::slice(args[i], 0, 8) == "--depth=" is
+            let v: string = str::slice(args[i], 8, string_len(args[i]))
+            if str::is_numeric(v) is return conv::str_to_int(v) end
+            return 3
+        end
+        i += 1
+    end
+    return 3
+end
+
+;; Jedna linia drzewa + rekurencja po zaleznosciach (seen: wspoldzielona mapa).
+fn print_dep_tree(name: string, ver: string, req_arch: string, idb: db::InstalledDb, c: cache::PackageCache,
+        ma: multi_arch::MultiArchDb, prefix: string, last: bool, depth: int, max_depth: int, seen: any) is
+    let connector: string = if last then "└─" else "├─"
+    let installed: bool = idb.is_installed(name)
+    let pkg_opt: package::Package? = cache::cache_get(c, name)
+    let in_cache: bool = pkg_opt != nil
+
+    let mut pkg_arch: string = ""
+    if pkg_opt != nil is
+        let pa: package::Package = pkg_opt
+        pkg_arch = pa.architecture
+    end
+    let is_foreign: bool = pkg_arch != "all" && pkg_arch != "" && pkg_arch != req_arch && multi_arch::supports_arch(ma, pkg_arch)
+
+    let marker: string = if is_foreign then ui::c("35", "◆") elsif installed then ui::bright_green("●") elsif in_cache then ui::cyan("○") else ui::red("✗")
+    let key: string = name + ":" + req_arch
+    let repeated: bool = col::hashmap_contains(seen, key)
+    let ver_str: string = if ver == "" then "" else " " + ui::dim(ver)
+    let cycle: string = if repeated then " " + ui::dim("(*)") else ""
+    let arch_tag: string = if is_foreign then " " + ui::c("35", "[" + pkg_arch + "]") else ""
+
+    write("  " + prefix + connector + " " + marker + " " + ui::bold(name) + ver_str + arch_tag + cycle)
+
+    if depth >= max_depth || repeated is return end
+    col::hashmap_insert(seen, key, "1")
+    if pkg_opt == nil is return end
+    let pkg: package::Package = pkg_opt
+
+    let child_prefix: string = prefix + (if last then " " else "│") + "  "
+
+    ;; dla kazdej grupy: pierwsza alternatywa o osiagalnej architekturze
+    let mut dep_names: [string] = []
+    let mut dep_vers: [string] = []
+    if pkg.depends != nil is
+        let d: string = pkg.depends
+        let groups: [package::DepGroup] = package::parse_dep_field(d)
+        let mut gi: int = 0
+        while gi < groups.len() is
+            let alts: [package::DepAlternative] = groups[gi].alternatives
+            let mut chosen: bool = false
+            let mut ai: int = 0
+            while ai < alts.len() && !chosen is
+                let cand: package::Package? = cache::cache_get(c, alts[ai].name)
+                if cand != nil is
+                    let cp: package::Package = cand
+                    let arch_ok: bool = cp.architecture == "all" || cp.architecture == req_arch || multi_arch::supports_arch(ma, cp.architecture)
+                    if arch_ok is
+                        dep_names.push(alts[ai].name)
+                        dep_vers.push(cp.version)
+                        chosen = true
+                    end
+                end
+                ai += 1
+            end
+            if !chosen && alts.len() > 0 is
+                dep_names.push(alts[0].name)
+                dep_vers.push("")
+            end
+            gi += 1
+        end
+    end
+
+    let mut k: int = 0
+    while k < dep_names.len() is
+        print_dep_tree(dep_names[k], dep_vers[k], req_arch, idb, c, ma, child_prefix, k == dep_names.len() - 1, depth + 1, max_depth, seen)
+        k += 1
+    end
+end
+
+pub fn cmd_show_deps(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer show-deps <package>[:arch]" end
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+    let ma: multi_arch::MultiArchDb = multi_arch::multi_arch_db_load()
+    let depth: int = parse_depth(args)
+
+    let spec: multi_arch::PkgSpec = multi_arch::parse_pkg_spec(args[0])
+    let name: string = spec.name
+    let sys_arch: string = cache::detect_arch()
+    let req_arch: string = if spec.arch == nil then sys_arch else spec.arch
+
+    let po: package::Package? = cache::cache_get(c, name)
+    if po == nil is return "Package '" + name + "' not found." end
+    let pkg: package::Package = po
+
+    header("Dependencies of " + ui::bold(name) + (if req_arch != sys_arch then ui::dim(":" + req_arch) else ""))
+    write(rule(65))
+
+    let seen: any = col::hashmap_new()
+    print_dep_tree(name, pkg.version, req_arch, idb, c, ma, "", true, 0, depth, seen)
+    write("")
+    write("  Legend: " + ui::bright_green("●") + " installed  " + ui::cyan("○") + " available  " + ui::red("✗") + " missing  " + ui::c("35", "◆") + " foreign-arch")
+    return ""
+end
+
+;; ── hammer files <pkg> ───────────────────────────────────────────────────
+
+fn store_path_of(inst: db::InstalledPackage) -> string is
+    return compat::path_join(build_mode::store_dir(), inst.name + "-" + inst.version + "-" + inst.store_hash)
+end
+
+pub fn cmd_files(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer files <package>" end
+    let name: string = args[0]
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let io: db::InstalledPackage? = idb.get(name)
+    if io == nil is return "Package '" + name + "' is not installed." end
+    let inst: db::InstalledPackage = io
+
+    let store_path: string = store_path_of(inst)
+    if !fs::exists(store_path) is
+        return "Store entry missing for " + name + " — run `hammer verify " + name + "`"
+    end
+
+    header("Files installed by " + ui::bold(name) + " " + ui::dim(inst.version))
+    write(rule(65))
+
+    ;; typ, sciezka wzgledna, cel dowiazania (tab-rozdzielone)
+    let out: string = proc::shell("cd " + shq(store_path) + " && LC_ALL=C find . -mindepth 1 -printf '%y\\t%P\\t%l\\n' 2>/dev/null | LC_ALL=C sort -t '\t' -k2,2")
+    let lines: [string] = line_list(out)
+    let mut count: int = 0
+    let mut i: int = 0
+    while i < lines.len() is
+        let parts: [string] = str::split(lines[i], "\t")
+        if parts.len() >= 2 && parts[1] != "" is
+            let ftype: string = if parts[0] == "d" then ui::dim("d") elsif parts[0] == "l" then ui::cyan("l") else "-"
+            let target: string = if parts[0] == "l" && parts.len() >= 3 then " → " + ui::dim(parts[2]) else ""
+            write("  " + ftype + " " + ui::bold("/" + parts[1]) + target)
+            count += 1
+        end
+        i += 1
+    end
+    write("")
+    write("  " + ui::cyan(to_string(count)) + " file(s) total.")
+    return ""
+end
+
+;; ── hammer owns <path> ───────────────────────────────────────────────────
+
+pub fn cmd_owns(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer owns <path>" end
+    let path_str: string = args[0]
+    let idb: db::InstalledDb = db::InstalledDb::open()
+
+    header("Who owns " + ui::bold(path_str) + "?")
+    write(rule(65))
+
+    ;; `trim_start_matches('/')`
+    let mut a: int = 0
+    while a < string_len(path_str) && string_at(path_str, a) == "/" is
+        a += 1
+    end
+    let needle: string = str::slice(path_str, a, string_len(path_str))
+
+    let all: [db::InstalledPackage] = idb.list_all()
+    let mut found_pkg: [string] = []
+    let mut found_ver: [string] = []
+    let mut found_path: [string] = []
+    let mut i: int = 0
+    while i < all.len() is
+        let inst: db::InstalledPackage = all[i]
+        let sp: string = store_path_of(inst)
+        if fs::exists(sp) is
+            let out: string = proc::shell("cd " + shq(sp) + " && find . -mindepth 1 -printf '%P\\n' 2>/dev/null")
+            let rels: [string] = line_list(out)
+            let mut k: int = 0
+            while k < rels.len() is
+                let installed_path: string = "/" + rels[k]
+                if installed_path == path_str || compat::str_index_of(rels[k], needle) >= 0 is
+                    found_pkg.push(inst.name)
+                    found_ver.push(inst.version)
+                    found_path.push(installed_path)
+                end
+                k += 1
+            end
+        end
+        i += 1
+    end
+
+    if found_pkg.len() == 0 is
+        write("  " + ui::dim("·") + " No installed package owns '" + ui::bold(path_str) + "'.")
+        write("  Run " + ui::cyan("hammer search") + " to check if it belongs to an available package.")
+    else is
+        let mut f: int = 0
+        while f < found_pkg.len() is
+            write("  " + ui::bright_green("●") + " " + ui::bold(found_path[f]) + ": " + ui::cyan_bold(found_pkg[f]) + " " + ui::dim(found_ver[f]))
+            f += 1
+        end
+    end
+    write("")
+    return ""
+end
+
+;; ── hammer changelog <pkg> ───────────────────────────────────────────────
+
+fn changelog_url_heuristic(name: string, ver: string, base_uri: string) -> string is
+    let mut pool_prefix: string = if string_len(name) > 0 then str::slice(name, 0, 1) else "a"
+    if string_starts_with(name, "lib") is
+        pool_prefix = "lib" + (if string_len(name) > 3 then str::slice(name, 3, 4) else "a")
+    end
+    if compat::str_index_of(base_uri, "debian.org") >= 0 is
+        return "https://metadata.ftp-master.debian.org/changelogs/pool/main/" + pool_prefix + "/" + name + "/" + name + "_changelog"
+    end
+    if compat::str_index_of(base_uri, "ubuntu.com") >= 0 is
+        return "https://changelogs.ubuntu.com/changelogs/pool/main/" + pool_prefix + "/" + name + "/" + name + "-" + ver
+    end
+    let mut b: int = string_len(base_uri)
+    while b > 0 && string_at(base_uri, b - 1) == "/" is
+        b -= 1
+    end
+    return str::slice(base_uri, 0, b) + "/pool/main/" + pool_prefix + "/" + name + "/" + name + "_changelog"
+end
+
+pub fn cmd_changelog(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer changelog <package>" end
+    let name: string = args[0]
+    let c: cache::PackageCache = cache::cache_load()
+    let po: package::Package? = cache::cache_get(c, name)
+    if po == nil is return "Package '" + name + "' not found. Run `hammer sync`." end
+    let pkg: package::Package = po
+
+    header("Changelog for " + ui::bold(name) + " " + ui::dim(pkg.version))
+    write(rule(65))
+
+    let base: string = if pkg.repo_base_uri == nil then "" else pkg.repo_base_uri
+    ;; indeks Sources (build_dep) -> URL z `Directory:`; inaczej heurystyka
+    let fr: build_dep::FetchResult = build_dep::sources_load_or_fetch()
+    let mut url: string = changelog_url_heuristic(name, pkg.version, base)
+    if fr.err == "" is
+        let at: int = build_dep::sources_find_for_binary(fr.idx, name)
+        if at >= 0 is url = build_dep::source_changelog_url(fr.idx.sources[at]) end
+    end
+
+    let content: string = proc::shell("curl -fsSL --max-time 20 " + shq(url) + " 2>/dev/null")
+    if content == "" is
+        write("  " + ui::yellow("·") + " Could not fetch changelog from " + ui::dim(url))
+        write("  Try: " + ui::cyan("https://packages.debian.org/changelog:" + name))
+        return ""
+    end
+    let lines: [string] = str::split(content, "\n")
+    let mut i: int = 0
+    while i < lines.len() && i < 60 is
+        let line: string = lines[i]
+        if string_starts_with(line, name) is
+            write("  " + ui::bright_cyan(line))
+        elsif string_starts_with(line, " --") is
+            write("  " + ui::dim(line))
+        elsif string_starts_with(line, "  *") || string_starts_with(line, "  -") is
+            write("  " + line)
+        else is
+            write("  " + ui::dim(line))
+        end
+        i += 1
+    end
+    write("")
+    write("  Full changelog: " + ui::cyan(url))
+    return ""
+end
+
+;; ── hammer stats ─────────────────────────────────────────────────────────
+
+fn dir_size_bytes(p: string) -> int is
+    if !fs::exists(p) is return 0 end
+    let out: string = str::trim(proc::shell("find " + shq(p) + " -type f -printf '%s\\n' 2>/dev/null | awk '{{s+=$1}} END{{print s+0}}'"))
+    if str::is_numeric(out) is return conv::str_to_int(out) end
+    return 0
+end
+
+fn dir_size_human(p: string) -> string is
+    return ui::human_size(dir_size_bytes(p))
+end
+
+fn label(s: string) -> string is
+    return ui::bold(fmt::pad_right(s, 30))
+end
+
+pub fn cmd_stats() -> string is
+    header("hammer store statistics")
+    write(rule(65))
+
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let all: [db::InstalledPackage] = idb.list_all()
+    let total: int = all.len()
+    let mut user: int = 0
+    let mut i: int = 0
+    while i < total is
+        if db::reason_to_str(all[i].reason) == "user" is user += 1 end
+        i += 1
+    end
+
+    write("  " + label("Installed packages:") + " " + ui::cyan_bold(to_string(total)))
+    write("  " + label("  User-installed:") + " " + ui::cyan(to_string(user)))
+    write("  " + label("  Auto-dependencies:") + " " + ui::dim(to_string(total - user)))
+
+    let sdir: string = build_mode::store_dir()
+    let store_count: int = if fs::is_dir(sdir) then fs::list_dir(sdir).len() else 0
+    write("")
+    write("  " + label("Store entries:") + " " + ui::cyan(to_string(store_count)))
+    write("  " + label("Store size:") + " " + ui::cyan(dir_size_human(sdir)))
+
+    let loaded: profile::LoadResult = profile::db_load()
+    if loaded.err == "" is
+        let gdb: profile::GenerationsDb = loaded.db
+        let gen_count: int = gdb.generations.len()
+        write("")
+        write("  " + label("Generations:") + " " + ui::cyan(to_string(gen_count)))
+        write("  " + label("Current:") + " gen-" + ui::bright_green(to_string(gdb.current)))
+        write("  " + label("Profiles dir size:") + " " + ui::cyan(dir_size_human(build_mode::profiles_dir())))
+
+        if gen_count > 0 is
+            write("")
+            write("  " + ui::bold(fmt::pad_right("Gen", 8)) + " " + ui::bold(fmt::pad_right("Date", 22)) + " " + ui::bold(fmt::pad_right("Pkgs", 8)))
+            ;; 5 najnowszych (malejaco po numerze)
+            let mut used: [int] = []
+            let mut shown: int = 0
+            while shown < 5 && shown < gen_count is
+                let mut best: int = -1
+                let mut bi: int = -1
+                let mut g: int = 0
+                while g < gen_count is
+                    let num: int = gdb.generations[g].number
+                    let mut taken: bool = false
+                    let mut u: int = 0
+                    while u < used.len() is
+                        if used[u] == g is taken = true end
+                        u += 1
+                    end
+                    if !taken && (bi < 0 || num > best) is
+                        best = num
+                        bi = g
+                    end
+                    g += 1
+                end
+                used.push(bi)
+                let gen: profile::Generation = gdb.generations[bi]
+                let active: string = if gen.number == gdb.current then " ← active" else ""
+                let mut pending: string = ""
+                if gdb.pending != nil && gdb.pending == gen.number is pending = " ← pending" end
+                write("  " + ui::dim(fmt::pad_right("gen-" + to_string(gen.number), 8)) + " " + ui::dim(fmt::pad_right(ui::format_ts(gen.timestamp), 22)) + " " + ui::cyan(fmt::pad_right(to_string(gen.packages.len()), 8)) + ui::bright_green(active) + ui::yellow(pending))
+                shown += 1
+            end
+            if gen_count > 5 is
+                write("  … and " + to_string(gen_count - 5) + " more. See: " + ui::cyan("hammer gen list"))
+            end
+        end
+    end
+
+    let modified: int = conffiles::all_modified().len()
+    if modified > 0 is
+        write("")
+        write("  " + label("Modified conffiles:") + " " + ui::yellow_bold(to_string(modified)) + " " + ui::dim("(see `hammer etc diff`)"))
+    end
+
+    write("")
+    write("  " + label("Download cache:") + " " + ui::dim(dir_size_human(download::dl_dir())))
+    write("  Clean with: " + ui::cyan("hammer clean"))
+    write("")
+    return ""
+end
+
+;; ── hammer show <pkg> [--verbose] [--json] ───────────────────────────────
+
+fn row(lbl: string, val: string) is
+    write("  " + ui::bold(fmt::pad_right(lbl + ":", 22)) + " " + val)
+end
+
+fn dep_parts(s: string, idb: db::InstalledDb) -> string is
+    let groups: [package::DepGroup] = package::parse_dep_field(s)
+    let mut parts: [string] = []
+    let mut gi: int = 0
+    while gi < groups.len() is
+        let alts: [package::DepAlternative] = groups[gi].alternatives
+        let mut rendered: [string] = []
+        let mut ai: int = 0
+        while ai < alts.len() is
+            let vc: string = ui::dim(constraint_text(alts[ai]))
+            if idb.is_installed(alts[ai].name) is
+                rendered.push(ui::bright_green(alts[ai].name) + vc)
+            else is
+                rendered.push(alts[ai].name + vc)
+            end
+            ai += 1
+        end
+        parts.push(str::join(rendered, " | "))
+        gi += 1
+    end
+    return str::join(parts, ", ")
+end
+
+pub fn cmd_show(args: [string], json: bool) -> string is
+    if args.len() == 0 is return "Usage: hammer show <package> [--verbose] [--json]" end
+    let name: string = args[0]
+    let verbose: bool = contains_str(args, "--verbose") || contains_str(args, "-v")
+    let c: cache::PackageCache = cache::cache_load()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let po: package::Package? = cache::cache_get(c, name)
+    if po == nil is return "Package '" + name + "' not found in cache. Run: hammer sync" end
+    let pkg: package::Package = po
+    let inst: db::InstalledPackage? = idb.get(name)
+
+    if json is
+        json_output::print_package_json(pkg, inst)
+        return ""
+    end
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  " + ui::bold(pkg.name) + " " + ui::bright_white(pkg.version) + "  [" + ui::dim(pkg.architecture) + "]")
+    write(rule(70))
+
+    if inst != nil is
+        let i: db::InstalledPackage = inst
+        if i.version == pkg.version is
+            write("  " + ui::bold(fmt::pad_right("Status:", 22)) + " " + ui::bright_green("installed") + " (" + ui::dim(str::slice(i.installed_at, 0, 10)) + ")")
+        else is
+            write("  " + ui::bold(fmt::pad_right("Status:", 22)) + " " + ui::bright_green("installed") + " " + ui::dim(i.version) + " → " + ui::bright_yellow(pkg.version) + " available")
+        end
+        if db::reason_to_str(i.reason) == "user" is
+            write("  " + ui::bold(fmt::pad_right("Install reason:", 22)) + " explicit")
+        else is
+            write("  " + ui::bold(fmt::pad_right("Install reason:", 22)) + " " + ui::dim("dependency"))
+        end
+    else is
+        write("  " + ui::bold(fmt::pad_right("Status:", 22)) + " " + ui::dim("not installed"))
+    end
+
+    write("")
+    if pkg.description_short != nil is
+        let s: string = pkg.description_short
+        write("  " + ui::bold(s))
+    end
+    if verbose && pkg.description_long != nil is
+        let l: string = pkg.description_long
+        let ls: [string] = str::split(l, "\n")
+        let mut k: int = 0
+        while k < ls.len() is
+            write("  " + ls[k])
+            k += 1
+        end
+    end
+
+    write("")
+    write(rule(70))
+
+    if pkg.maintainer != nil is
+        let m: string = pkg.maintainer
+        row("Maintainer", m)
+    end
+    if pkg.homepage != nil is
+        let h: string = pkg.homepage
+        row("Homepage", h)
+    end
+    if pkg.section != nil is
+        let sc: string = pkg.section
+        row("Section", sc)
+    end
+    if pkg.priority != nil is
+        let pr: string = pkg.priority
+        row("Priority", pr)
+    end
+    if pkg.installed_size_kb != nil is
+        let sz: int = pkg.installed_size_kb
+        row("Installed size", ui::human_size(sz * 1024))
+    end
+    if pkg.download_size != nil is
+        let dz: int = pkg.download_size
+        row("Download size", ui::human_size(dz))
+    end
+    if pkg.filename != nil is
+        let f: string = pkg.filename
+        row("Filename", f)
+    end
+    if pkg.sha256 != nil is
+        let sh: string = pkg.sha256
+        row("SHA256", str::slice(sh, 0, 16) + "…")
+    end
+
+    write("")
+    let labels: [string] = ["Pre-Depends", "Depends", "Recommends", "Suggests", "Conflicts", "Breaks", "Provides", "Replaces", "Enhances"]
+    let values: [string?] = [pkg.pre_depends, pkg.depends, pkg.recommends, pkg.suggests, pkg.conflicts, pkg.breaks, pkg.provides, pkg.replaces, pkg.enhances]
+    let mut li: int = 0
+    while li < labels.len() is
+        if values[li] != nil is
+            let v: string = values[li]
+            let lb: string = labels[li]
+            if verbose || lb == "Pre-Depends" || lb == "Depends" || lb == "Conflicts" || lb == "Breaks" is
+                write("  " + ui::bold(fmt::pad_right(lb + ":", 22)) + " " + dep_parts(v, idb))
+            end
+        end
+        li += 1
+    end
+
+    write("")
+    if inst != nil is
+        write("  " + ui::bold("Files:") + " " + ui::cyan("hammer files " + pkg.name))
+        write("  " + ui::bold("Changelog:") + " " + ui::cyan("hammer changelog " + pkg.name))
+        write("  " + ui::bold("Reverse deps:") + " " + ui::cyan("hammer rdepends " + pkg.name))
+    else is
+        write("  " + ui::bold("Install:") + " " + ui::cyan("hammer install " + pkg.name))
+    end
+    write("")
+    return ""
+end
+
+;; ── hammer depends / rdepends ────────────────────────────────────────────
+
+pub fn cmd_depends(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer depends <package>" end
+    let name: string = args[0]
+    let c: cache::PackageCache = cache::cache_load()
+    let po: package::Package? = cache::cache_get(c, name)
+    if po == nil is return "Package '" + name + "' not found." end
+    let pkg: package::Package = po
+
+    write("")
+    write("  " + ui::cyan("⬡") + "  Dependencies of " + ui::bold(name))
+    write(rule(50))
+
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let labels: [string] = ["Pre-Depends:", "Depends:", "Recommends:", "Suggests:"]
+    let values: [string?] = [pkg.pre_depends, pkg.depends, pkg.recommends, pkg.suggests]
+    let mut li: int = 0
+    while li < labels.len() is
+        if values[li] != nil is
+            let v: string = values[li]
+            write("  " + ui::bold(labels[li]))
+            let groups: [package::DepGroup] = package::parse_dep_field(v)
+            let mut gi: int = 0
+            while gi < groups.len() is
+                let alts: [package::DepAlternative] = groups[gi].alternatives
+                let mut rendered: [string] = []
+                let mut ai: int = 0
+                while ai < alts.len() is
+                    let n: string = if idb.is_installed(alts[ai].name) then ui::bright_green(alts[ai].name) else alts[ai].name
+                    rendered.push(n + ui::dim(constraint_text(alts[ai])))
+                    ai += 1
+                end
+                write("    " + str::join(rendered, " | "))
+                gi += 1
+            end
+        end
+        li += 1
+    end
+    return ""
+end
+
+pub fn cmd_rdepends(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer rdepends <package>" end
+    let name: string = args[0]
+    let c: cache::PackageCache = cache::cache_load()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+
+    write("")
+    write("  " + ui::cyan("⬡") + "  Packages that depend on " + ui::bold(name))
+    write(rule(50))
+
+    let mut count: int = 0
+    let pkgs: [package::Package] = cache::cache_all_packages(c)
+    let mut i: int = 0
+    while i < pkgs.len() is
+        let pkg: package::Package = pkgs[i]
+        let mut fields: [string] = []
+        if pkg.pre_depends != nil is
+            let a: string = pkg.pre_depends
+            fields.push(a)
+        end
+        if pkg.depends != nil is
+            let b: string = pkg.depends
+            fields.push(b)
+        end
+        let mut fi: int = 0
+        while fi < fields.len() is
+            let groups: [package::DepGroup] = package::parse_dep_field(fields[fi])
+            let mut gi: int = 0
+            while gi < groups.len() is
+                let alts: [package::DepAlternative] = groups[gi].alternatives
+                let mut hit: bool = false
+                let mut ai: int = 0
+                while ai < alts.len() is
+                    if alts[ai].name == name is hit = true end
+                    ai += 1
+                end
+                if hit is
+                    let sym: string = if idb.is_installed(pkg.name) then ui::bright_green("✔") else ui::dim("·")
+                    write("  " + sym + " " + ui::bold(pkg.name))
+                    count += 1
+                end
+                gi += 1
+            end
+            fi += 1
+        end
+        i += 1
+    end
+    if count == 0 is
+        write("  " + ui::dim("·") + " No packages depend on '" + name + "'.")
+    end
+    return ""
+end
+
+;; ── hammer which <file> ──────────────────────────────────────────────────
+
+pub fn cmd_which(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer which <file-path>" end
+    let p: string = args[0]
+    if fs::is_dir("/var/lib/dpkg/info") is
+        let out: string = str::trim(proc::shell("grep -lxF -- " + shq(p) + " /var/lib/dpkg/info/*.list 2>/dev/null | head -n1"))
+        if out != "" is
+            let base: string = compat::path_filename(out)
+            let pkg_name: string = if string_ends_with(base, ".list") then str::slice(base, 0, string_len(base) - 5) else base
+            write("  " + ui::bright_green("✔") + " " + ui::cyan(p) + " is owned by " + ui::bold(pkg_name))
+            return ""
+        end
+    end
+    write("  " + ui::dim("·") + " No package owns '" + p + "'.")
+    return ""
+end
+
+;; ── hammer policy <pkg> ──────────────────────────────────────────────────
+
+pub fn cmd_policy(args: [string]) -> string is
+    if args.len() == 0 is return "Usage: hammer policy <package>" end
+    let name: string = args[0]
+    let c: cache::PackageCache = cache::cache_load()
+    let idb: db::InstalledDb = db::InstalledDb::open()
+
+    write("")
+    write("  " + ui::bold(name) + ":")
+    let io: db::InstalledPackage? = idb.get(name)
+    let inst_ver: string = if io == nil then "(none)" else io.version
+    write("  " + fmt::pad_right("Installed:", 18) + " " + ui::bright_green(inst_ver))
+
+    let po: package::Package? = cache::cache_get(c, name)
+    if po != nil is
+        let pkg: package::Package = po
+        write("  " + fmt::pad_right("Candidate:", 18) + " " + ui::cyan(pkg.version))
+        if pkg.repo_base_uri != nil is
+            let uri: string = pkg.repo_base_uri
+            write("  " + fmt::pad_right("Repository:", 18) + " " + ui::dim(uri))
+        end
+    else is
+        write("  " + ui::bold(fmt::pad_right("Candidate:", 18)) + " (not in any repo)")
+    end
+    return ""
+end
