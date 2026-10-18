@@ -1,0 +1,103 @@
+use "std -> strings" from "str"
+
+;; hammer -> pkg::solver::error
+;;
+;; Port of source-code/pkg/solver/error.rs (Rust) to H#.
+;; `SolverProblem` (problemy strukturalne) i `SolverError`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. Warianty ze strukturalnymi polami (`NotFound { name, similar }`) ->
+;;    warianty krotkowe (`NotFound(name, similar)`) — kolejnosc pol jak w
+;;    Rust. `Option<String>` -> `string?`.
+;; 2. `impl Display` -> `problem_display` / `error_display`.
+;; 3. `impl Error` pomijamy (H# nie ma traitu Error).
+;; 4. Ta sama nazwa `SolverProblem`/`SolverError` istnieje w `libhammer`
+;;    (`solver_error.h#`) — tak jak w Rust sa to dwa rozne typy; kompilator
+;;    H# prefiksuje nazwy typow modulem.
+
+pub enum SolverProblem is
+    ;; NotFound(name, similar)
+    NotFound(string, [string])
+    ;; UnsatisfiedDep(package, dep, constraint)
+    UnsatisfiedDep(string, string, string?)
+    ;; Conflict(pkg_a, pkg_b, detail)
+    Conflict(string, string, string)
+    ;; VersionConflict(package, required, available)
+    VersionConflict(string, string, string)
+    ;; ArchMismatch(package, pkg_arch, sys_arch)
+    ArchMismatch(string, string, string)
+    Generic(string)
+end
+
+pub fn problem_display(p: SolverProblem) -> string is
+    match p is
+        SolverProblem::NotFound(name, similar) => is
+            let mut out: string = "Package '" + name + "' not found in any repository"
+            if similar.len() > 0 is
+                out = out + "\n  Did you mean: " + str::join(similar, ", ") + "?"
+            end
+            return out + "\n  Hint: run `hammer sync` to refresh the index."
+        end
+        SolverProblem::UnsatisfiedDep(package, dep, constraint) => is
+            let mut c: string = ""
+            if constraint != nil is
+                let cs: string = constraint
+                c = " (" + cs + ")"
+            end
+            return "Package '" + package + "' depends on '" + dep + "'" + c + " which is not available"
+        end
+        SolverProblem::Conflict(pkg_a, pkg_b, detail) => is
+            return "Conflict between '" + pkg_a + "' and '" + pkg_b + "': " + detail
+        end
+        SolverProblem::VersionConflict(package, required, available) => is
+            return "Package '" + package + "' requires " + required + " but only " + available + " is available"
+        end
+        SolverProblem::ArchMismatch(package, pkg_arch, sys_arch) => is
+            return "Package '" + package + "' is for " + pkg_arch + " but system is " + sys_arch
+        end
+        SolverProblem::Generic(msg) => is
+            return msg
+        end
+    end
+end
+
+;; Blad najwyzszego poziomu: UNSAT z komunikatem albo lista problemow.
+pub enum SolverError is
+    ;; Bezposredni UNSAT (silnik SAT)
+    Unsatisfiable(string)
+    ;; Problemy strukturalne (resolver wysokiego poziomu)
+    Problems([SolverProblem])
+end
+
+pub fn error_new(problems: [SolverProblem]) -> SolverError is
+    return SolverError::Problems(problems)
+end
+
+pub fn error_single(p: SolverProblem) -> SolverError is
+    let ps: [SolverProblem] = [p]
+    return SolverError::Problems(ps)
+end
+
+pub fn error_unsat(msg: string) -> SolverError is
+    return SolverError::Unsatisfiable(msg)
+end
+
+pub fn error_display(e: SolverError) -> string is
+    match e is
+        SolverError::Unsatisfiable(msg) => is
+            return "Dependency resolution failed (UNSAT): " + msg
+        end
+        SolverError::Problems(problems) => is
+            if problems.len() == 1 is
+                return problem_display(problems[0])
+            end
+            let mut out: string = "Dependency resolution failed (" + to_string(problems.len()) + " problem(s)):\n"
+            let mut i: int = 0
+            while i < problems.len() is
+                out = out + "  " + to_string(i + 1) + ". " + problem_display(problems[i]) + "\n"
+                i += 1
+            end
+            return out
+        end
+    end
+end
