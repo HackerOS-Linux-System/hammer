@@ -1,0 +1,84 @@
+use "std -> strings" from "str"
+
+mod internal
+mod ui
+mod oci
+
+;; hammer -> oci::cmd::oci_cmd_status   (port cmd/status.rs)
+;; Odejscia: `async`/`Result` -> `string` ("" = OK); `format_epoch` ->
+;; `compat::time_format` (UTC, `date -u`); `.bold()`/`.dimmed()` -> `ui::*`.
+
+fn has_flag(args: [string], a: string, b: string) -> bool is
+    let mut i: int = 0
+    while i < args.len() is
+        if args[i] == a || args[i] == b is return true end
+        i += 1
+    end
+    return false
+end
+
+pub fn run(args: [string], cfg: oci_types::Config) -> string is
+    let verbose: bool = has_flag(args, "--verbose", "-v")
+    let sr: oci_sysroot::SysrootResult = oci_sysroot::sysroot_open(cfg.sysroot_path, cfg.ostree_repo_path, cfg.osname)
+    if sr.err != "" is return sr.err end
+    let sysroot: oci_sysroot::Sysroot = sr.sysroot
+    let dl: oci_sysroot::DeploymentsList = oci_sysroot::list_deployments(sysroot)
+    if dl.err != "" is return dl.err end
+    let deployments: [oci_types::Deployment] = dl.items
+
+    let orphan: string = oci_overlay::detect_orphaned_session(cfg.overlay_work_dir)
+    if orphan != "" is
+        write("  " + ui::yellow_bold("!") + " Found an interrupted transaction at " + orphan + ".")
+        write("    Run " + ui::cyan("hammer oci cleanup --repair") + " to clean it up.")
+        write("")
+    end
+
+    if deployments.len() == 0 is
+        write("  No deployments yet. Run " + ui::cyan("hammer oci deploy <image-ref>") + " to bootstrap.")
+        return ""
+    end
+
+    let mut repo_ok: bool = false
+    let rr: oci_ostree_repo::RepoResult = oci_ostree_repo::repo_open(cfg.ostree_repo_path)
+    if verbose && rr.err == "" is repo_ok = true end
+
+    write("")
+    let mut i: int = 0
+    while i < deployments.len() is
+        let dep: oci_types::Deployment = deployments[i]
+        i += 1
+        let marker: string = if dep.booted then ui::bright_green("●") else ui::dim("○")
+        let lm: oci_sysroot::LayerMeta = oci_sysroot::read_layer_metadata(sysroot, dep.checksum)
+        let origin: string = if lm.origin == "" then dep.origin_refspec else lm.origin
+
+        write("  " + marker + " " + ui::bold(dep.osname) + " " + ui::dim(oci_types::short_sum(dep.checksum) + "." + to_string(dep.serial)))
+        if origin != "" is write("      Origin: " + origin) end
+        if dep.pinned is write("      " + ui::yellow("Pinned")) end
+        if lm.layers.len() > 0 is
+            let mut names: [string] = []
+            let mut k: int = 0
+            while k < lm.layers.len() is
+                names.push(lm.layers[k].name)
+                k += 1
+            end
+            write("      Layered packages (" + to_string(lm.layers.len()) + "): " + str::join(names, ", "))
+        end
+        if repo_ok is
+            let ci: oci_ostree_repo::CommitInfoResult = oci_ostree_repo::read_commit_info(rr.repo, dep.checksum)
+            if ci.err != "" is
+                write("      " + ui::yellow("!") + " could not read commit metadata: " + ci.err)
+            end
+            if ci.err == "" && ci.info.subject != "" is
+                write("      " + ui::dim("Subject") + ": " + ci.info.subject)
+            end
+            if ci.err == "" && ci.info.timestamp > 0 is
+                write("      " + ui::dim("Committed") + ": " + compat::time_format(ci.info.timestamp, "%Y-%m-%d %H:%M:%S") + " UTC")
+            end
+        end
+        write("")
+    end
+    if !verbose is
+        write("  " + ui::cyan("ℹ") + " Run with " + ui::cyan("hammer oci status --verbose") + " for commit subject/timestamp.")
+    end
+    return ""
+end
