@@ -1,0 +1,89 @@
+use "std -> strings" from "str"
+
+mod internal
+mod ui
+mod oci
+mod cmd
+
+;; hammer -> oci::cmd::oci_cmd   (port cmd/mod.rs: dispatcher + help)
+;; Odejscia: `async` zbedne; nieznana podkomenda -> blad ze `string` (Rust:
+;; `process::exit(1)` po `eprintln!`; `main` wypisuje blad i konczy kodem 1,
+;; wiec efekt ten sam).
+
+pub fn print_help() is
+    write("")
+    write("  " + ui::bright_cyan_bold("⬡ hammer oci") + "  " + ui::dim("— image-based/immutable OCI+deb mode"))
+    write("  Native hammer replacement for the standalone 'deb-ostree' tool.")
+    write("")
+    write("  " + ui::bold("Bootstrap:"))
+    write("    deploy <image-ref>        Initial deployment from an OCI base image")
+    write("    rebase <image-ref>        Switch to a different base image")
+    write("")
+    write("  " + ui::bold("Layer management:"))
+    write("    install <pkg...>          Install package(s) as a layer")
+    write("    uninstall <pkg...>        Remove layered package(s)")
+    write("    upgrade                   Update base image + re-apply layers")
+    write("    update                    Refresh package indexes only")
+    write("    autoremove                Remove orphaned layered dependencies")
+    write("")
+    write("  " + ui::bold("Deployments:"))
+    write("    status [--verbose]        Show all deployments (like 'rpm-ostree status')")
+    write("    rollback                  Return to the previous deployment")
+    write("    pin / unpin <id>          Protect / unprotect a deployment from cleanup")
+    write("    cleanup [--keep N]        Remove old deployments (default: keep 2)")
+    write("    fsck                      Verify OSTree repository integrity")
+    write("    diff                      Show package diff vs the booted deployment")
+    write("")
+    write("  " + ui::bold("Query:"))
+    write("    search <term>             Search available packages")
+    write("    list                      List installed layered packages")
+    write("")
+    write("  " + ui::bold("System:"))
+    write("    initramfs                 Regenerate initramfs inside the new deployment")
+    write("")
+end
+
+fn tail_from(args: [string], n: int) -> [string] is
+    let mut out: [string] = []
+    let mut i: int = n
+    while i < args.len() is
+        out.push(args[i])
+        i += 1
+    end
+    return out
+end
+
+;; Rust: `oci::cmd::run(args)`.
+pub fn run(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "help"
+    let rest: [string] = tail_from(args, 1)
+
+    if sub == "help" || sub == "--help" || sub == "-h" || sub == "" is
+        print_help()
+        return ""
+    end
+
+    let lc: oci_config::ConfigResult = oci_config::load_config("")
+    if lc.err != "" is return lc.err end
+    let cfg: oci_types::Config = lc.cfg
+
+    if sub == "status" || sub == "st" is return oci_cmd_status::run(rest, cfg) end
+    if sub == "deploy" is return oci_cmd_deploy::run(rest, cfg) end
+    if sub == "install" || sub == "in" is return oci_cmd_install::run(rest, cfg) end
+    if sub == "uninstall" || sub == "rm" is return oci_cmd_uninstall::run(rest, cfg) end
+    if sub == "upgrade" || sub == "up" is return oci_cmd_upgrade::run(rest, cfg) end
+    if sub == "rollback" || sub == "rb" is return oci_cmd_rollback::run(rest, cfg) end
+    if sub == "rebase" is return oci_cmd_rebase::run(rest, cfg) end
+    if sub == "cleanup" is return oci_cmd_cleanup::run(rest, cfg) end
+    if sub == "fsck" is return oci_cmd_fsck::run(rest, cfg) end
+    if sub == "initramfs" is return oci_cmd_initramfs::run(rest, cfg) end
+    if sub == "search" || sub == "se" is return oci_cmd_search::run(rest, cfg) end
+    if sub == "list" || sub == "ls" is return oci_cmd_list::run(rest, cfg) end
+    if sub == "pin" is return oci_cmd_pin::run(rest, cfg, true) end
+    if sub == "unpin" is return oci_cmd_pin::run(rest, cfg, false) end
+    if sub == "diff" is return oci_cmd_diff::run(rest, cfg) end
+    if sub == "update" is return oci_cmd_update::run(rest, cfg) end
+    if sub == "autoremove" is return oci_cmd_autoremove::run(rest, cfg) end
+
+    return "Unknown 'hammer oci' subcommand: '" + sub + "'. Try hammer oci help."
+end
