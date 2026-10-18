@@ -1,0 +1,279 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> env"     from "env"
+use "std -> conv" from "conv"
+
+mod internal
+mod ui
+;; [mod db pominiete: source-code/pkg/db.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania db::fn dzialaja bez zmian]
+;; [mod cache pominiete: source-code/pkg/cache.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania cache::fn dzialaja bez zmian]
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+
+;; hammer -> tools::notify
+;;
+;; Port of source-code/tools/notify.rs (Rust) to H#: powiadomienia o
+;; aktualizacjach (notify-send / dbus-send), `hammer notify`, timer systemd
+;; i demon z plikiem PID.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `async fn` (tokio) -> zwykle funkcje; `tokio::time::sleep` ->
+;;    `time::sleep_s`. H# nie ma runtime async dla tego przypadku.
+;; 2. `anyhow::Result<()>` -> `string` ("" = OK).
+;; 3. `Command::new(..).status()` -> `proc::shell` z `echo ok || echo fail`
+;;    (zwracany jest stdout, nie kod wyjscia).
+;; 4. `libc::signal(SIGTERM, handler)` — POMINIETE: `std -> signal` w H# ma
+;;    tylko puste zaslepki (`on_sigterm` nic nie robi). Rust i tak ustawial
+;;    handler, ktory robil `process::exit(0)` bez sprzatania, wiec efekt jest
+;;    ten sam (SIGTERM konczy proces); plik PID zostaje, dopoki nie wywola sie
+;;    `daemon_stop` (ono go kasuje, jak w Rust).
+;; 5. `libc::kill` -> `kill -TERM <pid>` powloki.
+;; 6. `/proc/self/exe` read_link -> `readlink -f`; fallback `/usr/bin/hammer`.
+;; 7. Format tekstu uslugi/timera systemd — bajt w bajt jak w Rust.
+;; 8. BLAD ORYGINALU ZACHOWANY: `daemon_run_check` woła `hammer list
+;;    --upgradable`, a `cmd_list` rozumie tylko `--upgrades` (`--upgradable`
+;;    daje liste WSZYSTKICH pakietow => stale "N updates available"). Nie
+;;    zmieniam flagi bez Twojej decyzji — podmien w `daemon_run_check`.
+;; 9. `std::env::var("HAMMER_NOTIFY_INTERVAL")` -> `env::get`; brak/zle
+;;    liczba = 6 (jak `unwrap_or(6)`).
+
+pub enum Urgency is
+    Low
+    Normal
+    Critical
+end
+
+fn urgency_str(u: Urgency) -> string is
+    match u is
+        Urgency::Low      => is return "low" end
+        Urgency::Normal   => is return "normal" end
+        Urgency::Critical => is return "critical" end
+    end
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn sh_ok(cmd: string) -> bool is
+    return str::trim(proc::shell("(" + cmd + ") >/dev/null 2>&1 && echo ok || echo fail")) == "ok"
+end
+
+pub fn notify_pid_file() -> string is return "/run/hammer-notify.pid" end
+pub fn notify_socket() -> string is return "/run/hammer-notify.sock" end
+
+;; ── send_notification ────────────────────────────────────────────────────
+
+;; notify-send -> dbus-send -> wpis w logu. Zawsze "" (jak `Ok(())`).
+pub fn send_notification(summary: string, body: string, urgency: Urgency, icon: string) -> string is
+    let urg: string = urgency_str(urgency)
+    if sh_ok("notify-send --app-name=hammer --urgency " + urg + " --icon " + shq(icon) + " --expire-time=10000 " + shq(summary) + " " + shq(body)) is
+        return ""
+    end
+
+    ;; Zapasowo: bezposrednie wywolanie D-Bus. Rust skladal jeden napis i
+    ;; ciol go po bialych znakach (`split_whitespace`), wiec `summary`/`body`
+    ;; ze spacjami rozpadaly sie na wiele argumentow — tu przekazujemy je
+    ;; w calosci (poprawka: dbus-send dostaje poprawne argumenty).
+    sh_ok("dbus-send --dest=org.freedesktop.Notifications /org/freedesktop/Notifications org.freedesktop.Notifications.Notify string:hammer uint32:0 string:" + shq(icon) + " string:" + shq(summary) + " string:" + shq(body) + " array:string: dict:string:variant: int32:10000")
+
+    log::info("notify: " + summary + " — " + body)
+    return ""
+end
+
+;; ── check_and_notify ─────────────────────────────────────────────────────
+
+pub fn check_and_notify() -> string is
+    let idb: db::InstalledDb = db::InstalledDb::open()
+    let c: cache::PackageCache = cache::cache_load()
+
+    let mut upgrades: [string] = []
+    let all: [db::InstalledPackage] = idb.list_all()
+    let mut i: int = 0
+    while i < all.len() is
+        let inst: db::InstalledPackage = all[i]
+        let av: package::Package? = cache::cache_get(c, inst.name)
+        if av != nil is
+            let avail: package::Package = av
+            if package::version_cmp(avail.version, inst.version) > 0 is
+                upgrades.push(inst.name + " " + inst.version + " → " + avail.version)
+            end
+        end
+        i += 1
+    end
+
+    if upgrades.len() == 0 is
+        log::info("notify: no updates available")
+        return ""
+    end
+
+    let count: int = upgrades.len()
+    let summary: string = to_string(count) + " update" + (if count == 1 then "" else "s") + " available"
+    let mut body: string = ""
+    if count <= 5 is
+        body = str::join(upgrades, "\n")
+    else is
+        let mut first: [string] = []
+        let mut k: int = 0
+        while k < 5 is
+            first.push(upgrades[k])
+            k += 1
+        end
+        body = str::join(first, "\n") + "\n… and " + to_string(count - 5) + " more"
+    end
+
+    log::info("notify: " + to_string(count) + " updates available")
+    return send_notification(summary, body, Urgency::Normal, "software-update-available")
+end
+
+;; ── CLI ──────────────────────────────────────────────────────────────────
+
+;; hammer notify [check | daemon | install-timer]
+pub fn cmd_notify(args: [string]) -> string is
+    let sub: string = if args.len() > 0 then args[0] else "check"
+    if sub == "check" is
+        write("  " + ui::dim("·") + " Checking for updates…")
+        return check_and_notify()
+    end
+    if sub == "daemon" is
+        write("  " + ui::dim("·") + " Starting update check loop…")
+        while true is
+            let e1: string = cache::sync_all()
+            if e1 != "" is log::warn("notify daemon: sync failed: " + e1) end
+            let e2: string = check_and_notify()
+            if e2 != "" is log::warn("notify daemon: check failed: " + e2) end
+            compat::time_sleep_s(6 * 3600)
+        end
+        return ""
+    end
+    if sub == "install-timer" is return install_systemd_timer() end
+    return "Unknown notify subcommand: '" + sub + "'"
+end
+
+fn install_systemd_timer() -> string is
+    let mut hammer: string = str::trim(proc::shell("readlink -f /proc/self/exe 2>/dev/null"))
+    if hammer == "" is hammer = "/usr/bin/hammer" end
+
+    let service: string = "[Unit]\nDescription=Hammer Package Manager — Update Check\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nExecStart=" + hammer + " notify check\nStandardOutput=journal\nStandardError=journal\n\n[Install]\nWantedBy=timers.target\n"
+    let timer: string = "[Unit]\nDescription=Hammer Package Manager — Daily Update Check\n\n[Timer]\nOnCalendar=daily\nPersistent=true\nRandomizedDelaySec=1h\n\n[Install]\nWantedBy=timers.target\n"
+
+    if !fs::write("/etc/systemd/system/hammer-update-check.service", service) is
+        return "Cannot write /etc/systemd/system/hammer-update-check.service"
+    end
+    if !fs::write("/etc/systemd/system/hammer-update-check.timer", timer) is
+        return "Cannot write /etc/systemd/system/hammer-update-check.timer"
+    end
+
+    sh_ok("systemctl enable --now hammer-update-check.timer --no-reload")
+    sh_ok("systemctl daemon-reload")
+
+    write("  " + ui::bright_green("✔") + " hammer-update-check.timer installed and enabled.")
+    log::info("notify: installed systemd timer")
+    return ""
+end
+
+;; ── Demon z plikiem PID ──────────────────────────────────────────────────
+
+pub struct NotifyDaemon is
+    pub interval_hours: int
+    pub check_interval: int
+end
+
+pub fn daemon_new(interval_hours: int) -> NotifyDaemon is
+    return NotifyDaemon { interval_hours: interval_hours, check_interval: interval_hours }
+end
+
+pub fn daemon_from_config() -> NotifyDaemon is
+    let raw: string = env::get("HAMMER_NOTIFY_INTERVAL")
+    let mut interval: int = 6
+    if str::is_numeric(raw) is interval = conv::str_to_int(raw) end
+    return daemon_new(interval)
+end
+
+fn daemon_run_check() is
+    ;; patrz odejscie 8 (flaga `--upgradable` jak w oryginale)
+    let out: string = proc::shell("hammer list --upgradable 2>/dev/null")
+    let lines: [string] = str::split(out, "\n")
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < lines.len() is
+        if str::trim(lines[i]) != "" is n += 1 end
+        i += 1
+    end
+    if n > 0 is
+        let summary: string = to_string(n) + " update" + (if n == 1 then "" else "s") + " available"
+        send_notification(summary, "Run 'hammer upgrade' to install.", Urgency::Normal, "software-update-available")
+    end
+end
+
+;; Petla demona — blokuje. Wolac tylko raz.
+pub fn daemon_run(d: NotifyDaemon) -> string is
+    if !fs::write(notify_pid_file(), to_string(os_pid()) + "\n") is
+        return "Cannot write " + notify_pid_file()
+    end
+    ui::eprint_line("[hammer-notify] Started. Interval: " + to_string(d.interval_hours) + "h PID: " + to_string(os_pid()))
+
+    let interval_s: int = d.interval_hours * 3600
+    let mut last_run: int = compat::time_now_unix() - interval_s
+    while true is
+        let now: int = compat::time_now_unix()
+        if now - last_run >= interval_s is
+            last_run = now
+            daemon_run_check()
+        end
+        compat::time_sleep_s(60)
+    end
+
+    proc::shell("rm -f -- " + shq(notify_pid_file()))
+    ui::eprint_line("[hammer-notify] Stopped.")
+    return ""
+end
+
+fn os_pid() -> int is
+    let t: string = str::trim(proc::shell("echo $PPID"))
+    if str::is_numeric(t) is return conv::str_to_int(t) end
+    return 0
+end
+
+;; Zatrzymuje dzialajacy demon (SIGTERM przez plik PID).
+pub fn daemon_stop() -> string is
+    if !fs::exists(notify_pid_file()) is
+        return "No PID file — is hammer-notify running?"
+    end
+    let t: string = str::trim(fs::read(notify_pid_file()))
+    if !str::is_numeric(t) is return "Invalid PID in PID file" end
+    proc::shell("kill -TERM " + t + " 2>/dev/null")
+    proc::shell("rm -f -- " + shq(notify_pid_file()))
+    write("  " + ui::bright_green("✔") + " Sent SIGTERM to hammer-notify (pid=" + t + ").")
+    return ""
+end
+
+;; `unix:path=/run/user/<uid>/bus` dla kazdej aktywnej sesji.
+pub fn find_all_dbus_addresses() -> [string] is
+    let mut addrs: [string] = []
+    if fs::is_dir("/run/user") is
+        let ents: [string] = fs::list_dir("/run/user")
+        let mut i: int = 0
+        while i < ents.len() is
+            let bus: string = "/run/user/" + ents[i] + "/bus"
+            if fs::exists(bus) is addrs.push("unix:path=" + bus) end
+            i += 1
+        end
+    end
+    return addrs
+end
+
+;; Powiadomienie do kazdej aktywnej sesji pulpitu.
+pub fn broadcast_notification(summary: string, body: string, urgency: Urgency, icon: string) is
+    let addrs: [string] = find_all_dbus_addresses()
+    if addrs.len() == 0 is
+        send_notification(summary, body, urgency, icon)
+        return
+    end
+    let urg: string = urgency_str(urgency)
+    let mut i: int = 0
+    while i < addrs.len() is
+        sh_ok("DBUS_SESSION_BUS_ADDRESS=" + shq(addrs[i]) + " notify-send --app-name=hammer --icon=" + shq(icon) + " --urgency=" + urg + " " + shq(summary) + " " + shq(body))
+        i += 1
+    end
+end
