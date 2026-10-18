@@ -1,0 +1,435 @@
+use "std -> fs"          from "fs"
+use "std -> strings"     from "str"
+use "std -> process"     from "proc"
+use "std -> collections" from "col"
+
+mod internal
+mod pkg
+mod system
+mod ui
+mod oci_types
+mod oci_process
+mod oci_status_db
+
+;; hammer -> oci::oci_repo_index
+;;
+;; Port of source-code/oci/repo_index.rs (Rust) to H#: pobieranie i
+;; parsowanie indeksow `Packages` (z weryfikacja GPG/InRelease), pula
+;; pakietow, rozwiazywanie zaleznosci prawdziwym solverem SAT oraz proste
+;; domkniecie BFS jako zapas.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `async` + `reqwest` -> `download::get_file` (curl) do plikow
+;;    tymczasowych; sekwencyjnie.
+;; 2. `Pool` (HashMap) -> `cache::PackageCache` (indeks nazw w hashmapie z
+;;    `std -> collections`) + mapa `provides`. URI zrodla trzymane w
+;;    `Package.repo_base_uri`. Przy rownej wersji z dwoch zrodel wygrywa
+;;    pozniejsze (`cache_insert`); Rust zostawial pierwsze.
+;; 3. `Pool::provides`: nazwa wirtualna -> nazwy realne rozdzielone TABEM w
+;;    jednej wartosci mapy (H# nie ma mapy na tablice); `resolve_alt` bierze
+;;    pierwsza, jak w Rust.
+;; 4. GPG: tak jak w Rust brak klucza/podpisu tylko OSTRZEGA, o ile
+;;    `require_gpg = false`. ZMIANA: przy `require_gpg = true` rowniez
+;;    wynik "skipped" (brak keyringu/gpgv) jest twardym bledem — Rust
+;;    traktowal to jako sukces (`Ok(())`), przez co wymog nic nie
+;;    gwarantowal. Przy zweryfikowanym podpisie skroty plikow sa czytane
+;;    TYLKO z tresci faktycznie podpisanej (patrz `system/gpg_verify.h#`, G).
+;; 5. FALLBACK, ktory Rust tylko obiecywal w komentarzu: gdy `Packages`
+;;    nie ma na serwerze, probujemy `Packages.xz`, potem `Packages.gz`
+;;    (najpierw sprawdzajac skrot pliku SKOMPRESOWANEGO wg InRelease, potem
+;;    rozpakowanie).
+;; 6. `resolve_with_real_solver`: tymczasowa baza = plik `/tmp/hammer-mem-
+;;    <pid>.sqlite` (patrz `pkg/db.h#`, odejscie 2), usuwana po uzyciu.
+;;    `solver_new` czyta globalne piny/multi-arch (jak `Solver::new` w Rust).
+;; 7. `Result<T>` -> struktury z polem `err` ("" = OK). `anyhow` .context ->
+;;    prefiks w tresci bledu.
+
+pub struct Pool is
+    pub cache:    cache::PackageCache
+    ;; nazwa wirtualna (Provides) -> nazwy realne rozdzielone '\t'
+    pub provides: any
+end
+
+pub struct PoolResult is
+    pub pool: Pool
+    pub err:  string
+end
+
+pub fn pool_new() -> Pool is
+    return Pool { cache: cache::cache_empty(), provides: col::hashmap_new() }
+end
+
+fn sanitize(s: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < string_len(s) is
+        let c: string = string_at(s, i)
+        let alnum: bool = (c >= "0" && c <= "9") || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+        if alnum is out = out + c else out = out + "_" end
+        i += 1
+    end
+    return out
+end
+
+fn trim_slash_end(s: string) -> string is
+    let mut n: int = string_len(s)
+    while n > 0 && string_at(s, n - 1) == "/" is n -= 1 end
+    return str::slice(s, 0, n)
+end
+
+fn trim_slash_start(s: string) -> string is
+    let mut n: int = 0
+    while n < string_len(s) && string_at(s, n) == "/" is n += 1 end
+    return str::slice(s, n, string_len(s))
+end
+
+fn provides_add(pool: Pool, virt: string, real: string) is
+    if col::hashmap_contains(pool.provides, virt) is
+        col::hashmap_insert(pool.provides, virt, col::hashmap_get(pool.provides, virt) + "\t" + real)
+    else
+        col::hashmap_insert(pool.provides, virt, real)
+    end
+end
+
+;; Rust: `Pool::add`. Zwraca NOWA pule (cache jest niemutowalna struktura).
+pub fn pool_add(pool: Pool, p: package::Package, base_uri: string) -> Pool is
+    let mut pkg: package::Package = p
+    pkg.repo_base_uri = base_uri
+    let mut i: int = 0
+    while i < pkg.provides_list.len() is
+        provides_add(pool, pkg.provides_list[i], pkg.name)
+        i += 1
+    end
+    if pkg.provides != nil is
+        let groups: [package::DepGroup] = package::parse_dep_field(pkg.provides)
+        let mut g: int = 0
+        while g < groups.len() is
+            let mut a: int = 0
+            while a < groups[g].alternatives.len() is
+                provides_add(pool, groups[g].alternatives[a].name, pkg.name)
+                a += 1
+            end
+            g += 1
+        end
+    end
+    return Pool { cache: cache::cache_insert(pool.cache, pkg), provides: pool.provides }
+end
+
+pub fn pool_find(pool: Pool, name: string) -> package::Package? is
+    return cache::cache_get(pool.cache, name)
+end
+
+;; Rust: `Pool::all` (dla `hammer oci search`).
+pub fn pool_all(pool: Pool) -> [package::Package] is
+    return pool.cache.by_name
+end
+
+pub fn pool_count(pool: Pool) -> int is
+    return cache::cache_len(pool.cache)
+end
+
+pub fn base_uri_for(pool: Pool, name: string) -> string? is
+    let p: package::Package? = pool_find(pool, name)
+    if p == nil is return nil end
+    let pk: package::Package = p
+    return pk.repo_base_uri
+end
+
+;; Rust: `Pool::deb_url` — `Filename:` jest wzgledne do URI repozytorium.
+pub fn deb_url(pool: Pool, name: string) -> string? is
+    let p: package::Package? = pool_find(pool, name)
+    if p == nil is return nil end
+    let pk: package::Package = p
+    if pk.filename == nil || pk.repo_base_uri == nil is return nil end
+    return trim_slash_end(pk.repo_base_uri) + "/" + trim_slash_start(pk.filename)
+end
+
+;; Rust: `Pool::resolve_alt` — nazwa realna albo pierwszy dostawca; "" = brak.
+pub fn resolve_alt(pool: Pool, name: string) -> string is
+    if pool_find(pool, name) != nil is return name end
+    if col::hashmap_contains(pool.provides, name) is
+        let parts: [string] = str::split(col::hashmap_get(pool.provides, name), "\t")
+        if parts.len() > 0 is return parts[0] end
+    end
+    return ""
+end
+
+;; ── InRelease ────────────────────────────────────────────────────────────
+
+pub struct ReleaseResult is
+    pub ir:       gpg_verify::InRelease
+    ;; "verified" | "skipped"
+    pub state:    string
+    pub err:      string
+end
+
+;; Rust: `fetch_and_verify_release` — InRelease (fallback Release).
+fn fetch_and_verify_release(client: download::HttpClient, uri: string, suite: string, cfg: oci_types::Config) -> ReleaseResult is
+    let base: string = trim_slash_end(uri) + "/dists/" + suite
+    let mut got: download::StringResult = download::get_string(client, base + "/InRelease")
+    if got.err != "" is
+        ;; Prostsze/starsze serwery: tylko Release (+ Release.gpg, ktorego tu
+        ;; nie weryfikujemy — jak w Rust, best-effort).
+        let rel: download::StringResult = download::get_string(client, base + "/Release")
+        if rel.err != "" is
+            let none: gpg_verify::InRelease = gpg_verify::inrelease_parse("")
+            return ReleaseResult { ir: none, state: "", err: "Fetching " + base + "/InRelease or " + base + "/Release: " + rel.err }
+        end
+        got = rel
+    end
+    let st: gpg_verify::VerifyStatus = gpg_verify::verify_inrelease_status(got.text, cfg.keyring_dir)
+    if st.state == "failed" is
+        let none2: gpg_verify::InRelease = gpg_verify::inrelease_parse("")
+        return ReleaseResult { ir: none2, state: "failed", err: "Verifying signature for " + uri + " " + suite + ": " + st.err }
+    end
+    if st.state == "verified" is
+        return ReleaseResult { ir: gpg_verify::inrelease_parse(st.content), state: "verified", err: "" }
+    end
+    return ReleaseResult { ir: gpg_verify::inrelease_parse(got.text), state: "skipped", err: "" }
+end
+
+;; ── Pobieranie indeksu ───────────────────────────────────────────────────
+
+pub struct IndexText is
+    pub text: string
+    pub err:  string
+end
+
+fn read_index(client: download::HttpClient, base_url: string, rel_path: string, ir: gpg_verify::InRelease, have_ir: bool, require_gpg: bool) -> IndexText is
+    let variants: [string] = ["", ".xz", ".gz"]
+    let mut last_err: string = ""
+    let mut v: int = 0
+    while v < variants.len() is
+        let rel: string = rel_path + variants[v]
+        let url: string = base_url + "/" + rel
+        let tmp: string = fs::temp_file("hammer-oci-pkgs")
+        let ge: string = download::get_file(client, url, tmp)
+        v += 1
+        if ge != "" is
+            last_err = ge
+            proc::shell("rm -f -- " + oci_process::shq(tmp))
+            continue
+        end
+        if have_ir is
+            let ve: string = gpg_verify::inrelease_verify_file(ir, rel, tmp)
+            if ve != "" is
+                proc::shell("rm -f -- " + oci_process::shq(tmp))
+                ;; indeks niezgodny z deklarowana suma: nie ufamy mu
+                return IndexText { text: "", err: "Packages index " + rel + " failed InRelease checksum check: " + ve }
+            end
+        end
+        let mut text: string = ""
+        if variants[v - 1] == "" is
+            text = fs::read(tmp)
+        elsif variants[v - 1] == ".xz" is
+            text = proc::shell("xz -dc -- " + oci_process::shq(tmp) + " 2>/dev/null")
+        else
+            text = proc::shell("gzip -dc -- " + oci_process::shq(tmp) + " 2>/dev/null")
+        end
+        proc::shell("rm -f -- " + oci_process::shq(tmp))
+        if text == "" is
+            last_err = "empty or undecodable " + rel
+            continue
+        end
+        return IndexText { text: text, err: "" }
+    end
+    return IndexText { text: "", err: "could not fetch " + base_url + "/" + rel_path + ": " + last_err }
+end
+
+;; Rust: `refresh_index` — pula z wszystkich `cfg.apt_sources`.
+pub fn refresh_index(cfg: oci_types::Config) -> PoolResult is
+    let mut pool: Pool = pool_new()
+    proc::shell("mkdir -p -- " + oci_process::shq(cfg.apt_lists_path) + " 2>/dev/null")
+    if !fs::is_dir(cfg.apt_lists_path) is
+        return PoolResult { pool: pool, err: "mkdir -p " + cfg.apt_lists_path }
+    end
+    let client: download::HttpClient = download::client_new()
+
+    let mut s: int = 0
+    while s < cfg.apt_sources.len() is
+        let parts: [string] = str::split_whitespace(cfg.apt_sources[s])
+        s += 1
+        if parts.len() == 0 || parts[0] != "deb" is continue end
+        let mut uri: string = ""
+        let mut rest: [string] = []
+        let mut t: int = 1
+        while t < parts.len() is
+            let tok: string = parts[t]
+            t += 1
+            if tok.starts_with("[") is continue end
+            if uri == "" is uri = tok else rest.push(tok) end
+        end
+        if uri == "" || rest.len() == 0 is continue end
+        let suite: string = rest[0]
+        let mut components: [string] = []
+        if rest.len() > 1 is
+            let mut c: int = 1
+            while c < rest.len() is
+                components.push(rest[c])
+                c += 1
+            end
+        else
+            components.push("main")
+        end
+
+        let rr: ReleaseResult = fetch_and_verify_release(client, uri, suite, cfg)
+        let mut have_ir: bool = false
+        if rr.err != "" is
+            if cfg.require_gpg is
+                return PoolResult { pool: pool, err: "GPG verification required (require_gpg=true) but failed for " + uri + " " + suite + ": " + rr.err }
+            end
+            log::warn("oci: could not verify " + uri + " " + suite + " InRelease (" + rr.err + ") — proceeding WITHOUT signature verification for this source")
+        elsif rr.state == "skipped" && cfg.require_gpg is
+            return PoolResult { pool: pool, err: "GPG verification required (require_gpg=true) but the signature of " + uri + " " + suite + " could not be checked (no keyring in " + cfg.keyring_dir + " or gpgv missing)" }
+        else
+            have_ir = true
+        end
+
+        let base_url: string = trim_slash_end(uri) + "/dists/" + suite
+        let mut ci: int = 0
+        while ci < components.len() is
+            let component: string = components[ci]
+            ci += 1
+            let rel_path: string = component + "/binary-" + cfg.arch + "/Packages"
+            let it: IndexText = read_index(client, base_url, rel_path, rr.ir, have_ir, cfg.require_gpg)
+            if it.err != "" is
+                if it.err.starts_with("Packages index") is
+                    if cfg.require_gpg is
+                        return PoolResult { pool: pool, err: "oci: " + it.err }
+                    end
+                    log::warn("oci: " + it.err)
+                else
+                    log::warn("oci: " + it.err)
+                end
+                continue
+            end
+            let cache_name: string = sanitize(uri) + "_" + suite + "_" + component + "_" + cfg.arch + "_Packages"
+            fs::write(compat::path_join(cfg.apt_lists_path, cache_name), it.text)
+
+            let pkgs: [package::Package] = package::parse_index(it.text)
+            let mut k: int = 0
+            while k < pkgs.len() is
+                pool = pool_add(pool, pkgs[k], uri)
+                k += 1
+            end
+        end
+    end
+    return PoolResult { pool: pool, err: "" }
+end
+
+;; ── Rozwiazywanie zaleznosci ─────────────────────────────────────────────
+
+;; Rust: `resolve_with_real_solver` — ten sam CDCL, co atomic/normal-mode,
+;; na tymczasowych cache/db zbudowanych z puli i `status_db` rootfs.
+pub fn resolve_with_real_solver(pool: Pool, rootfs: string, names: [string]) -> solver::PlanResult is
+    let idb: db::InstalledDb = db::InstalledDb::open_in_memory()
+    let loaded: oci_status_db::StatusLoad = oci_status_db::load_all(rootfs)
+    let mut i: int = 0
+    while i < loaded.pkgs.len() is
+        let inst: oci_status_db::InstalledPackage = loaded.pkgs[i]
+        i += 1
+        ;; Pelne metadane z puli (Depends/Conflicts/Provides), a dla pakietow
+        ;; bazy spoza zrodel — minimalny Package (nazwa+wersja+arch).
+        let from_pool: package::Package? = cache::cache_get(pool.cache, inst.name)
+        let mut p: package::Package = package::empty_package()
+        if from_pool != nil is
+            p = from_pool
+        else
+            p.name = inst.name
+            p.version = inst.version
+            p.architecture = inst.architecture
+        end
+        let e: string = idb.record_install(p, db::InstallReason::User, "", 0)
+        if e != "" is
+            proc::shell("rm -f -- " + oci_process::shq("/tmp/hammer-mem-" + to_string(compat::os_pid()) + ".sqlite"))
+            return solver::plan_err("Seeding in-memory InstalledDb with '" + inst.name + "': " + e)
+        end
+    end
+    let sv: solver::Solver = solver::solver_new(pool.cache, idb)
+    let r: solver::PlanResult = solver::solver_resolve_install(sv, names, false)
+    idb.close()
+    proc::shell("rm -f -- " + oci_process::shq("/tmp/hammer-mem-" + to_string(compat::os_pid()) + ".sqlite"))
+    if r.err != "" is
+        return solver::plan_err("CDCL dependency resolution failed: " + r.err)
+    end
+    return r
+end
+
+pub struct ClosureResult is
+    pub pkgs: [package::Package]
+    pub err:  string
+end
+
+fn contains_name(items: [string], name: string) -> bool is
+    let mut i: int = 0
+    while i < items.len() is
+        if items[i] == name is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Rust: `resolve_closure` — BFS po Depends/Pre-Depends (pierwsza
+;; spelniajaca alternatywa; w razie braku pierwsza w ogole).
+pub fn resolve_closure(pool: Pool, names: [string]) -> ClosureResult is
+    let mut resolved: [package::Package] = []
+    let mut resolved_names: [string] = []
+    let mut queue: [string] = names
+    let mut seen: [string] = []
+    let mut head: int = 0
+    let none: [package::Package] = []
+
+    while head < queue.len() is
+        let name: string = queue[head]
+        head += 1
+        if contains_name(seen, name) is continue end
+        seen.push(name)
+
+        let real_name: string = resolve_alt(pool, name)
+        if real_name == "" is
+            return ClosureResult { pkgs: none, err: "Package '" + name + "' not found in any configured index" }
+        end
+        let found: package::Package? = pool_find(pool, real_name)
+        if found == nil is continue end
+        let pkg: package::Package = found
+        if !contains_name(resolved_names, pkg.name) is
+            resolved.push(pkg)
+            resolved_names.push(pkg.name)
+        end
+
+        let fields: [string?] = [pkg.depends, pkg.pre_depends]
+        let mut f: int = 0
+        while f < fields.len() is
+            let field: string? = fields[f]
+            f += 1
+            if field == nil is continue end
+            let groups: [package::DepGroup] = package::parse_dep_field(field)
+            let mut g: int = 0
+            while g < groups.len() is
+                let alts: [package::DepAlternative] = groups[g].alternatives
+                g += 1
+                let mut chosen: string = ""
+                let mut a: int = 0
+                while a < alts.len() && chosen == "" is
+                    let real: string = resolve_alt(pool, alts[a].name)
+                    if real != "" is
+                        let cand: package::Package? = pool_find(pool, real)
+                        if cand != nil is
+                            let cp: package::Package = cand
+                            let mut ok: bool = true
+                            if alts[a].constraint != nil is
+                                let c: package::VersionConstraint = alts[a].constraint
+                                ok = package::version_satisfies(cp.version, package::op_to_str(c.op), c.version)
+                            end
+                            if ok is chosen = alts[a].name end
+                        end
+                    end
+                    a += 1
+                end
+                if chosen == "" && alts.len() > 0 is chosen = alts[0].name end
+                if chosen != "" && !contains_name(seen, chosen) is queue.push(chosen) end
+            end
+        end
+    end
+    return ClosureResult { pkgs: resolved, err: "" }
+end
