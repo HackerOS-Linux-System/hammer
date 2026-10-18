@@ -1,0 +1,673 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process"    from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod package
+mod db
+mod cache
+mod deb
+mod store
+mod conffiles
+mod essential
+mod solver
+mod ui
+;; [mod profile pominiete: source-code/system/profile.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania profile::fn dzialaja bez zmian]
+;; [mod sandbox pominiete: source-code/system/sandbox.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania sandbox::fn dzialaja bez zmian]
+;; [mod livepatch pominiete: source-code/system/livepatch.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania livepatch::fn dzialaja bez zmian]
+;; [mod grub pominiete: source-code/system/grub.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania grub::fn dzialaja bez zmian]
+;; [mod audit pominiete: source-code/system/audit.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania audit::fn dzialaja bez zmian]
+;; [mod download pominiete: source-code/ui/download.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez ui/mod.h# — wywolania download::fn dzialaja bez zmian]
+
+;; hammer -> pkg::transaction
+;;
+;; Port of source-code/pkg/transaction.rs (Rust) to H#: wykonanie planu
+;; transakcji (pobranie, rozpakowanie do magazynu, rejestracja w bazie,
+;; nowa generacja, live-patch, postinst, GRUB), tryb normal-mode (rozpakowanie
+;; wprost do `/`), hooki pre/post-transaction, `RollbackGuard`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `async fn` -> zwykle funkcje (H# nie ma async; pobieranie robi
+;;    `download::download_packages` z curlem w tle). `anyhow::Result<u32>` ->
+;;    `TxResult { ok, err, gen_num }`, `Result<()>` -> `string` ("" = Ok).
+;; 2. `TransactionContext<'a>` (referencje) -> struktura z kopiami wartosci.
+;; 3. `#[cfg(feature = "normal-mode")]` -> wybor w czasie dzialania
+;;    (`build_mode::normal_mode()`), patrz build_mode.h#. Oba backendy sa
+;;    zawsze skompilowane.
+;; 4. `DebPackage::parse(&bytes)` -> `deb::parse_file(sciezka)`; po uzyciu
+;;    OBOWIAZKOWO `deb::cleanup` (katalog roboczy w /tmp, patrz deb.h#).
+;; 5. Konwersja `Path::new("/")` w `deb.unpack` -> `deb::unpack(deb, "/")`.
+;; 6. Pasek postepu `indicatif` w normal-mode -> jedna linia na paczke
+;;    (`[i/n] Unpacking <nazwa>…`); pelny pasek wymagalby odswiezania w tle.
+;; 7. `Drop` dla `RollbackGuard` nie istnieje w H# — patrz `guard_finish`:
+;;    wolajacy MUSI go wywolac przy bledzie (jak `drop` bez `commit`). W Rust
+;;    nic nie tworzy `RollbackGuard` (martwy kod) — port dla kompletnosci.
+;; 8. `tokio::process::Command::status().await` w `run_hook` -> `system()`;
+;;    `note` przekazywane przez `env HAMMER_TRANSACTION=<cytowane>`.
+;; 9. `HashMap upgrade_from` -> tablice (patrz solver/mod.h#).
+;;
+;; ── BLEDY / LUKI ORYGINALU, KTORE NAPRAWIAM ──────────────────────────────
+;; A. LIVE-PATCH Z BLEDAMI: `livepatch::apply_live` zawsze zwraca `Ok(..)` —
+;;    bledy sa w `result.errors`. Rust ignorowal je i mimo nieudanych
+;;    dowiazan oznaczal generacje jako AKTUALNA (galaz `Err` ("falling back
+;;    to staged mode") byla nieosiagalna). Teraz niepusta lista bledow =
+;;    wycofanie do trybu "staged" (generacja zostaje pending), jak sugerowal
+;;    komunikat z galezi `Err`.
+;; B. Katalog tymczasowy dla conffiles (`/tmp/hammer_conffiles_<pakiet>_<pid>`)
+;;    byl przewidywalny — `conffiles::extract_from_deb` uzywa teraz
+;;    `mktemp` wewnatrz `deb.h#`.
+;;
+;; ── ZACHOWANE ZE ZLOGO ZACHOWANIA ORYGINALU (do Twojej decyzji) ──────────
+;; C. Postinst nowych paczek jest uruchamiany od razu w piaskownicy NA ZYWYM
+;;    systemie takze wtedy, gdy generacja jest tylko "staged" (pliki paczki
+;;    nie sa jeszcze aktywne), a `profile::activate_pending` uruchomi go
+;;    PONOWNIE przy aktywacji (dla pakietow nieobecnych w poprzedniej
+;;    generacji). Skrypty nie sa idempotentne z zalozenia.
+;; D. Normal-mode: oryginalne conffiles NIE sa zapisywane (tylko
+;;    `register_package_conffiles`, ktore loguje) — trzystronny merge przy
+;;    upgrade nie ma z czego korzystac. `rollback guard` nie jest uzywany.
+;; E. Normal-mode rozpakowuje `data.tar` wprost na `/` (GNU tar usuwa
+;;    wiodace `/` i odrzuca `..`, ale przechodzi przez dowiazania
+;;    katalogow juz istniejace na dysku) — jak `deb.unpack(Path::new("/"))`.
+
+pub struct TransactionContext is
+    pub plan:            solver::TransactionPlan
+    pub db:              db::InstalledDb
+    pub explicit:        [string]
+    pub is_upgrade:      bool
+    ;; --force-essential: pozwol usuwac pakiety krytyczne
+    pub force_essential: bool
+end
+
+pub fn context_system(plan: solver::TransactionPlan, idb: db::InstalledDb, explicit: [string], is_upgrade: bool) -> TransactionContext is
+    return TransactionContext { plan: plan, db: idb, explicit: explicit, is_upgrade: is_upgrade, force_essential: false }
+end
+
+pub struct TxResult is
+    pub ok:      bool
+    pub err:     string
+    pub gen_num: int
+end
+
+fn tx_failed(err: string) -> TxResult is
+    return TxResult { ok: false, err: err, gen_num: 0 }
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn contains_str(list: [string], v: string) -> bool is
+    let mut i: int = 0
+    while i < list.len() is
+        if list[i] == v is return true end
+        i += 1
+    end
+    return false
+end
+
+fn plural(n: int) -> string is
+    if n == 1 is return "" end
+    return "s"
+end
+
+fn find_package(list: [package::Package], name: string) -> package::Package? is
+    let mut i: int = 0
+    while i < list.len() is
+        if list[i].name == name is return list[i] end
+        i += 1
+    end
+    return nil
+end
+
+fn pkg_in(list: [package::Package], name: string) -> bool is
+    return find_package(list, name) != nil
+end
+
+;; ── Zapis skryptu postinst (sciezka legacy) ──────────────────────────────
+
+fn postinst_dir() -> string is
+    return compat::path_join(build_mode::db_dir(), "postinst")
+end
+
+fn save_postinst_script(pkg_name: string, script: string) -> string is
+    let dir: string = postinst_dir()
+    fs::mkdir(dir)
+    if !fs::is_dir(dir) is return "Cannot create " + dir end
+    fs::write(compat::path_join(dir, pkg_name + ".postinst"), script)
+    return ""
+end
+
+;; ── execute_transaction (atomic) ─────────────────────────────────────────
+
+fn cache_max_bytes() -> int is return 2 * 1024 * 1024 * 1024 end
+
+pub fn execute_transaction(ctx: TransactionContext, note: string) -> TxResult is
+    let client: download::HttpClient = download::client_new()
+    let plan: solver::TransactionPlan = ctx.plan
+    let idb: db::InstalledDb = ctx.db
+
+    ;; ── Straznik: pakiety krytyczne przed usunieciem ─────────────────
+    if plan.to_remove.len() > 0 is
+        let c: cache::PackageCache = cache::cache_load()
+        let gerr: string = essential::guard_essential_removal(plan.to_remove, ctx.force_essential, c)
+        if gerr != "" is return tx_failed("Essential package protection: " + gerr) end
+    end
+
+    ;; ── Lista do pobrania ────────────────────────────────────────────
+    let mut to_install: [package::Package] = []
+    let mut ti: int = 0
+    while ti < plan.to_install.len() is
+        to_install.push(plan.to_install[ti])
+        ti += 1
+    end
+    let mut tu: int = 0
+    while tu < plan.to_upgrade.len() is
+        to_install.push(plan.to_upgrade[tu])
+        tu += 1
+    end
+
+    ;; ── Pobieranie ───────────────────────────────────────────────────
+    if to_install.len() > 0 is
+        write("  " + ui::accent_bold("⬡") + "  Downloading " + to_string(to_install.len()) + " package" + plural(to_install.len()) + "…")
+    end
+    let none_dl: [download::DownloadResult] = []
+    let mut downloads: [download::DownloadResult] = none_dl
+    if to_install.len() > 0 is
+        let dr: download::DownloadOutcome = download::download_packages(client, to_install)
+        if !dr.ok is return tx_failed("Download failed: " + dr.err) end
+        downloads = dr.results
+    end
+
+    ;; ── Rozpakowanie do magazynu ─────────────────────────────────────
+    write("  " + ui::accent_bold("⬡") + "  Unpacking packages…")
+
+    let mut store_entries: [store::StoreEntry] = []
+    let sb: sandbox::PostinstSandbox = sandbox::sandbox_new()
+
+    let mut d: int = 0
+    while d < downloads.len() is
+        let dl: download::DownloadResult = downloads[d]
+        d += 1
+
+        let pr: deb::ParseResult = deb::parse_file(dl.path)
+        if pr.deb == nil is return tx_failed("Parsing .deb for " + dl.package.name + ": " + pr.err) end
+        let dd: deb::DebPackage = pr.deb
+
+        ;; skrypt postinst na rozruch (sciezka legacy) — blad tylko ostrzezeniem
+        if dd.postinst != nil is
+            let script: string = dd.postinst
+            let serr: string = save_postinst_script(dl.package.name, script)
+            if serr != "" is log::warn("transaction: could not save postinst for " + dl.package.name + ": " + serr) end
+        end
+
+        ;; rozpakowanie do magazynu
+        let ir: store::InstallResult = store::install_deb_pkg(dl.package, dd)
+        if !ir.ok is
+            deb::cleanup(dd)
+            return tx_failed("Installing " + dl.package.name + " to store: " + ir.err)
+        end
+        let entry: store::StoreEntry = ir.entry
+
+        ;; conffiles (trzystronny merge przy upgrade): oryginaly z .deb
+        let orig: conffiles::ConfOriginals = conffiles::extract_from_deb(dd)
+        if orig.paths.len() > 0 is
+            let cerr: string = conffiles::record(dl.package.name, orig.paths, orig.contents)
+            if cerr != "" is log::warn("transaction: conffiles record failed for " + dl.package.name + ": " + cerr) end
+        end
+        deb::cleanup(dd)
+
+        store_entries.push(entry)
+        write("  " + ui::dim("·") + " " + ui::bold(dl.package.name) + " " + ui::dim(dl.package.version))
+    end
+
+    ;; ── Usuniecia ────────────────────────────────────────────────────
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err != "" is return tx_failed(lr.err) end
+    let mut gdb: profile::GenerationsDb = lr.db
+
+    if plan.to_remove.len() > 0 is
+        let mut r: int = 0
+        while r < plan.to_remove.len() is
+            let name: string = plan.to_remove[r]
+            r += 1
+            let inst: db::InstalledPackage? = idb.get(name)
+            if inst != nil is
+                let ip: db::InstalledPackage = inst
+                let rerr: string = idb.record_remove_and_sync(name, ip.version, gdb.current)
+                if rerr != "" is return tx_failed("Recording removal of " + name + ": " + rerr) end
+            end
+        end
+        audit::record_remove(plan.to_remove, gdb.current, nil, idb)
+    end
+
+    ;; ── Zapis instalacji w bazie ─────────────────────────────────────
+    let gen_num: int = profile::db_next_number(gdb)
+
+    let mut e: int = 0
+    while e < store_entries.len() is
+        let entry: store::StoreEntry = store_entries[e]
+        e += 1
+        let found: package::Package? = find_package(to_install, entry.name)
+        if found == nil is return tx_failed("Internal: package " + entry.name + " not in install list") end
+        let pkg: package::Package = found
+        let reason: db::InstallReason = if contains_str(ctx.explicit, entry.name) then db::InstallReason::User else db::InstallReason::Dependency
+        let ierr: string = idb.record_install_and_sync(pkg, reason, entry.hash, gen_num)
+        if ierr != "" is return tx_failed("Recording install of " + entry.name + ": " + ierr) end
+    end
+
+    ;; ── Audyt: instalacje / upgrade ──────────────────────────────────
+    let mut upgrades: [package::Package] = []
+    let mut installs: [package::Package] = []
+    let mut u: int = 0
+    while u < to_install.len() is
+        if solver::plan_has_upgrade_from(plan, to_install[u].name) is
+            upgrades.push(to_install[u])
+        else is
+            installs.push(to_install[u])
+        end
+        u += 1
+    end
+    if installs.len() > 0 is audit::record_install(installs, gdb.current, gen_num) end
+    if upgrades.len() > 0 is
+        audit::record_upgrade(upgrades, plan.upgrade_from_names, plan.upgrade_from_versions, gdb.current, gen_num)
+    end
+
+    ;; ── Istniejace pakiety wchodza do nowego profilu ─────────────────
+    let mut existing_entries: [store::StoreEntry] = []
+    let installed_now: [db::InstalledPackage] = idb.list_all()
+    let mut x: int = 0
+    while x < installed_now.len() is
+        let p: db::InstalledPackage = installed_now[x]
+        x += 1
+        if !pkg_in(to_install, p.name) && !contains_str(plan.to_remove, p.name) is
+            let sp: string = compat::path_join(store::store_dir(), p.name + "-" + p.version + "-" + p.store_hash)
+            if fs::exists(sp) is
+                existing_entries.push(store::StoreEntry { name: p.name, version: p.version, hash: p.store_hash,
+                    path: sp, backend: store::StoreBackend::Hardlink })
+            end
+        end
+    end
+    let mut all_entries: [store::StoreEntry] = existing_entries
+    let mut se: int = 0
+    while se < store_entries.len() is
+        all_entries.push(store_entries[se])
+        se += 1
+    end
+
+    ;; ── Analiza live-patch ───────────────────────────────────────────
+    let mut have_analysis: bool = false
+    let mut can_live: bool = false
+    if store_entries.len() > 0 is
+        let files: [string] = livepatch::collect_files(store_entries)
+        let analysis: livepatch::PatchAnalysis = livepatch::analyse(files)
+        have_analysis = true
+        can_live = analysis.can_live_patch
+        if analysis.can_live_patch is
+            write("  " + ui::bright_yellow_bold("⚡") + "  Live-patch eligible — applying without reboot…")
+        else is
+            write("  " + ui::yellow_bold("⚠") + "  Reboot required after this transaction.")
+            let mut rr: int = 0
+            while rr < analysis.reboot_reasons.len() is
+                write("    " + ui::dim("·") + " " + ui::dim(analysis.reboot_reasons[rr]))
+                rr += 1
+            end
+        end
+    end
+
+    ;; ── Nowy profil generacji ────────────────────────────────────────
+    write("  " + ui::accent_bold("⬡") + "  Composing gen-" + to_string(gen_num) + "…")
+    let cr: profile::ComposeResult = profile::compose_profile(gen_num, all_entries, note)
+    if cr.err != "" is return tx_failed("Composing generation profile: " + cr.err) end
+    let gen: profile::Generation = cr.generation
+
+    ;; ── Zapis generacji ──────────────────────────────────────────────
+    gdb.generations.push(gen)
+    gdb.pending = gen_num
+    let sverr: string = profile::db_save(gdb)
+    if sverr != "" is return tx_failed(sverr) end
+
+    ;; dowiazanie pending
+    let perr: string = profile::set_pending(gen)
+    if perr != "" is return tx_failed(perr) end
+
+    ;; ── Live-patch (patrz A) ─────────────────────────────────────────
+    let mut applied_live: bool = false
+    if have_analysis && can_live && store_entries.len() > 0 is
+        let result: livepatch::LivePatchResult = livepatch::apply_live(store_entries, store::active_link())
+        if result.errors.len() == 0 is
+            ;; natychmiastowa promocja generacji — bez restartu
+            gdb.current = gen_num
+            gdb.pending = nil
+            let s2: string = profile::db_save(gdb)
+            if s2 != "" is return tx_failed(s2) end
+            let cp: string = profile::clear_pending()
+            if cp != "" is log::warn("clear_pending: " + cp) end
+            let rl: profile::RelinkResult = profile::relink_bins(profile::gen_profile_path(gen))
+            if rl.err != "" is return tx_failed(rl.err) end
+            write("  " + ui::bright_green_bold("✔") + "  Live patch applied (" + to_string(result.updated_files) + " file" +
+                  plural(result.updated_files) + " updated) — no reboot needed.")
+            log::info("transaction: gen-" + to_string(gen_num) + " applied live (" + to_string(result.updated_files) + " files) — " + note)
+            applied_live = true
+        else is
+            log::warn("transaction: live-patch failed (" + to_string(result.errors.len()) + " errors, first: " +
+                result.errors[0] + "), falling back to staged mode")
+            write("  " + ui::yellow_bold("⚠") + "  Live patch failed — staged as gen-" + to_string(gen_num) + ", reboot to activate.")
+        end
+    end
+
+    ;; ── Postinst nowych paczek (patrz C) ─────────────────────────────
+    let mut pd: int = 0
+    while pd < downloads.len() is
+        let dl: download::DownloadResult = downloads[pd]
+        pd += 1
+        let is_new: bool = !solver::plan_has_upgrade_from(plan, dl.package.name)
+        if is_new is
+            let script_path: string = compat::path_join(postinst_dir(), dl.package.name + ".postinst")
+            if fs::exists(script_path) is
+                let script: string = fs::read(script_path)
+                log::info("transaction: running postinst for " + dl.package.name + " via sandbox")
+                let rr: sandbox::RunResult = sandbox::run_postinst(sb, dl.package.name, script)
+                if !rr.ok is
+                    log::warn("transaction: could not run postinst " + dl.package.name + ": " + rr.err)
+                elsif rr.result.success is
+                    log::info("transaction: postinst " + dl.package.name + " OK")
+                else is
+                    let first: string = first_line_of(rr.result.stderr)
+                    log::warn("transaction: postinst " + dl.package.name + " failed (exit " + to_string(rr.result.exit_code) + "): " + first)
+                    write("  " + ui::yellow_bold("!") + " postinst " + ui::bold(dl.package.name) + " failed — system may need manual config")
+                end
+            end
+        end
+    end
+
+    ;; ── GRUB ─────────────────────────────────────────────────────────
+    let gerr: string = grub::update_grub(gdb)
+    if gerr != "" is log::warn("transaction: GRUB update failed: " + gerr) end
+
+    ;; ── Wywlaszczanie cache (<= 2 GiB plikow .deb) ───────────────────
+    let ev: download::CacheResult = download::evict_cache_lru(cache_max_bytes())
+    if ev.err != "" is
+        log::warn("transaction: cache eviction failed: " + ev.err)
+    elsif ev.count > 0 is
+        log::info("transaction: evicted " + to_string(ev.count) + " stale cache file(s)")
+    end
+
+    if !applied_live is
+        write("  " + ui::bright_green_bold("✔") + "  Staged as gen-" + to_string(gen_num) + " — reboot to activate")
+        log::info("transaction: gen-" + to_string(gen_num) + " staged — " + note)
+    end
+    return TxResult { ok: true, err: "", gen_num: gen_num }
+end
+
+fn first_line_of(s: string) -> string is
+    let p: int = compat::str_index_of(s, "\n")
+    if p < 0 is return s end
+    return str::slice(s, 0, p)
+end
+
+;; ── Hooki pre/post-transaction ───────────────────────────────────────────
+
+pub fn run_hook(hook: string, note: string) is
+    let hook_path: string = "/etc/hammer/hooks.d/" + hook
+    if !fs::exists(hook_path) is return end
+    log::info("hook: running " + hook + " (" + note + ")")
+    system("env HAMMER_TRANSACTION=" + shq(note) + " /bin/sh " + shq(hook_path))
+end
+
+;; ── Pomocnicze normal-mode ───────────────────────────────────────────────
+
+fn find_maintainer_script(pkg: string, kind: string) -> string? is
+    let p: string = "/var/lib/dpkg/info/" + pkg + "." + kind
+    if fs::exists(p) is return p end
+    return nil
+end
+
+fn sort_by_len_desc(items: [string]) -> [string] is
+    let mut a: [string] = items
+    let mut i: int = 1
+    while i < a.len() is
+        let cur: string = a[i]
+        let mut j: int = i - 1
+        while j >= 0 && string_len(a[j]) < string_len(cur) is
+            a[j + 1] = a[j]
+            j -= 1
+        end
+        a[j + 1] = cur
+        i += 1
+    end
+    return a
+end
+
+;; Pliki z listy dpkg (najdluzsze sciezki najpierw); puste katalogi znikaja,
+;; niepuste zostaja. Brak listy to tylko ostrzezenie.
+pub fn remove_package_files(pkg: string, root: string) -> string is
+    let list_path: string = "/var/lib/dpkg/info/" + pkg + ".list"
+    if !fs::exists(list_path) is
+        log::warn("remove: no dpkg file list for " + pkg)
+        return ""
+    end
+    let lines: [string] = str::split(fs::read(list_path), "\n")
+    let mut paths: [string] = []
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i] != "" is paths.push(lines[i]) end
+        i += 1
+    end
+    let sorted: [string] = sort_by_len_desc(paths)
+    let mut k: int = 0
+    while k < sorted.len() is
+        let rel: string = sorted[k]
+        k += 1
+        let mut trimmed: string = rel
+        while trimmed.starts_with("/") is trimmed = str::slice(trimmed, 1, string_len(trimmed)) end
+        let full: string = compat::path_join(root, trimmed)
+        if system("test -L " + shq(full) + " -o -f " + shq(full)) == 0 is
+            system("rm -f -- " + shq(full))
+            log::file_op("remove", full)
+        elsif fs::is_dir(full) is
+            system("rmdir -- " + shq(full) + " 2>/dev/null")
+        end
+    end
+    return ""
+end
+
+;; ── execute_transaction_normal ───────────────────────────────────────────
+
+pub fn execute_transaction_normal(ctx: TransactionContext, note: string) -> string is
+    let plan: solver::TransactionPlan = ctx.plan
+    let idb: db::InstalledDb = ctx.db
+    let client: download::HttpClient = download::client_new()
+
+    if solver::plan_is_empty(plan) is
+        write("  " + ui::dim("·") + " Nothing to do.")
+        return ""
+    end
+    solver::print_summary(plan, false)
+
+    run_hook("pre-transaction", note)
+
+    let mut to_install: [package::Package] = []
+    let mut a: int = 0
+    while a < plan.to_install.len() is
+        to_install.push(plan.to_install[a])
+        a += 1
+    end
+    let mut b: int = 0
+    while b < plan.to_upgrade.len() is
+        to_install.push(plan.to_upgrade[b])
+        b += 1
+    end
+
+    if to_install.len() > 0 is
+        write("  " + ui::cyan_bold("⬡") + "  Downloading " + to_string(to_install.len()) + " package(s)…")
+        let dr: download::DownloadOutcome = download::download_packages(client, to_install)
+        if !dr.ok is return "Download: " + dr.err end
+        let downloads: [download::DownloadResult] = dr.results
+
+        ;; ── Weryfikacja podpisow ─────────────────────────────────────
+        let mut v: int = 0
+        while v < downloads.len() is
+            let verr: string = audit::verify_package_signature(downloads[v].path)
+            if verr != "" is
+                ui::eprint_line("  " + ui::red_bold("!") + " Signature verification failed for " + downloads[v].package.name + ": " + verr)
+                return "Aborting: signature verification failed for '" + downloads[v].package.name + "'"
+            end
+            v += 1
+        end
+
+        ;; ── Instalacja wprost na / ───────────────────────────────────
+        let staging: string = build_mode::staging_dir()
+        fs::mkdir(staging)
+        if !fs::is_dir(staging) is return "Cannot create " + staging end
+
+        let n_pkgs: int = downloads.len()
+        let sb: sandbox::PostinstSandbox = sandbox::sandbox_new()
+        let mut i: int = 0
+        while i < downloads.len() is
+            let dl: download::DownloadResult = downloads[i]
+            i += 1
+            let pkg: package::Package = dl.package
+            write("  " + ui::cyan("[" + to_string(i) + "/" + to_string(n_pkgs) + "]") + " Unpacking " + ui::bold(pkg.name) + "…")
+
+            let pr: deb::ParseResult = deb::parse_file(dl.path)
+            if pr.deb == nil is return "Parse .deb: " + pr.err end
+            let dd: deb::DebPackage = pr.deb
+
+            ;; prerm przy aktualizacji
+            if idb.is_installed(pkg.name) is
+                if dd.prerm != nil is
+                    let prerm: string = dd.prerm
+                    sandbox::run_prerm_script(sb, pkg.name, prerm)
+                end
+            end
+
+            ;; rozpakowanie na /
+            let ex: deb::ExtractResult = deb::unpack(dd, "/")
+            if ex.err != "" is
+                deb::cleanup(dd)
+                return "Unpack: " + ex.err
+            end
+            log::pkg("install-normal", pkg.name, pkg.version)
+
+            ;; postinst
+            if dd.postinst != nil is
+                let postinst: string = dd.postinst
+                let rr: sandbox::RunResult = sandbox::run_postinst(sb, pkg.name, postinst)
+                if !rr.ok is
+                    deb::cleanup(dd)
+                    return rr.err
+                end
+                if rr.result.exit_code != 0 is
+                    log::warn("postinst " + pkg.name + " exit " + to_string(rr.result.exit_code))
+                end
+            end
+
+            ;; conffiles (patrz D)
+            conffiles::register_package_conffiles(pkg.name)
+            deb::cleanup(dd)
+
+            ;; wpis w bazie
+            let reason: db::InstallReason = if contains_str(ctx.explicit, pkg.name) then db::InstallReason::User else db::InstallReason::Dependency
+            let ierr: string = idb.record_install_and_sync(pkg, reason, "", 0)
+            if ierr != "" is return ierr end
+        end
+        write("  " + ui::bright_green("✔") + " Installed " + ui::bold(to_string(n_pkgs)) + " package(s).")
+    end
+
+    ;; ── Usuniecia (to_remove + to_autoremove) ────────────────────────
+    let mut names: [string] = []
+    let mut r1: int = 0
+    while r1 < plan.to_remove.len() is
+        names.push(plan.to_remove[r1])
+        r1 += 1
+    end
+    let mut r2: int = 0
+    while r2 < plan.to_autoremove.len() is
+        names.push(plan.to_autoremove[r2])
+        r2 += 1
+    end
+
+    let mut n: int = 0
+    while n < names.len() is
+        let name: string = names[n]
+        n += 1
+        write("  " + ui::red("✘") + " Removing " + ui::bold(name) + "…")
+
+        let prerm: string? = find_maintainer_script(name, "prerm")
+        if prerm != nil is
+            let sp: string = prerm
+            let sb: sandbox::PostinstSandbox = sandbox::sandbox_new()
+            sandbox::run_prerm_script(sb, name, if fs::exists(sp) then fs::read(sp) else "")
+        end
+
+        let rerr: string = remove_package_files(name, "/")
+        if rerr != "" is return rerr end
+
+        let postrm: string? = find_maintainer_script(name, "postrm")
+        if postrm != nil is
+            let sp: string = postrm
+            let sb: sandbox::PostinstSandbox = sandbox::sandbox_new()
+            sandbox::run_postrm_script(sb, name, if fs::exists(sp) then fs::read(sp) else "", "remove")
+        end
+
+        let derr: string = idb.remove(name)
+        if derr != "" is return derr end
+        log::pkg("remove-normal", name, "")
+    end
+
+    run_hook("post-transaction", note)
+    write("  " + ui::bright_green_bold("✔") + " Transaction complete.")
+    return ""
+end
+
+;; ── Dyspozytor zalezny od trybu ──────────────────────────────────────────
+
+;; Jedyne miejsce wybierajace backend; wypisuje tylko UI wlasciwe dla niego.
+;; "" = Ok.
+pub fn run_transaction(ctx: TransactionContext, note: string) -> string is
+    if build_mode::normal_mode() is return execute_transaction_normal(ctx, note) end
+
+    let r: TxResult = execute_transaction(ctx, note)
+    if !r.ok is return r.err end
+    let lr: profile::LoadResult = profile::db_load()
+    if lr.err == "" is grub::update_grub(lr.db) end
+    ui::print_pending_notice(r.gen_num)
+    return ""
+end
+
+;; ── Straznik czesciowej instalacji (patrz 7) ─────────────────────────────
+
+pub struct RollbackGuard is
+    pub installed: [string]
+    pub activated: bool
+end
+
+pub fn guard_new() -> RollbackGuard is
+    let none: [string] = []
+    return RollbackGuard { installed: none, activated: false }
+end
+
+pub fn guard_record(g: RollbackGuard, name: string) -> RollbackGuard is
+    let mut out: [string] = g.installed
+    out.push(name)
+    return RollbackGuard { installed: out, activated: g.activated }
+end
+
+pub fn guard_commit(g: RollbackGuard) -> RollbackGuard is
+    return RollbackGuard { installed: g.installed, activated: true }
+end
+
+;; Odpowiednik `Drop`: bez `commit` usuwa z bazy zapisane pakiety.
+pub fn guard_finish(g: RollbackGuard) is
+    if !g.activated && g.installed.len() > 0 is
+        log::warn("transaction: rolling back partial install: " + str::join(g.installed, ", "))
+        let fresh: db::InstalledDb = db::InstalledDb::open()
+        let mut i: int = 0
+        while i < g.installed.len() is
+            fresh.remove(g.installed[i])
+            i += 1
+        end
+    end
+end
