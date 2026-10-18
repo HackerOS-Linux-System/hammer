@@ -1,0 +1,368 @@
+use "std -> fs"          from "fs"
+use "std -> strings"     from "str"
+use "std -> process"     from "proc"
+use "std -> collections" from "col"
+
+mod internal
+mod ui
+;; [mod profile pominiete: source-code/system/profile.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez system/mod.h# — wywolania profile::fn dzialaja bez zmian]
+;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
+
+;; hammer -> internal::diff
+;;
+;; Port of source-code/internal/diff.rs (Rust) to H#: roznica dwoch generacji
+;; (pakiety + pliki w magazynie) i `hammer diff`.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `HashMap<&str,&str>` -> natywne mapy (`std -> collections`, nazwa ->
+;;    wersja). `HashSet` -> mapa jako zbior + `sorting::unique`.
+;; 2. Wynik jest sortowany po nazwie/sciezce (jak w Rust); kolejnosc
+;;    iteracji HashMap w Rust byla losowa, ale `sort_by` ja normalizowal —
+;;    tu sortujemy WCZESNIEJ same klucze (`sorting::sorted`), wynik ten sam.
+;; 3. `anyhow::Result<GenDiff>` -> `GenDiff` (obliczenie nie ma sciezki
+;;    bledu: brak generacji = pusta mapa pakietow, tak jak
+;;    `.map(..).unwrap_or_default()` w Rust).
+;; 4. Zbieranie plikow: `read_dir` rekurencyjnie -> jedno `find -L … -printf`
+;;    na pakiet. `-L` odpowiada `path.is_dir()`/`metadata()` z Rust (podaza
+;;    za dowiazaniami; wiszace dowiazanie = rozmiar 0, bo `unwrap_or(0)`),
+;;    a dodatkowo `find` wykrywa petle dowiazan (Rust zapetlilby sie).
+;; 4b. Porownanie wersji: `package::version_cmp` (ten sam algorytm dpkg co
+;;    `solver::version::compare`); `mod version` z innego katalogu nie jest
+;;    pewnie osiagalny po samej nazwie pliku, a `package` jest juz uzywany.
+;; 5. `STORE_DIR` -> `build_mode::store_dir()` (zalezy od trybu).
+;; 6. `serde_json::json!` + `to_string_pretty` -> `json_output::{jobj,jfield,
+;;    pretty}`; klucze ALFABETYCZNIE jak w serde_json (BTreeMap): top-level
+;;    files/from/packages/to, pakiet from_ver/kind/name/to_ver.
+;; 7. ZACHOWANE ZACHOWANIA ORYGINALU (nie "naprawiam" po cichu):
+;;    a) plik uchodzi za `Modified` tylko gdy ZMIENIL SIE ROZMIAR — brak
+;;       porownania tresci/skrotu (identyczny rozmiar, inna tresc = brak zmiany);
+;;    b) `is_empty()` nie bierze pod uwage `conf_changes`;
+;;    c) `compute_conf_diff` to zaslepka (zawsze pusta) takze w Rust;
+;;    d) `Downgraded` = kazda zmiana wersji, ktora nie jest `Greater`
+;;       (rowne wg dpkg, np. `1.0` vs `0:1.0`, tez trafia tu).
+;; 8. `print_diff(diff, full, json)` zwraca `string` ("" = OK), konwencja
+;;    portu zamiast `anyhow::Result<()>`. Prosty wariant z `ui.rs` to
+;;    `ui::print_diff` (patrz ui/ui.h#).
+
+;; ── Typy ─────────────────────────────────────────────────────────────────
+
+pub enum ChangeKind is
+    Added
+    Removed
+    Upgraded
+    Downgraded
+end
+
+pub fn kind_label(k: ChangeKind) -> string is
+    match k is
+        ChangeKind::Added      => is return "added" end
+        ChangeKind::Removed    => is return "removed" end
+        ChangeKind::Upgraded   => is return "upgraded" end
+        ChangeKind::Downgraded => is return "downgraded" end
+    end
+end
+
+pub struct PkgChange is
+    pub name:     string
+    pub kind:     ChangeKind
+    pub from_ver: string?
+    pub to_ver:   string?
+end
+
+pub enum FileChangeKind is
+    Added
+    Removed
+    Modified
+end
+
+pub struct FileChange is
+    pub path: string
+    pub kind: FileChangeKind
+end
+
+pub struct GenDiff is
+    pub from_gen:     int
+    pub to_gen:       int
+    pub pkg_changes:  [PkgChange]
+    pub file_changes: [FileChange]
+    pub conf_changes: [FileChange]
+end
+
+fn count_kind(d: GenDiff, label: string) -> int is
+    let mut n: int = 0
+    let mut i: int = 0
+    while i < d.pkg_changes.len() is
+        if kind_label(d.pkg_changes[i].kind) == label is n += 1 end
+        i += 1
+    end
+    return n
+end
+
+;; Rust: `is_empty` — tylko pakiety i pliki (patrz 7b).
+pub fn diff_is_empty(d: GenDiff) -> bool is
+    return d.pkg_changes.len() == 0 && d.file_changes.len() == 0
+end
+
+pub fn n_added(d: GenDiff) -> int is return count_kind(d, "added") end
+
+pub fn n_removed(d: GenDiff) -> int is return count_kind(d, "removed") end
+
+pub fn n_upgraded(d: GenDiff) -> int is
+    return count_kind(d, "upgraded") + count_kind(d, "downgraded")
+end
+
+;; ── Obliczanie ───────────────────────────────────────────────────────────
+
+pub struct NameMap is
+    ;; nazwa -> wersja
+    pub map:   any
+    pub names: [string]
+end
+
+fn pkg_map(gdb: profile::GenerationsDb, number: int) -> NameMap is
+    let m: any = col::hashmap_new()
+    let mut names: [string] = []
+    let g: profile::Generation? = profile::db_get(gdb, number)
+    if g != nil is
+        let gen: profile::Generation = g
+        let mut i: int = 0
+        while i < gen.packages.len() is
+            let p: profile::GenPackage = gen.packages[i]
+            ;; HashMap::collect: ostatni wpis o tej samej nazwie wygrywa
+            if !col::hashmap_contains(m, p.name) is names.push(p.name) end
+            col::hashmap_insert(m, p.name, p.version)
+            i += 1
+        end
+    end
+    return NameMap { map: m, names: names }
+end
+
+pub fn compute_diff(from_n: int, to_n: int, gdb: profile::GenerationsDb) -> GenDiff is
+    let a: NameMap = pkg_map(gdb, from_n)
+    let b: NameMap = pkg_map(gdb, to_n)
+
+    let all_names: [string] = sorting::sorted(sorting::unique(sorting::concat(a.names, b.names), col::hashmap_new()))
+
+    let mut pkg_changes: [PkgChange] = []
+    let mut i: int = 0
+    while i < all_names.len() is
+        let name: string = all_names[i]
+        let in_from: bool = col::hashmap_contains(a.map, name)
+        let in_to: bool = col::hashmap_contains(b.map, name)
+        if in_from && in_to is
+            let old_ver: string = col::hashmap_get(a.map, name)
+            let new_ver: string = col::hashmap_get(b.map, name)
+            if old_ver != new_ver is
+                let ord: int = package::version_cmp(new_ver, old_ver)
+                let kind: ChangeKind = if ord > 0 then ChangeKind::Upgraded else ChangeKind::Downgraded
+                pkg_changes.push(PkgChange { name: name, kind: kind, from_ver: old_ver, to_ver: new_ver })
+            end
+        elsif in_to is
+            pkg_changes.push(PkgChange { name: name, kind: ChangeKind::Added, from_ver: nil, to_ver: col::hashmap_get(b.map, name) })
+        else is
+            pkg_changes.push(PkgChange { name: name, kind: ChangeKind::Removed, from_ver: col::hashmap_get(a.map, name), to_ver: nil })
+        end
+        i += 1
+    end
+
+    return GenDiff { from_gen: from_n, to_gen: to_n, pkg_changes: pkg_changes,
+        file_changes: compute_file_diff(from_n, to_n, gdb), conf_changes: compute_conf_diff(from_n, to_n) }
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+pub struct FileMap is
+    ;; sciezka wzgledna -> rozmiar (tekst)
+    pub map:   any
+    pub paths: [string]
+end
+
+;; Pliki wszystkich pakietow generacji w magazynie (rozmiary w bajtach).
+fn collect_store_files(number: int, gdb: profile::GenerationsDb) -> FileMap is
+    let m: any = col::hashmap_new()
+    let mut paths: [string] = []
+    let go: profile::Generation? = profile::db_get(gdb, number)
+    if go == nil is return FileMap { map: m, paths: paths } end
+    let gen: profile::Generation = go
+    let store: string = build_mode::store_dir()
+    let mut pi: int = 0
+    while pi < gen.packages.len() is
+        let p: profile::GenPackage = gen.packages[pi]
+        let dir: string = compat::path_join(store, p.name + "-" + p.version + "-" + p.store_hash)
+        if fs::is_dir(dir) is
+            let out: string = proc::shell("cd " + shq(dir) + " && find -L . \\( -type f -o -type l \\) -printf '%P\\t%s\\n' 2>/dev/null")
+            let lines: [string] = str::split(out, "\n")
+            let mut li: int = 0
+            while li < lines.len() is
+                let line: string = lines[li]
+                let tab: int = compat::str_index_of(line, "\t")
+                if tab > 0 is
+                    let rel: string = str::slice(line, 0, tab)
+                    if !col::hashmap_contains(m, rel) is paths.push(rel) end
+                    ;; map.insert: pozniejszy pakiet nadpisuje rozmiar
+                    col::hashmap_insert(m, rel, str::slice(line, tab + 1, string_len(line)))
+                end
+                li += 1
+            end
+        end
+        pi += 1
+    end
+    return FileMap { map: m, paths: paths }
+end
+
+fn compute_file_diff(from_n: int, to_n: int, gdb: profile::GenerationsDb) -> [FileChange] is
+    let a: FileMap = collect_store_files(from_n, gdb)
+    let b: FileMap = collect_store_files(to_n, gdb)
+    let all: [string] = sorting::sorted(sorting::unique(sorting::concat(a.paths, b.paths), col::hashmap_new()))
+    let mut changes: [FileChange] = []
+    let mut i: int = 0
+    while i < all.len() is
+        let p: string = all[i]
+        let in_from: bool = col::hashmap_contains(a.map, p)
+        let in_to: bool = col::hashmap_contains(b.map, p)
+        if in_to && !in_from is
+            changes.push(FileChange { path: p, kind: FileChangeKind::Added })
+        elsif in_from && !in_to is
+            changes.push(FileChange { path: p, kind: FileChangeKind::Removed })
+        elsif in_from && in_to is
+            ;; patrz 7a: tylko rozmiar
+            if col::hashmap_get(a.map, p) != col::hashmap_get(b.map, p) is
+                changes.push(FileChange { path: p, kind: FileChangeKind::Modified })
+            end
+        end
+        i += 1
+    end
+    return changes
+end
+
+;; Zaslepka takze w oryginale (patrz 7c).
+fn compute_conf_diff(from_n: int, to_n: int) -> [FileChange] is
+    let none: [FileChange] = []
+    return none
+end
+
+;; ── Wypisywanie ──────────────────────────────────────────────────────────
+
+fn ver_or_q(v: string?) -> string is
+    if v == nil is return "?" end
+    let s: string = v
+    return s
+end
+
+pub fn print_diff(d: GenDiff, full: bool, json: bool) -> string is
+    if json is return print_diff_json(d) end
+
+    write("")
+    write("  " + ui::bright_cyan_bold("⬡") + "  Diff: gen-" + to_string(d.from_gen) + " → gen-" + to_string(d.to_gen))
+    write("  " + ui::dim(str::repeat("─", 60)))
+
+    if diff_is_empty(d) is
+        write("  " + ui::dim("·") + " No changes between gen-" + to_string(d.from_gen) + " and gen-" + to_string(d.to_gen) + ".")
+        return ""
+    end
+
+    let mut i: int = 0
+    while i < d.pkg_changes.len() is
+        let c: PkgChange = d.pkg_changes[i]
+        let mut sym: string = ""
+        let mut line: string = ""
+        match c.kind is
+            ChangeKind::Added => is
+                sym = ui::bright_green("++")
+                line = ui::bold(c.name) + " → " + ui::green(ver_or_q(c.to_ver))
+            end
+            ChangeKind::Removed => is
+                sym = ui::red("--")
+                line = ui::bold(c.name) + " " + ui::dim(ver_or_q(c.from_ver))
+            end
+            ChangeKind::Upgraded => is
+                sym = ui::bright_yellow("~~")
+                line = ui::bold(c.name) + ": " + ui::dim(ver_or_q(c.from_ver)) + " → " + ui::bright_yellow(ver_or_q(c.to_ver))
+            end
+            ChangeKind::Downgraded => is
+                sym = ui::red("↓↓")
+                line = ui::bold(c.name) + ": " + ui::dim(ver_or_q(c.from_ver)) + " → " + ui::red(ver_or_q(c.to_ver))
+            end
+        end
+        write("  " + sym + "  " + line)
+        i += 1
+    end
+
+    if full && d.file_changes.len() > 0 is
+        write("")
+        write("  " + ui::bold("File changes:"))
+        let mut fi: int = 0
+        while fi < d.file_changes.len() is
+            let fc: FileChange = d.file_changes[fi]
+            let mut sym: string = ""
+            let mut col_s: string = ""
+            match fc.kind is
+                FileChangeKind::Added => is
+                    sym = "+"
+                    col_s = ui::green(fc.path)
+                end
+                FileChangeKind::Removed => is
+                    sym = "-"
+                    col_s = ui::red(fc.path)
+                end
+                FileChangeKind::Modified => is
+                    sym = "~"
+                    col_s = ui::yellow(fc.path)
+                end
+            end
+            write("  " + ui::dim(sym) + " " + col_s)
+            fi += 1
+        end
+    end
+
+    write("")
+    write("  " + ui::bold("Summary:") + " +" + ui::green(to_string(n_added(d))) + " upgraded:" + ui::yellow(to_string(n_upgraded(d))) + " removed:" + ui::red(to_string(n_removed(d))))
+
+    if !full && d.file_changes.len() > 0 is
+        write("  " + ui::dim("·") + " " + to_string(d.file_changes.len()) + " file change(s). Use " + ui::cyan("--full") + " for details.")
+    end
+    return ""
+end
+
+fn file_kind_label(k: FileChangeKind) -> string is
+    match k is
+        FileChangeKind::Added    => is return "added" end
+        FileChangeKind::Removed  => is return "removed" end
+        FileChangeKind::Modified => is return "modified" end
+    end
+end
+
+;; Uklad jak `serde_json::to_string_pretty` (2 spacje, puste tablice `[]`).
+fn print_diff_json(d: GenDiff) -> string is
+    ;; Klucze alfabetycznie (files, from, packages, to) — `serde_json::json!`
+    ;; bez `preserve_order` trzyma je w BTreeMap. Zwarty JSON + `pretty` z
+    ;; `ui/json_output.h#` daje uklad `to_string_pretty`.
+    let mut pk: [string] = []
+    let mut i: int = 0
+    while i < d.pkg_changes.len() is
+        let c: PkgChange = d.pkg_changes[i]
+        pk.push(json_output::jobj([
+            json_output::jfield("from_ver", json_output::jstr_opt(c.from_ver)),
+            json_output::jfield("kind", json_output::jstr(kind_label(c.kind))),
+            json_output::jfield("name", json_output::jstr(c.name)),
+            json_output::jfield("to_ver", json_output::jstr_opt(c.to_ver))]))
+        i += 1
+    end
+    let mut fl: [string] = []
+    let mut j: int = 0
+    while j < d.file_changes.len() is
+        let f: FileChange = d.file_changes[j]
+        fl.push(json_output::jobj([
+            json_output::jfield("kind", json_output::jstr(file_kind_label(f.kind))),
+            json_output::jfield("path", json_output::jstr(f.path))]))
+        j += 1
+    end
+    write(json_output::pretty(json_output::jobj([
+        json_output::jfield("files", json_output::jarr(fl)),
+        json_output::jfield("from", json_output::jint(d.from_gen)),
+        json_output::jfield("packages", json_output::jarr(pk)),
+        json_output::jfield("to", json_output::jint(d.to_gen))])))
+    return ""
+end
