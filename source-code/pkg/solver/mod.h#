@@ -1,0 +1,263 @@
+use "std -> strings" from "str"
+use "std -> conv"    from "conv"
+
+mod internal
+mod package
+mod ui
+mod cache
+mod db
+mod pins
+mod multi_arch
+mod version
+mod error
+mod provides
+mod conflicts
+mod sat
+mod resolve
+mod explain
+mod tests
+mod libsolv
+
+;; hammer -> pkg::solver   (CZESCIOWY port source-code/pkg/solver/mod.rs)
+;;
+;; Przepisane TYLKO: `TransactionPlan` (+ `is_empty`, `print_summary`,
+;; `fmt_bytes`) i `SolverStats` — to, czego potrzebuje `pkg/transaction.h#`.
+;; Osobne pliki (juz przepisane): `version.h#`, `error.h#`, `provides.h#`,
+;; `conflicts.h#`.
+;; `sat.h#` (DPLL zamiast CDCL), `resolve.h#` (rozwiazywanie zaleznosci).
+;; Fasada `Solver` na koncu tego pliku; `SolverBackend` pominiety (jedyny
+;; silnik to DPLL, `Dpll` w Rust byl usuniety jako martwy kod).
+;; `tests.rs` (546) -> `tests.h#` (SAT + resolver; patrz jego naglowek).
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `HashMap<String,String> upgrade_from` -> rownolegle tablice
+;;    `upgrade_from_names` / `upgrade_from_versions` (+ `plan_upgrade_from`,
+;;    `plan_has_upgrade_from`).
+;; 2. `Option<sat::SolverStats>` -> `sat_stats: SolverStats?`; sama struktura
+;;    `SolverStats` zyje na razie tu (zostanie przeniesiona do `sat.h#`).
+;; 3. `#[derive(Default)]` -> `plan_empty()`.
+;; 4. `fmt_bytes`: `{:.1}`/`{:.2}` na f64 -> arytmetyka calkowita
+;;    (zaokraglenie polowek w gore), jak w `ui::human_size`.
+;; 5. `println!` z kolorami -> `ui::`.
+
+pub struct SolverStats is
+    pub n_vars:    int
+    pub n_clauses: int
+    pub conflicts: int
+    pub decisions: int
+    pub restarts:  int
+end
+
+pub struct TransactionPlan is
+    pub to_install:          [package::Package]
+    pub to_upgrade:          [package::Package]
+    pub to_remove:           [string]
+    pub to_autoremove:       [string]
+    pub upgrade_from_names:    [string]
+    pub upgrade_from_versions: [string]
+    pub download_bytes:      int
+    pub install_bytes:       int
+    pub freed_bytes:         int
+    pub warnings:            [string]
+    pub conflicts:           [string]
+    pub sat_stats:           SolverStats?
+end
+
+pub fn plan_empty() -> TransactionPlan is
+    let a: [package::Package] = []
+    let b: [package::Package] = []
+    let c: [string] = []
+    let d: [string] = []
+    let e: [string] = []
+    let f: [string] = []
+    let g: [string] = []
+    let h: [string] = []
+    return TransactionPlan { to_install: a, to_upgrade: b, to_remove: c, to_autoremove: d,
+        upgrade_from_names: e, upgrade_from_versions: f, download_bytes: 0, install_bytes: 0, freed_bytes: 0,
+        warnings: g, conflicts: h, sat_stats: nil }
+end
+
+pub fn plan_is_empty(p: TransactionPlan) -> bool is
+    return p.to_install.len() == 0 && p.to_upgrade.len() == 0 && p.to_remove.len() == 0 && p.to_autoremove.len() == 0
+end
+
+;; Stara wersja pakietu przy upgrade (nil gdy to nie upgrade).
+pub fn plan_upgrade_from(p: TransactionPlan, name: string) -> string? is
+    let mut i: int = 0
+    while i < p.upgrade_from_names.len() is
+        if p.upgrade_from_names[i] == name is return p.upgrade_from_versions[i] end
+        i += 1
+    end
+    return nil
+end
+
+pub fn plan_has_upgrade_from(p: TransactionPlan, name: string) -> bool is
+    return plan_upgrade_from(p, name) != nil
+end
+
+;; Dopisuje wpis `upgrade_from` (HashMap::insert: pozniejszy nadpisuje).
+pub fn plan_set_upgrade_from(p: TransactionPlan, name: string, old_version: string) -> TransactionPlan is
+    let mut names: [string] = []
+    let mut vers: [string] = []
+    let mut replaced: bool = false
+    let mut i: int = 0
+    while i < p.upgrade_from_names.len() is
+        if p.upgrade_from_names[i] == name is
+            names.push(name)
+            vers.push(old_version)
+            replaced = true
+        else is
+            names.push(p.upgrade_from_names[i])
+            vers.push(p.upgrade_from_versions[i])
+        end
+        i += 1
+    end
+    if !replaced is
+        names.push(name)
+        vers.push(old_version)
+    end
+    let mut out: TransactionPlan = p
+    out.upgrade_from_names = names
+    out.upgrade_from_versions = vers
+    return out
+end
+
+fn hundredths(nbytes: int, div: int) -> string is
+    let t: int = (nbytes * 100 + div / 2) / div
+    let frac: int = t % 100
+    return to_string(t / 100) + "." + (if frac < 10 then "0" + to_string(frac) else to_string(frac))
+end
+
+fn tenths(nbytes: int, div: int) -> string is
+    let t: int = (nbytes * 10 + div / 2) / div
+    return to_string(t / 10) + "." + to_string(t % 10)
+end
+
+pub fn fmt_bytes(b: int) -> string is
+    if b < 1024 is return to_string(b) + " B" end
+    if b < 1048576 is return tenths(b, 1024) + " KiB" end
+    if b < 1073741824 is return tenths(b, 1048576) + " MiB" end
+    return hundredths(b, 1073741824) + " GiB"
+end
+
+pub fn print_summary(p: TransactionPlan, verbose: bool) is
+    if p.to_install.len() > 0 is
+        write("  " + ui::bright_cyan_bold("↓") + " " + to_string(p.to_install.len()) + " package(s) to install:")
+        let mut i: int = 0
+        while i < p.to_install.len() is
+            write("    " + ui::dim("·") + " " + ui::cyan(p.to_install[i].name) + "  (" + ui::dim(p.to_install[i].version) + ")")
+            i += 1
+        end
+    end
+    if p.to_upgrade.len() > 0 is
+        write("  " + ui::bright_yellow_bold("↑") + " " + to_string(p.to_upgrade.len()) + " package(s) to upgrade:")
+        let mut i: int = 0
+        while i < p.to_upgrade.len() is
+            let from: string? = plan_upgrade_from(p, p.to_upgrade[i].name)
+            let from_s: string = if from == nil then "?" else from
+            write("    " + ui::dim("·") + " " + ui::cyan(p.to_upgrade[i].name) + "  " + ui::dim(from_s) + " → " +
+                  ui::bright_yellow(p.to_upgrade[i].version))
+            i += 1
+        end
+    end
+    if p.to_remove.len() > 0 is
+        write("  " + ui::red_bold("✘") + " " + to_string(p.to_remove.len()) + " package(s) to remove:")
+        let mut i: int = 0
+        while i < p.to_remove.len() is
+            write("    " + ui::dim("·") + " " + ui::red(p.to_remove[i]))
+            i += 1
+        end
+    end
+    if p.to_autoremove.len() > 0 is
+        write("  " + ui::dim("✘") + " " + to_string(p.to_autoremove.len()) + " package(s) to auto-remove:")
+        let mut i: int = 0
+        while i < p.to_autoremove.len() is
+            write("    " + ui::dim("·") + " " + ui::dim(p.to_autoremove[i]))
+            i += 1
+        end
+    end
+    ;; ostrzezenia (takze podpowiedzi)
+    let mut w: int = 0
+    while w < p.warnings.len() is
+        let line: string = p.warnings[w]
+        w += 1
+        let icon: string = if line.starts_with("  ℹ") then "" else "  " + ui::yellow_bold("⚠") + " "
+        write(icon + ui::yellow(line))
+    end
+    if p.download_bytes > 0 is write("  " + ui::dim("·") + " Download  : " + fmt_bytes(p.download_bytes)) end
+    if p.install_bytes > 0 is write("  " + ui::dim("·") + " Disk usage: +" + fmt_bytes(p.install_bytes)) end
+    if p.freed_bytes > 0 is write("  " + ui::dim("·") + " Freed     : -" + fmt_bytes(p.freed_bytes)) end
+    if verbose && p.sat_stats != nil is
+        let st: SolverStats = p.sat_stats
+        write("  " + ui::dim("·") + " SAT: vars=" + to_string(st.n_vars) + " clauses=" + to_string(st.n_clauses) +
+              " conflicts=" + to_string(st.conflicts) + " decisions=" + to_string(st.decisions) + " restarts=" + to_string(st.restarts))
+    end
+end
+
+;; ── Fasada Solver ────────────────────────────────────────────────────────
+
+pub struct Solver is
+    pub cache:      cache::PackageCache
+    pub idb:        db::InstalledDb
+    pub pins:       pins::PinDb
+    pub multi_arch: multi_arch::MultiArchDb
+end
+
+;; Rust: `Solver::new(cache, db)` (+ `PinDb::load().unwrap_or_default()`).
+pub fn solver_new(c: cache::PackageCache, idb: db::InstalledDb) -> Solver is
+    return Solver { cache: c, idb: idb, pins: pins::pindb_load(), multi_arch: multi_arch::multi_arch_db_load() }
+end
+
+;; Wynik rozwiazywania: plan albo blad ("" = OK). `anyhow::Result<TransactionPlan>`.
+pub struct PlanResult is
+    pub plan: TransactionPlan
+    pub err:  string
+end
+
+pub fn plan_ok(p: TransactionPlan) -> PlanResult is
+    return PlanResult { plan: p, err: "" }
+end
+
+pub fn plan_err(msg: string) -> PlanResult is
+    return PlanResult { plan: plan_empty(), err: msg }
+end
+
+pub fn solver_resolve_install(s: Solver, names: [string], no_recommends: bool) -> PlanResult is
+    return resolve::resolve_install(s, names, no_recommends)
+end
+
+pub fn solver_resolve_reinstall(s: Solver, names: [string]) -> PlanResult is
+    return resolve::resolve_reinstall(s, names)
+end
+
+pub fn solver_resolve_remove(s: Solver, names: [string]) -> PlanResult is
+    return resolve::resolve_remove(s, names)
+end
+
+pub fn solver_resolve_upgrade(s: Solver) -> PlanResult is
+    return resolve::resolve_upgrade(s)
+end
+
+pub fn solver_resolve_dist_upgrade(s: Solver) -> PlanResult is
+    return resolve::resolve_dist_upgrade(s)
+end
+
+pub fn solver_resolve_autoremove(s: Solver) -> PlanResult is
+    return resolve::resolve_autoremove(s)
+end
+
+pub fn solver_resolve_fix_broken(s: Solver) -> PlanResult is
+    return resolve::resolve_fix_broken(s)
+end
+
+;; Do 6 podobnych nazw (Rust: `cache.search(lowercase).take(6)`).
+pub fn solver_find_similar(s: Solver, name: string) -> [string] is
+    let hits: [package::Package] = cache::cache_search(s.cache, str::to_lower(name))
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < hits.len() && i < 6 is
+        out.push(hits[i].name)
+        i += 1
+    end
+    return out
+end
