@@ -1,0 +1,1273 @@
+use "std -> strings"     from "str"
+use "std -> collections" from "col"
+
+mod internal
+mod package
+mod cache
+mod db
+mod pins
+mod provides
+mod conflicts
+mod version
+mod sat
+mod libsolv
+mod solver
+
+;; hammer -> pkg::solver::resolve
+;;
+;; Port of source-code/pkg/solver/resolve.rs (Rust) to H#: iteracyjny
+;; resolver w stylu zypper (heurystyka) + weryfikacja SAT.
+;;
+;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
+;; 1. `Result<T>` (`bail!`/`?`) -> `solver::PlanResult { plan, err }`; wewnatrz
+;;    kontekst niesie `err` i kazdy krok sprawdza go na wejsciu (pierwszy
+;;    blad wygrywa, tak jak `?`).
+;; 2. `ResolveCtx` jest wartoscia przekazywana i ZWRACANA (`ctx = f(ctx, ..)`):
+;;    interpreter H# przekazuje struktury przez wartosc, a LLVM przez
+;;    wskaznik (patrz PORT_STATUS.md) — jedyny styl dzialajacy w obu. Mapy
+;;    (`std -> collections`) sa uchwytami wspoldzielonymi (tylko w LLVM).
+;; 3. `HashMap<String,(Package,InstallReason)> to_install` -> rownolegle
+;;    tablice (`inst_names/inst_pkgs/inst_reason`) + mapa `inst_idx`
+;;    (nazwa -> pozycja). Kolejnosc = kolejnosc dodania — w Rust iteracja po
+;;    HashMap byla losowa, wiec `topological_order` mial niedeterministyczne
+;;    remisy; tu sa deterministyczne.
+;; 4. `HashSet`/`VecDeque` -> `NameSet` (mapa + tablica nazw) i tablica z
+;;    indeksem glowy.
+;; 5. `run_cdcl_verification` uzywa `sat.h#` (DPLL zamiast CDCL; patrz tam).
+;;    Logika klauzul (jednostki, implikacje zaleznosci, konflikty z pominieciem
+;;    samokonfliktu i ograniczen wersji) jest zachowana.
+;; 6. ZACHOWANY BLAD ORYGINALU: sprawdzenie pinu w `request_install` woła
+;;    `version::satisfies(pkg.version, constraint, inst.version)`, czyli
+;;    z `constraint` w roli OPERATORA i `inst.version` w roli wersji — to
+;;    nigdy nie jest znanym operatorem, wiec `satisfies` zwraca `false` i
+;;    KAZDY zainstalowany pakiet z pinem jest pomijany ("pinned to ...:
+;;    skipping"). Prawdopodobnie zamierzone: `satisfies(pkg.version, op,
+;;    constraint)` po rozbiciu pinu na operator+wersje. Nie zmieniam bez
+;;    Twojej decyzji.
+;; 7. `score += download_size / -1024` (dzielenie calkowite przez -1024) jak w
+;;    Rust: H# `/` na int obcina ku zeru, tak samo jak Rust.
+
+;; ── Zbior nazw ───────────────────────────────────────────────────────────
+
+pub struct NameSet is
+    pub map:   any
+    pub names: [string]
+end
+
+fn set_new() -> NameSet is
+    let n: [string] = []
+    return NameSet { map: col::hashmap_new(), names: n }
+end
+
+fn set_has(s: NameSet, name: string) -> bool is
+    return col::hashmap_contains(s.map, name)
+end
+
+;; Dodaje nazwe; zwraca nowy zbior (obejmuje dedupe).
+fn set_add(s: NameSet, name: string) -> NameSet is
+    if col::hashmap_contains(s.map, name) is return s end
+    col::hashmap_insert(s.map, name, "1")
+    return NameSet { map: s.map, names: append_str(s.names, name) }
+end
+
+fn append_str(a: [string], x: string) -> [string] is
+    let mut o: [string] = a
+    o.push(x)
+    return o
+end
+
+fn append_pkg(a: [package::Package], x: package::Package) -> [package::Package] is
+    let mut o: [package::Package] = a
+    o.push(x)
+    return o
+end
+
+fn contains_str(xs: [string], s: string) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == s is return true end
+        i += 1
+    end
+    return false
+end
+
+fn remove_str(xs: [string], s: string) -> [string] is
+    let mut o: [string] = []
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] != s is o.push(xs[i]) end
+        i += 1
+    end
+    return o
+end
+
+fn dep_field_strs(pkg: package::Package, with_recommends: bool) -> [string] is
+    let mut out: [string] = []
+    if pkg.pre_depends != nil is
+        let a: string = pkg.pre_depends
+        out.push(a)
+    end
+    if pkg.depends != nil is
+        let b: string = pkg.depends
+        out.push(b)
+    end
+    if with_recommends && pkg.recommends != nil is
+        let c: string = pkg.recommends
+        out.push(c)
+    end
+    return out
+end
+
+fn is_essential(s: solver::Solver, name: string) -> bool is
+    let p: package::Package? = cache::cache_get(s.cache, name)
+    if p == nil is return false end
+    let pk: package::Package = p
+    return pk.essential
+end
+
+fn user_installed_names(s: solver::Solver) -> [string] is
+    let list: [db::InstalledPackage] = s.idb.list_user_installed()
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < list.len() is
+        out.push(list[i].name)
+        i += 1
+    end
+    return out
+end
+
+;; ── Kontekst ─────────────────────────────────────────────────────────────
+
+;; Powod instalacji: 0 = Explicit, 1 = Dependency, 2 = Recommends.
+fn reason_explicit() -> int is return 0 end
+fn reason_dependency() -> int is return 1 end
+fn reason_recommends() -> int is return 2 end
+
+pub struct ResolveCtx is
+    pub solver:        solver::Solver
+    pub pmap:          provides::ProvidesMap
+    pub no_recommends: bool
+    ;; do zainstalowania w tej transakcji (kolejnosc dodania)
+    pub inst_names:    [string]
+    pub inst_pkgs:     [package::Package]
+    pub inst_reason:   [int]
+    ;; nazwa -> pozycja w inst_* (jako tekst)
+    pub inst_idx:      any
+    pub to_remove:     [string]
+    ;; pakiety w trakcie rozwiazywania (wykrywanie cykli)
+    pub resolving:     [string]
+    pub pre_depends:   [string]
+    pub warnings:      [string]
+    pub suggests:      [string]
+    pub stats:         solver::SolverStats?
+    pub err:           string
+end
+
+fn ctx_new(s: solver::Solver, pmap: provides::ProvidesMap, no_recommends: bool) -> ResolveCtx is
+    let a: [string] = []
+    let b: [package::Package] = []
+    let c: [int] = []
+    let d: [string] = []
+    let e: [string] = []
+    let f: [string] = []
+    let g: [string] = []
+    let h: [string] = []
+    return ResolveCtx { solver: s, pmap: pmap, no_recommends: no_recommends,
+        inst_names: a, inst_pkgs: b, inst_reason: c, inst_idx: col::hashmap_new(),
+        to_remove: d, resolving: e, pre_depends: f, warnings: g, suggests: h,
+        stats: nil, err: "" }
+end
+
+fn ctx_fail(ctx: ResolveCtx, msg: string) -> ResolveCtx is
+    let mut c: ResolveCtx = ctx
+    c.err = msg
+    return c
+end
+
+fn ctx_warn(ctx: ResolveCtx, msg: string) -> ResolveCtx is
+    let mut c: ResolveCtx = ctx
+    c.warnings = append_str(c.warnings, msg)
+    return c
+end
+
+fn ctx_planned(ctx: ResolveCtx, name: string) -> bool is
+    return col::hashmap_contains(ctx.inst_idx, name)
+end
+
+fn ctx_planned_pkg(ctx: ResolveCtx, name: string) -> package::Package is
+    return ctx.inst_pkgs[conv::str_to_int(col::hashmap_get(ctx.inst_idx, name))]
+end
+
+fn ctx_add_install(ctx: ResolveCtx, pkg: package::Package, reason: int) -> ResolveCtx is
+    let mut c: ResolveCtx = ctx
+    col::hashmap_insert(c.inst_idx, pkg.name, to_string(c.inst_names.len()))
+    c.inst_names = append_str(c.inst_names, pkg.name)
+    c.inst_pkgs = append_pkg(c.inst_pkgs, pkg)
+    c.inst_reason = append_int(c.inst_reason, reason)
+    return c
+end
+
+fn append_int(a: [int], x: int) -> [int] is
+    let mut o: [int] = a
+    o.push(x)
+    return o
+end
+
+;; Usuwa pakiet z planu instalacji (przebudowuje tablice i mape).
+fn ctx_drop_install(ctx: ResolveCtx, name: string) -> ResolveCtx is
+    let mut c: ResolveCtx = ctx
+    let mut names: [string] = []
+    let mut pkgs: [package::Package] = []
+    let mut reasons: [int] = []
+    let idx: any = col::hashmap_new()
+    let mut i: int = 0
+    while i < c.inst_names.len() is
+        if c.inst_names[i] != name is
+            col::hashmap_insert(idx, c.inst_names[i], to_string(names.len()))
+            names.push(c.inst_names[i])
+            pkgs.push(c.inst_pkgs[i])
+            reasons.push(c.inst_reason[i])
+        end
+        i += 1
+    end
+    c.inst_names = names
+    c.inst_pkgs = pkgs
+    c.inst_reason = reasons
+    c.inst_idx = idx
+    return c
+end
+
+fn should_upgrade(ctx: ResolveCtx, pkg: package::Package) -> bool is
+    let io: db::InstalledPackage? = ctx.solver.idb.get(pkg.name)
+    if io == nil is return false end
+    let inst: db::InstalledPackage = io
+    return version::compare(pkg.version, inst.version) > 0
+end
+
+;; ── request_install ──────────────────────────────────────────────────────
+
+fn bare_name(name: string) -> string is
+    let i: int = compat::str_index_of(name, ":")
+    if i < 0 is return name end
+    return str::slice(name, 0, i)
+end
+
+fn ctx_request_install(ctx0: ResolveCtx, name: string) -> ResolveCtx is
+    if ctx0.err != "" is return ctx0 end
+    let mut ctx: ResolveCtx = ctx0
+    let s: solver::Solver = ctx.solver
+    let bare: string = bare_name(name)
+
+    ;; Juz spelnione przez zainstalowany pakiet?
+    let cached: package::Package? = cache::cache_get(s.cache, bare)
+    let mut upgradable: bool = false
+    if cached != nil is
+        let cp: package::Package = cached
+        upgradable = should_upgrade(ctx, cp)
+    end
+    if provides::is_satisfied(ctx.pmap, bare) && !upgradable is
+        if s.idb.is_installed(bare) is
+            return ctx_warn(ctx, "'" + bare + "' is already installed.")
+        end
+    end
+
+    ;; Przez ProvidesMap (pakiety wirtualne)
+    let real_name: string = provides::provides_resolve(ctx.pmap, bare)
+    let direct: package::Package? = cache::cache_get(s.cache, real_name)
+    let mut pkg: package::Package = package::empty_package()
+    if direct != nil is
+        pkg = direct
+    else is
+        let providers: [string] = provides::providers_of(ctx.pmap, bare)
+        if providers.len() == 0 is
+            let similar: [string] = solver::solver_find_similar(s, bare)
+            let hint: string = if similar.len() == 0 then "Run 'hammer sync' to refresh the package index." else "Did you mean: " + str::join(similar, ", ") + "?"
+            return ctx_fail(ctx, "Package '" + bare + "' not found.\n  " + hint)
+        end
+        let provider: string = providers[0]
+        let po: package::Package? = cache::cache_get(s.cache, provider)
+        if po == nil is
+            return ctx_fail(ctx, "Provider '" + provider + "' for '" + bare + "' not in cache.")
+        end
+        pkg = po
+    end
+
+    ;; Hold
+    if s.idb.is_held(pkg.name) is
+        let held_ver: string = ""
+        let io: db::InstalledPackage? = s.idb.get(pkg.name)
+        let mut hv: string = held_ver
+        if io != nil is
+            let ip: db::InstalledPackage = io
+            hv = ip.version
+        end
+        return ctx_warn(ctx, "'" + pkg.name + "' is held at version " + hv + " — skipping.")
+    end
+
+    ;; Pin (patrz odejscie 6)
+    let pin: [string]? = pins::pindb_get_pin(s.pins, pkg.name)
+    if pin != nil is
+        let pn: [string] = pin
+        let io2: db::InstalledPackage? = s.idb.get(pkg.name)
+        if io2 != nil is
+            let inst: db::InstalledPackage = io2
+            if !version::satisfies(pkg.version, pn[0], inst.version) is
+                return ctx_warn(ctx, "'" + pkg.name + "' pinned to '" + pn[0] + "': skipping version " + pkg.version)
+            end
+        end
+    end
+
+    return ctx_mark_to_install(ctx, pkg, reason_explicit())
+end
+
+;; ── mark_to_install ──────────────────────────────────────────────────────
+
+fn ctx_mark_to_install(ctx0: ResolveCtx, pkg: package::Package, reason: int) -> ResolveCtx is
+    if ctx0.err != "" is return ctx0 end
+    let mut ctx: ResolveCtx = ctx0
+    let s: solver::Solver = ctx.solver
+
+    ;; Straznik cyklu
+    if contains_str(ctx.resolving, pkg.name) is return ctx end
+    if ctx_planned(ctx, pkg.name) is return ctx end
+    if s.idb.is_installed(pkg.name) && reason != reason_explicit() is return ctx end
+
+    ctx.resolving = append_str(ctx.resolving, pkg.name)
+
+    ;; Konflikty "do przodu"
+    let confs: [conflicts::ConflictInfo] = conflicts::check_install(pkg, s.idb)
+    let mut ci: int = 0
+    while ci < confs.len() is
+        let c: conflicts::ConflictInfo = confs[ci]
+        if c.hard is
+            if conflicts::kind_label(c.kind) == "Replaces" is
+                ctx.to_remove = append_str(ctx.to_remove, c.with_pkg)
+            else is
+                return ctx_fail(ctx, conflicts::format_conflict_explanation(confs))
+            end
+        else is
+            ctx = ctx_warn(ctx, c.message)
+        end
+        ci += 1
+    end
+
+    ;; Konflikty "wstecz" (co zainstalowane koliduje z nami)
+    let rev: [conflicts::ConflictInfo] = conflicts::check_reverse_breaks(pkg, s.idb, s.cache)
+    let mut ri: int = 0
+    while ri < rev.len() is
+        if rev[ri].hard is
+            return ctx_fail(ctx, "Installed '" + rev[ri].pkg_name + "' conflicts with '" + pkg.name + "': " + rev[ri].message)
+        end
+        ri += 1
+    end
+
+    ;; Auto-usuwanie pakietow zastepowanych (Replaces:) przez ProvidesMap
+    let replaced: [string] = resolve_replaces_with_provides(pkg, s.idb, ctx.pmap)
+    let mut pi: int = 0
+    while pi < replaced.len() is
+        if !contains_str(ctx.to_remove, replaced[pi]) is
+            ctx.to_remove = append_str(ctx.to_remove, replaced[pi])
+        end
+        pi += 1
+    end
+
+    ctx = ctx_add_install(ctx, pkg, reason)
+
+    ;; Pre-Depends (kolejnosc), Depends, Recommends
+    ctx = ctx_resolve_dep_field(ctx, pkg, pkg.pre_depends, reason_dependency(), true)
+    ctx = ctx_resolve_dep_field(ctx, pkg, pkg.depends, reason_dependency(), false)
+    if !ctx.no_recommends is
+        ctx = ctx_resolve_dep_field(ctx, pkg, pkg.recommends, reason_recommends(), false)
+    end
+    if ctx.err != "" is return ctx end
+
+    ;; Suggests: tylko log
+    if pkg.suggests != nil is
+        let sug: string = pkg.suggests
+        let groups: [package::DepGroup] = package::parse_dep_field(sug)
+        let mut gi: int = 0
+        while gi < groups.len() is
+            let alts: [package::DepAlternative] = groups[gi].alternatives
+            let mut ai: int = 0
+            while ai < alts.len() is
+                if !s.idb.is_installed(alts[ai].name) is
+                    let line: string = "Suggested: " + alts[ai].name + " (by " + pkg.name + ")"
+                    if !contains_str(ctx.suggests, line) is ctx.suggests = append_str(ctx.suggests, line) end
+                end
+                ai += 1
+            end
+            gi += 1
+        end
+    end
+
+    ;; Enhances: tylko log
+    if pkg.enhances != nil is
+        let enh: string = pkg.enhances
+        let egroups: [package::DepGroup] = package::parse_dep_field(enh)
+        let mut eg: int = 0
+        while eg < egroups.len() is
+            let ealts: [package::DepAlternative] = egroups[eg].alternatives
+            let mut ea: int = 0
+            while ea < ealts.len() is
+                let line2: string = "Enhances: " + ealts[ea].name + " (by " + pkg.name + ")"
+                if !contains_str(ctx.suggests, line2) is ctx.suggests = append_str(ctx.suggests, line2) end
+                ea += 1
+            end
+            eg += 1
+        end
+    end
+
+    ctx.resolving = remove_str(ctx.resolving, pkg.name)
+    return ctx
+end
+
+;; ── resolve_dep_field ────────────────────────────────────────────────────
+
+fn alt_names_joined(group: package::DepGroup) -> string is
+    let mut names: [string] = []
+    let mut i: int = 0
+    while i < group.alternatives.len() is
+        names.push(group.alternatives[i].name)
+        i += 1
+    end
+    return str::join(names, " | ")
+end
+
+fn ctx_resolve_dep_field(ctx0: ResolveCtx, requester: package::Package, dep_str: string?, reason: int, pre_dep: bool) -> ResolveCtx is
+    if ctx0.err != "" is return ctx0 end
+    if dep_str == nil is return ctx0 end
+    let ds: string = dep_str
+    let mut ctx: ResolveCtx = ctx0
+    let groups: [package::DepGroup] = package::parse_dep_field(ds)
+    let mut gi: int = 0
+    while gi < groups.len() && ctx.err == "" is
+        let group: package::DepGroup = groups[gi]
+        if !ctx_or_group_satisfied(ctx, group) is
+            let chosen: package::Package? = ctx_pick_best_alternative(ctx, group)
+            if chosen != nil is
+                let pkg: package::Package = chosen
+                if pre_dep && !contains_str(ctx.pre_depends, pkg.name) is
+                    ctx.pre_depends = append_str(ctx.pre_depends, pkg.name)
+                end
+                ctx = ctx_mark_to_install(ctx, pkg, reason)
+            elsif reason == reason_dependency() is
+                return ctx_fail(ctx, "Package '" + requester.name + "' depends on '" + alt_names_joined(group) + "' but no provider is available.\n  Run 'hammer sync' to refresh the index.")
+            elsif reason == reason_recommends() is
+                ctx = ctx_warn(ctx, "Recommended '" + alt_names_joined(group) + "' (by '" + requester.name + "') is not available — skipping.")
+            end
+        end
+        gi += 1
+    end
+    return ctx
+end
+
+;; Czy ograniczenie alternatywy jest spelnione przez wersje `ver`.
+fn alt_ok_for(alt: package::DepAlternative, ver: string) -> bool is
+    if alt.constraint == nil is return true end
+    let c: package::VersionConstraint = alt.constraint
+    return version::satisfies(ver, package::op_to_str(c.op), c.version)
+end
+
+;; Co najmniej jedna alternatywa jest spelniona (zainstalowana albo w planie).
+fn ctx_or_group_satisfied(ctx: ResolveCtx, group: package::DepGroup) -> bool is
+    let s: solver::Solver = ctx.solver
+    let mut ai: int = 0
+    while ai < group.alternatives.len() is
+        let alt: package::DepAlternative = group.alternatives[ai]
+        let providers: [string] = provides::providers_of(ctx.pmap, alt.name)
+        let mut pi: int = 0
+        while pi < providers.len() is
+            let p: string = providers[pi]
+            if s.idb.is_installed(p) is
+                if alt.constraint == nil is return true end
+                let io: db::InstalledPackage? = s.idb.get(p)
+                if io != nil is
+                    let inst: db::InstalledPackage = io
+                    if alt_ok_for(alt, inst.version) is return true end
+                end
+            end
+            pi += 1
+        end
+        let mut qi: int = 0
+        while qi < providers.len() is
+            if ctx_planned(ctx, providers[qi]) is
+                if alt_ok_for(alt, ctx_planned_pkg(ctx, providers[qi]).version) is return true end
+            end
+            qi += 1
+        end
+        ai += 1
+    end
+    return false
+end
+
+;; Najlepszy pakiet z grupy OR (punktacja MVS jak w oryginale).
+fn ctx_pick_best_alternative(ctx: ResolveCtx, group: package::DepGroup) -> package::Package? is
+    let s: solver::Solver = ctx.solver
+    let mut best: package::Package? = nil
+    let mut best_score: int = 0
+    let mut has_best: bool = false
+
+    let mut ai: int = 0
+    while ai < group.alternatives.len() is
+        let alt: package::DepAlternative = group.alternatives[ai]
+        let providers: [string] = provides::providers_of(ctx.pmap, alt.name)
+        let is_exact_name: bool = !provides::is_virtual(ctx.pmap, alt.name)
+        let mut pi: int = 0
+        while pi < providers.len() is
+            let po: package::Package? = cache::cache_get(s.cache, providers[pi])
+            if po != nil is
+                let pkg: package::Package = po
+                if alt_ok_for(alt, pkg.version) is
+                    let mut score: int = 0
+                    if s.idb.is_installed(pkg.name) is
+                        score += 1000
+                        let io: db::InstalledPackage? = s.idb.get(pkg.name)
+                        if io != nil is
+                            let inst: db::InstalledPackage = io
+                            let ord: int = version::compare(pkg.version, inst.version)
+                            if ord == 0 is
+                                score += 100
+                            elsif ord > 0 is
+                                score += 50
+                            else is
+                                score += 10
+                            end
+                        end
+                    end
+                    if ctx_planned(ctx, pkg.name) is score += 900 end
+                    if is_exact_name is score += 200 end
+                    let dl: int = if pkg.download_size == nil then 0 else pkg.download_size
+                    score += dl / -1024
+                    if !has_best || score > best_score is
+                        best = pkg
+                        best_score = score
+                        has_best = true
+                    end
+                end
+            end
+            pi += 1
+        end
+        ai += 1
+    end
+    return best
+end
+
+;; ── upgrade ──────────────────────────────────────────────────────────────
+
+fn ctx_request_upgrade_all(ctx0: ResolveCtx, dist_upgrade: bool) -> ResolveCtx is
+    if ctx0.err != "" is return ctx0 end
+    let mut ctx: ResolveCtx = ctx0
+    let s: solver::Solver = ctx.solver
+    let installed: [db::InstalledPackage] = s.idb.list_all()
+    let mut i: int = 0
+    while i < installed.len() && ctx.err == "" is
+        let inst: db::InstalledPackage = installed[i]
+        if !s.idb.is_held(inst.name) && (dist_upgrade || !is_essential(s, inst.name)) is
+            let ao: package::Package? = cache::cache_get(s.cache, inst.name)
+            if ao != nil is
+                let avail: package::Package = ao
+                if version::compare(avail.version, inst.version) > 0 is
+                    ctx = ctx_mark_to_install(ctx, avail, reason_explicit())
+                end
+            end
+        end
+        i += 1
+    end
+    ;; dist-upgrade: ponownie rozwiaz zaleznosci uaktualnianych pakietow
+    if dist_upgrade && ctx.err == "" is
+        let upgrading: [package::Package] = ctx.inst_pkgs
+        let mut k: int = 0
+        while k < upgrading.len() && ctx.err == "" is
+            ctx = ctx_resolve_dep_field(ctx, upgrading[k], upgrading[k].depends, reason_dependency(), false)
+            k += 1
+        end
+    end
+    return ctx
+end
+
+;; ── Kolejnosc topologiczna (Kahn) ────────────────────────────────────────
+
+fn ctx_topological_order(ctx: ResolveCtx) -> [package::Package] is
+    let n: int = ctx.inst_names.len()
+    let mut in_degree: [int] = []
+    let mut succ: [[int]] = []
+    let mut i: int = 0
+    while i < n is
+        in_degree.push(0)
+        let empty: [int] = []
+        succ.push(empty)
+        i += 1
+    end
+
+    ;; Krawedzie (dep -> pakiet): jak w Rust, pierwsza zaleznosc z planu na pole
+    let mut idx: int = 0
+    while idx < n is
+        let pkg: package::Package = ctx.inst_pkgs[idx]
+        let fields: [string] = dep_field_strs(pkg, false)
+        let mut fi: int = 0
+        while fi < fields.len() is
+            let groups: [package::DepGroup] = package::parse_dep_field(fields[fi])
+            let mut found: int = -1
+            let mut gi: int = 0
+            while gi < groups.len() && found < 0 is
+                let alts: [package::DepAlternative] = groups[gi].alternatives
+                let mut ai: int = 0
+                while ai < alts.len() && found < 0 is
+                    if col::hashmap_contains(ctx.inst_idx, alts[ai].name) is
+                        found = conv::str_to_int(col::hashmap_get(ctx.inst_idx, alts[ai].name))
+                    end
+                    ai += 1
+                end
+                gi += 1
+            end
+            if found >= 0 is
+                succ[found] = append_int(succ[found], idx)
+                in_degree[idx] = in_degree[idx] + 1
+            end
+            fi += 1
+        end
+        idx += 1
+    end
+
+    ;; Kolejka: najpierw pre-depends, potem reszta o stopniu 0
+    let mut queue: [int] = []
+    let mut pd: int = 0
+    while pd < ctx.pre_depends.len() is
+        if col::hashmap_contains(ctx.inst_idx, ctx.pre_depends[pd]) is
+            queue.push(conv::str_to_int(col::hashmap_get(ctx.inst_idx, ctx.pre_depends[pd])))
+        end
+        pd += 1
+    end
+    let mut z: int = 0
+    while z < n is
+        if in_degree[z] == 0 && !contains_int(queue, z) is queue.push(z) end
+        z += 1
+    end
+
+    let mut visited: [bool] = []
+    let mut v: int = 0
+    while v < n is
+        visited.push(false)
+        v += 1
+    end
+    let mut ordered: [package::Package] = []
+    let mut head: int = 0
+    while head < queue.len() is
+        let cur: int = queue[head]
+        head += 1
+        if !visited[cur] is
+            visited[cur] = true
+            ordered.push(ctx.inst_pkgs[cur])
+            let out: [int] = succ[cur]
+            let mut si: int = 0
+            while si < out.len() is
+                let nx: int = out[si]
+                if in_degree[nx] > 0 is in_degree[nx] = in_degree[nx] - 1 end
+                if in_degree[nx] == 0 && !visited[nx] is queue.push(nx) end
+                si += 1
+            end
+        end
+    end
+
+    ;; Cykle (siatka bezpieczenstwa): dopisz nieodwiedzone
+    let mut r: int = 0
+    while r < n is
+        if !visited[r] is ordered.push(ctx.inst_pkgs[r]) end
+        r += 1
+    end
+    return ordered
+end
+
+fn contains_int(xs: [int], x: int) -> bool is
+    let mut i: int = 0
+    while i < xs.len() is
+        if xs[i] == x is return true end
+        i += 1
+    end
+    return false
+end
+
+;; ── build_plan ───────────────────────────────────────────────────────────
+
+fn ctx_build_plan(ctx: ResolveCtx) -> solver::PlanResult is
+    if ctx.err != "" is return solver::plan_err(ctx.err) end
+    let s: solver::Solver = ctx.solver
+    let mut plan: solver::TransactionPlan = solver::plan_empty()
+
+    let ordered: [package::Package] = ctx_topological_order(ctx)
+    let mut fresh: [package::Package] = []
+    let mut upgrades: [package::Package] = []
+    let mut i: int = 0
+    while i < ordered.len() is
+        let pkg: package::Package = ordered[i]
+        if s.idb.is_installed(pkg.name) is
+            let io: db::InstalledPackage? = s.idb.get(pkg.name)
+            if io != nil is
+                let inst: db::InstalledPackage = io
+                plan = solver::plan_set_upgrade_from(plan, pkg.name, inst.version)
+                plan.freed_bytes += inst.installed_size_kb * 1024
+            end
+            upgrades.push(pkg)
+        else is
+            fresh.push(pkg)
+        end
+        i += 1
+    end
+    plan.to_install = fresh
+    plan.to_upgrade = upgrades
+    plan.to_remove = ctx.to_remove
+
+    let mut k: int = 0
+    while k < fresh.len() is
+        plan.download_bytes += if fresh[k].download_size == nil then 0 else fresh[k].download_size
+        plan.install_bytes += if fresh[k].installed_size_kb == nil then 0 else fresh[k].installed_size_kb
+        k += 1
+    end
+    let mut u: int = 0
+    while u < upgrades.len() is
+        plan.download_bytes += if upgrades[u].download_size == nil then 0 else upgrades[u].download_size
+        plan.install_bytes += if upgrades[u].installed_size_kb == nil then 0 else upgrades[u].installed_size_kb
+        u += 1
+    end
+
+    let mut warnings: [string] = ctx.warnings
+    let mut si: int = 0
+    while si < ctx.suggests.len() is
+        warnings.push("  ℹ " + ctx.suggests[si])
+        si += 1
+    end
+    plan.warnings = warnings
+    plan.sat_stats = ctx.stats
+    return solver::plan_ok(plan)
+end
+
+;; ── Wejscia publiczne ────────────────────────────────────────────────────
+
+pub fn resolve_install(s: solver::Solver, names: [string], no_recommends: bool) -> solver::PlanResult is
+    let pmap: provides::ProvidesMap = provides::provides_build(s.cache, s.idb)
+    let mut ctx: ResolveCtx = ctx_new(s, pmap, no_recommends)
+
+    ;; Faza 1: heurystyka
+    let mut i: int = 0
+    while i < names.len() && ctx.err == "" is
+        ctx = ctx_request_install(ctx, names[i])
+        i += 1
+    end
+    ;; Faza 2: weryfikacja SAT
+    ctx = ctx_run_sat_verification(ctx)
+    ;; Faza 3: niezalezna weryfikacja przez libsolv (satsolv)
+    ctx = ctx_run_libsolv_verification(ctx)
+    return ctx_build_plan(ctx)
+end
+
+pub fn resolve_reinstall(s: solver::Solver, names: [string]) -> solver::PlanResult is
+    let pmap: provides::ProvidesMap = provides::provides_build(s.cache, s.idb)
+    let mut ctx: ResolveCtx = ctx_new(s, pmap, false)
+    let mut i: int = 0
+    while i < names.len() && ctx.err == "" is
+        let po: package::Package? = cache::cache_get(s.cache, names[i])
+        if po == nil is
+            return solver::plan_err("Package '" + names[i] + "' not found.")
+        end
+        let pkg: package::Package = po
+        ctx = ctx_mark_to_install(ctx, pkg, reason_explicit())
+        i += 1
+    end
+    return ctx_build_plan(ctx)
+end
+
+pub fn resolve_remove(s: solver::Solver, names: [string]) -> solver::PlanResult is
+    let pmap: provides::ProvidesMap = provides::provides_build(s.cache, s.idb)
+    let mut plan: solver::TransactionPlan = solver::plan_empty()
+    let mut i: int = 0
+    while i < names.len() is
+        let name: string = names[i]
+        if !s.idb.is_installed(name) is
+            plan.warnings = append_str(plan.warnings, name + " is not installed.")
+        else is
+            if s.idb.is_held(name) is
+                return solver::plan_err("Package '" + name + "' is held. Release with: hammer unhold " + name)
+            end
+            let one: [string] = [name]
+            let rdeps: [string] = conflicts::reverse_depends(one, s.idb)
+            if rdeps.len() > 0 is
+                plan.warnings = append_str(plan.warnings, "Removing '" + name + "' will break: " + str::join(rdeps, ", "))
+            end
+            let io: db::InstalledPackage? = s.idb.get(name)
+            if io != nil is
+                let inst: db::InstalledPackage = io
+                plan.freed_bytes += inst.installed_size_kb * 1024
+            end
+            plan.to_remove = append_str(plan.to_remove, name)
+        end
+        i += 1
+    end
+    let orphans: [string] = find_newly_orphaned(s, plan.to_remove, pmap)
+    let mut k: int = 0
+    while k < orphans.len() is
+        plan.to_autoremove = append_str(plan.to_autoremove, orphans[k])
+        k += 1
+    end
+    return solver::plan_ok(plan)
+end
+
+pub fn resolve_upgrade(s: solver::Solver) -> solver::PlanResult is
+    let pmap: provides::ProvidesMap = provides::provides_build(s.cache, s.idb)
+    let mut ctx: ResolveCtx = ctx_new(s, pmap, false)
+    ctx = ctx_request_upgrade_all(ctx, false)
+    return ctx_build_plan(ctx)
+end
+
+pub fn resolve_dist_upgrade(s: solver::Solver) -> solver::PlanResult is
+    let pmap: provides::ProvidesMap = provides::provides_build(s.cache, s.idb)
+    let mut ctx: ResolveCtx = ctx_new(s, pmap, false)
+    ctx = ctx_request_upgrade_all(ctx, true)
+    return ctx_build_plan(ctx)
+end
+
+pub fn resolve_autoremove(s: solver::Solver) -> solver::PlanResult is
+    let mut plan: solver::TransactionPlan = solver::plan_empty()
+    let pmap: provides::ProvidesMap = provides::provides_build(s.cache, s.idb)
+    let installed: [db::InstalledPackage] = s.idb.list_all()
+    let user_names: [string] = user_installed_names(s)
+    let user_set: NameSet = names_to_set(user_names)
+
+    let required: NameSet = closure_of_user_packages(s, user_names, pmap)
+    let recommended: NameSet = closure_of_recommends(s, required, pmap)
+
+    let mut i: int = 0
+    while i < installed.len() is
+        let inst: db::InstalledPackage = installed[i]
+        let keep: bool = set_has(user_set, inst.name) || set_has(required, inst.name) ||
+            set_has(recommended, inst.name) || s.idb.is_held(inst.name) || is_essential(s, inst.name)
+        if !keep is
+            plan.freed_bytes += inst.installed_size_kb * 1024
+            plan.to_autoremove = append_str(plan.to_autoremove, inst.name)
+        end
+        i += 1
+    end
+    return solver::plan_ok(plan)
+end
+
+pub fn resolve_fix_broken(s: solver::Solver) -> solver::PlanResult is
+    let pmap: provides::ProvidesMap = provides::provides_build(s.cache, s.idb)
+    let mut plan: solver::TransactionPlan = solver::plan_empty()
+    let installed: [db::InstalledPackage] = s.idb.list_all()
+
+    let mut i: int = 0
+    while i < installed.len() is
+        let inst: db::InstalledPackage = installed[i]
+        let po: package::Package? = cache::cache_get(s.cache, inst.name)
+        if po == nil is
+            plan.warnings = append_str(plan.warnings, "'" + inst.name + "' installed but not in any repo (orphan). Consider: hammer remove " + inst.name)
+        else is
+            let pkg: package::Package = po
+            if pkg.depends != nil is
+                let dep_str: string = pkg.depends
+                let groups: [package::DepGroup] = package::parse_dep_field(dep_str)
+                let mut gi: int = 0
+                while gi < groups.len() is
+                    let group: package::DepGroup = groups[gi]
+                    if !fix_group_satisfied(s, pmap, group) is
+                        let dep_name: string = if group.alternatives.len() > 0 then group.alternatives[0].name else "?"
+                        let providers: [string] = provides::providers_of(pmap, dep_name)
+                        if providers.len() > 0 is
+                            let fo: package::Package? = cache::cache_get(s.cache, providers[0])
+                            if fo != nil is
+                                let fix_pkg: package::Package = fo
+                                if !plan_has_install(plan, providers[0]) is
+                                    plan.download_bytes += if fix_pkg.download_size == nil then 0 else fix_pkg.download_size
+                                    plan.install_bytes += if fix_pkg.installed_size_kb == nil then 0 else fix_pkg.installed_size_kb
+                                    plan.to_install = append_pkg(plan.to_install, fix_pkg)
+                                end
+                            end
+                        else is
+                            plan.warnings = append_str(plan.warnings, "BROKEN: '" + inst.name + "' needs '" + dep_name + "' but no provider available")
+                        end
+                    end
+                    gi += 1
+                end
+            end
+        end
+        i += 1
+    end
+    return solver::plan_ok(plan)
+end
+
+fn plan_has_install(plan: solver::TransactionPlan, name: string) -> bool is
+    let mut i: int = 0
+    while i < plan.to_install.len() is
+        if plan.to_install[i].name == name is return true end
+        i += 1
+    end
+    return false
+end
+
+fn fix_group_satisfied(s: solver::Solver, pmap: provides::ProvidesMap, group: package::DepGroup) -> bool is
+    let mut ai: int = 0
+    while ai < group.alternatives.len() is
+        let alt: package::DepAlternative = group.alternatives[ai]
+        let providers: [string] = provides::providers_of(pmap, alt.name)
+        let mut pi: int = 0
+        while pi < providers.len() is
+            if s.idb.is_installed(providers[pi]) is
+                if alt.constraint == nil is return true end
+                let io: db::InstalledPackage? = s.idb.get(providers[pi])
+                if io != nil is
+                    let ip: db::InstalledPackage = io
+                    if alt_ok_for(alt, ip.version) is return true end
+                end
+            end
+            pi += 1
+        end
+        ai += 1
+    end
+    return false
+end
+
+;; ── Pomocnicze: domkniecia ───────────────────────────────────────────────
+
+fn names_to_set(names: [string]) -> NameSet is
+    let mut s: NameSet = set_new()
+    let mut i: int = 0
+    while i < names.len() is
+        s = set_add(s, names[i])
+        i += 1
+    end
+    return s
+end
+
+;; Domkniecie zaleznosci (Depends/Pre-Depends/Recommends) pakietow uzytkownika.
+fn closure_of_user_packages(s: solver::Solver, user_pkgs: [string], pmap: provides::ProvidesMap) -> NameSet is
+    let mut required: NameSet = names_to_set(user_pkgs)
+    let mut queue: [string] = required.names
+    let mut head: int = 0
+    while head < queue.len() is
+        let name: string = queue[head]
+        head += 1
+        let po: package::Package? = cache::cache_get(s.cache, name)
+        if po != nil is
+            let pkg: package::Package = po
+            let fields: [string] = dep_field_strs(pkg, true)
+            let mut fi: int = 0
+            while fi < fields.len() is
+                let groups: [package::DepGroup] = package::parse_dep_field(fields[fi])
+                let mut gi: int = 0
+                while gi < groups.len() is
+                    let alts: [package::DepAlternative] = groups[gi].alternatives
+                    let mut ai: int = 0
+                    while ai < alts.len() is
+                        let providers: [string] = provides::providers_of(pmap, alts[ai].name)
+                        let mut pi: int = 0
+                        while pi < providers.len() is
+                            if s.idb.is_installed(providers[pi]) && !set_has(required, providers[pi]) is
+                                required = set_add(required, providers[pi])
+                                queue = append_str(queue, providers[pi])
+                            end
+                            pi += 1
+                        end
+                        ai += 1
+                    end
+                    gi += 1
+                end
+                fi += 1
+            end
+        end
+    end
+    return required
+end
+
+;; Pakiety, ktore wymagane pakiety POLECAJA (Recommends) — nie do autoremove.
+fn closure_of_recommends(s: solver::Solver, required: NameSet, pmap: provides::ProvidesMap) -> NameSet is
+    let mut recommended: NameSet = set_new()
+    let mut queue: [string] = required.names
+    let mut head: int = 0
+    while head < queue.len() is
+        let name: string = queue[head]
+        head += 1
+        let po: package::Package? = cache::cache_get(s.cache, name)
+        if po != nil is
+            let pkg: package::Package = po
+            if pkg.recommends != nil is
+                let rec: string = pkg.recommends
+                let groups: [package::DepGroup] = package::parse_dep_field(rec)
+                let mut gi: int = 0
+                while gi < groups.len() is
+                    let alts: [package::DepAlternative] = groups[gi].alternatives
+                    let mut ai: int = 0
+                    while ai < alts.len() is
+                        let providers: [string] = provides::providers_of(pmap, alts[ai].name)
+                        let mut pi: int = 0
+                        while pi < providers.len() is
+                            if s.idb.is_installed(providers[pi]) && !set_has(recommended, providers[pi]) is
+                                recommended = set_add(recommended, providers[pi])
+                                queue = append_str(queue, providers[pi])
+                            end
+                            pi += 1
+                        end
+                        ai += 1
+                    end
+                    gi += 1
+                end
+            end
+        end
+    end
+    return recommended
+end
+
+;; Pakiety osierocone po usunieciu `removing`.
+fn find_newly_orphaned(s: solver::Solver, removing: [string], pmap: provides::ProvidesMap) -> [string] is
+    let user_names: [string] = user_installed_names(s)
+    let user_set: NameSet = names_to_set(user_names)
+    let mut remaining_user: [string] = []
+    let mut i: int = 0
+    while i < user_names.len() is
+        if !contains_str(removing, user_names[i]) is remaining_user.push(user_names[i]) end
+        i += 1
+    end
+    let still_required: NameSet = closure_of_user_packages(s, remaining_user, pmap)
+
+    let mut out: [string] = []
+    let installed: [db::InstalledPackage] = s.idb.list_all()
+    let mut k: int = 0
+    while k < installed.len() is
+        let n: string = installed[k].name
+        if !contains_str(removing, n) && !set_has(user_set, n) && !set_has(still_required, n) is
+            out.push(n)
+        end
+        k += 1
+    end
+    return out
+end
+
+;; Ktore zainstalowane pakiety usunac, bo `pkg` je zastepuje (Replaces:),
+;; z rozwiazaniem nazw wirtualnych przez ProvidesMap.
+fn resolve_replaces_with_provides(pkg: package::Package, idb: db::InstalledDb, pmap: provides::ProvidesMap) -> [string] is
+    let mut to_remove: [string] = []
+    if pkg.replaces == nil is return to_remove end
+    let r_str: string = pkg.replaces
+    let groups: [package::DepGroup] = package::parse_dep_field(r_str)
+    let mut gi: int = 0
+    while gi < groups.len() is
+        let alts: [package::DepAlternative] = groups[gi].alternatives
+        let mut ai: int = 0
+        while ai < alts.len() is
+            let alt: package::DepAlternative = alts[ai]
+            let providers: [string] = provides::providers_of(pmap, alt.name)
+            let mut candidates: [string] = providers
+            if providers.len() == 0 is candidates = [alt.name] end
+            let mut ci: int = 0
+            while ci < candidates.len() is
+                let io: db::InstalledPackage? = idb.get(candidates[ci])
+                if io != nil is
+                    let inst: db::InstalledPackage = io
+                    if alt_ok_for(alt, inst.version) && !contains_str(to_remove, candidates[ci]) is
+                        to_remove.push(candidates[ci])
+                    end
+                end
+                ci += 1
+            end
+            ai += 1
+        end
+        gi += 1
+    end
+    return to_remove
+end
+
+;; ── Weryfikacja SAT ──────────────────────────────────────────────────────
+
+fn sat_fail_msg(detail: string) -> string is
+    return "Dependency conflict detected (CDCL): " + detail + "\n  Run 'hammer why-not <package>' for details."
+end
+
+;; Koduje przypisanie heurystyki jako problem SAT i sprawdza go:
+;;   "P musi byc zainstalowany" -> [P]; "P zalezy od Q|R" -> [¬P, Q, R];
+;;   "P koliduje z Q" -> [¬P, ¬Q]. UNSAT => blad; SAT => pakiety ustawione
+;;   na false sa usuwane z planu (z ostrzezeniem).
+;; Faza 3: niezalezna weryfikacja przez PRAWDZIWY libsolv (satsolv + libhammer::solver),
+;; patrz `libsolv.h#`. Wylaczenie: `HAMMER_SOLVER=builtin`.
+;;   * libsolv nieuzyty (wylaczony / blad ladowania danych) -> zostaje wynik DPLL (+ ostrzezenie),
+;;   * libsolv: brak rozwiazania -> twardy blad z opisami problemow,
+;;   * libsolv: rozwiazanie      -> pakiety wymagane przez libsolv, a nieobecne w planie, sa
+;;                                  DODAWANE (z ostrzezeniem).
+fn ctx_run_libsolv_verification(ctx0: ResolveCtx) -> ResolveCtx is
+    if ctx0.err != "" is return ctx0 end
+    if !libsolv::libsolv_enabled() is return ctx0 end
+    let mut ctx: ResolveCtx = ctx0
+    let s: solver::Solver = ctx.solver
+    let wanted: [string] = ctx.inst_names
+    let remove: [string] = ctx.to_remove
+
+    let v: libsolv::LibsolvVerdict = libsolv::libsolv_verify(s.cache, s.idb, wanted, remove, cache::detect_arch(), ctx.no_recommends)
+
+    if !v.used is
+        let mut mi: int = 0
+        while mi < v.messages.len() is
+            let m: string = v.messages[mi]
+            if m != "nothing to solve" && m != "HAMMER_SOLVER=builtin" is
+                ctx = ctx_warn(ctx, "libsolv verification skipped: " + m)
+            end
+            mi += 1
+        end
+        return ctx
+    end
+
+    if !v.ok is
+        let mut msg: string = "libsolv could not find a solution:"
+        let mut pi: int = 0
+        while pi < v.messages.len() is
+            msg = msg + "\n  " + v.messages[pi]
+            pi += 1
+        end
+        return ctx_fail(ctx, msg)
+    end
+
+    let mut ii: int = 0
+    while ii < v.installs.len() is
+        let name: string = v.installs[ii]
+        if !ctx_planned(ctx, name) && !s.idb.is_installed(name) is
+            ctx = ctx_warn(ctx, "libsolv additionally requires '" + name + "' — added to the plan")
+            ctx = ctx_request_install(ctx, name)
+            if ctx.err != "" is return ctx end
+        end
+        ii += 1
+    end
+    return ctx
+end
+
+fn ctx_run_sat_verification(ctx0: ResolveCtx) -> ResolveCtx is
+    if ctx0.err != "" is return ctx0 end
+    let mut ctx: ResolveCtx = ctx0
+    let s: solver::Solver = ctx.solver
+    let mut sv: sat::Sat = sat::sat_new(200000)
+
+    let planned: [string] = ctx.inst_names
+    let pkgs: [package::Package] = ctx.inst_pkgs
+
+    let mut i: int = 0
+    while i < planned.len() is
+        sv = sat::sat_intern(sv, planned[i])
+        if s.idb.is_installed(planned[i]) is sv = sat::sat_prefer_installed(sv, planned[i]) end
+        i += 1
+    end
+
+    ;; Jednostki: kazdy planowany pakiet MUSI byc true
+    let mut u: int = 0
+    while u < planned.len() is
+        let v: int = sat::sat_var(sv, planned[u])
+        sv = sat::sat_add_clause(sv, [v])
+        if sv.err != "" is return ctx_fail(ctx, sat_fail_msg(sv.err)) end
+        u += 1
+    end
+
+    ;; Implikacje zaleznosci i konflikty
+    let mut pi: int = 0
+    while pi < planned.len() is
+        let name: string = planned[pi]
+        let pkg: package::Package = pkgs[pi]
+        let pv: int = sat::sat_var(sv, name)
+
+        let dep_fields: [string] = dep_field_strs(pkg, false)
+        let mut fi: int = 0
+        while fi < dep_fields.len() is
+            let groups: [package::DepGroup] = package::parse_dep_field(dep_fields[fi])
+            let mut gi: int = 0
+            while gi < groups.len() is
+                let alts: [package::DepAlternative] = groups[gi].alternatives
+                ;; juz spelnione przez zainstalowany pakiet?
+                let mut already_ok: bool = false
+                let mut ai: int = 0
+                while ai < alts.len() && !already_ok is
+                    let prov: [string] = provides::providers_of(ctx.pmap, alts[ai].name)
+                    let mut k: int = 0
+                    while k < prov.len() is
+                        if s.idb.is_installed(prov[k]) is already_ok = true end
+                        k += 1
+                    end
+                    ai += 1
+                end
+                if !already_ok is
+                    let mut clause: [int] = [0 - pv]
+                    let mut aj: int = 0
+                    while aj < alts.len() is
+                        let prov2: [string] = provides::providers_of(ctx.pmap, alts[aj].name)
+                        let mut kk: int = 0
+                        while kk < prov2.len() is
+                            sv = sat::sat_intern(sv, prov2[kk])
+                            clause.push(sat::sat_var(sv, prov2[kk]))
+                            kk += 1
+                        end
+                        aj += 1
+                    end
+                    if clause.len() > 1 is
+                        sv = sat::sat_add_clause(sv, clause)
+                        if sv.err != "" is return ctx_fail(ctx, sat_fail_msg(sv.err)) end
+                    end
+                end
+                gi += 1
+            end
+            fi += 1
+        end
+
+        ;; Conflicts: ¬P ∨ ¬Q
+        if pkg.conflicts != nil is
+            let conf_str: string = pkg.conflicts
+            let cgroups: [package::DepGroup] = package::parse_dep_field(conf_str)
+            let mut cg: int = 0
+            while cg < cgroups.len() is
+                let calts: [package::DepAlternative] = cgroups[cg].alternatives
+                let mut ca: int = 0
+                while ca < calts.len() is
+                    let alt: package::DepAlternative = calts[ca]
+                    let provs: [string] = provides::providers_of(ctx.pmap, alt.name)
+                    let mut cp: int = 0
+                    while cp < provs.len() is
+                        let provider: string = provs[cp]
+                        ;; pakiet nie koliduje sam ze soba (wzorzec Provides+Conflicts+Replaces)
+                        if provider != name is
+                            let mut applies: bool = true
+                            if alt.constraint != nil is
+                                let po: package::Package? = cache::cache_get(s.cache, provider)
+                                if po != nil is
+                                    let pp: package::Package = po
+                                    applies = alt_ok_for(alt, pp.version)
+                                end
+                            end
+                            if applies is
+                                sv = sat::sat_intern(sv, provider)
+                                let qv: int = sat::sat_var(sv, provider)
+                                sv = sat::sat_add_clause(sv, [0 - pv, 0 - qv])
+                                if sv.err != "" is return ctx_fail(ctx, sat_fail_msg(sv.err)) end
+                            end
+                        end
+                        cp += 1
+                    end
+                    ca += 1
+                end
+                cg += 1
+            end
+        end
+        pi += 1
+    end
+
+    let n_vars: int = sat::sat_n_vars(sv)
+    let n_clauses: int = sat::sat_n_clauses(sv)
+    sv = sat::sat_solve(sv)
+
+    if sv.status == -1 is return ctx_fail(ctx, sat_fail_msg(sv.err)) end
+    if sv.status == 1 is
+        let mut d: int = 0
+        while d < planned.len() is
+            if sat::sat_value(sv, planned[d]) == -1 is
+                ctx = ctx_warn(ctx, "CDCL: removed '" + planned[d] + "' from install set (conflict resolution)")
+                ctx = ctx_drop_install(ctx, planned[d])
+            end
+            d += 1
+        end
+    else is
+        ctx = ctx_warn(ctx, "CDCL: conflict budget exceeded, using heuristic result.")
+    end
+    ctx.stats = solver::SolverStats { n_vars: n_vars, n_clauses: n_clauses,
+        conflicts: sv.conflicts, decisions: sv.decisions, restarts: 0 }
+    return ctx
+end
