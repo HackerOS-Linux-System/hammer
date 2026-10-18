@@ -1,0 +1,249 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> fmt"     from "fmt"
+use "std -> conv"    from "conv"
+
+mod internal
+mod ui
+mod db
+
+;; hammer -> pkg::file_index
+;;
+;; Port of source-code/pkg/file_index.rs (Rust) to H#: indeks "plik ->
+;; pakiet" (tabela `file_index` w bazie hammera), `hammer what <plik>` i
+;; `hammer what --rebuild`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. SQL przez `db::sql_run` (`db_query_bind`, patrz naglowek pkg/db.h#);
+;;    "polaczeniem" jest sciezka pliku bazy. `crate::db::DB_PATH` (stala)
+;;    -> `build_mode::db_path()` (zalezy od trybu atomic/normal).
+;; 2. Wstawianie hurtowe: zamiast jednego INSERT na plik (Rust: tysiace
+;;    wywolan), wiersze ida paczkami `BEGIN; INSERT ...; ...; COMMIT;`
+;;    o rozmiarze < ~100 kB (limit argumentu argv w Linuksie to 128 kB) —
+;;    kazde wywolanie to osobny proces `sqlite3`.
+;; 3. `walkdir` -> `fs::walk` (zwraca same pliki); Rust bral tez symlinki
+;;    (`is_symlink`), a `fs::walk` moze pomijac zepsute dowiazania —
+;;    w indeksie moze brakowac tych wpisow.
+;; 4. `Result<..>` -> `string` ("" = Ok) albo wartosc; `lookup_fuzzy`
+;;    zwraca tablice napisow "sciezka\tpaczka" zamiast krotek.
+;; 5. `DELETE ... ` w `remove_package` nie zwraca liczby usunietych wierszy
+;;    przez CLI — liczba pochodzi z `SELECT COUNT(*)` tuz przed usunieciem.
+
+pub struct FileIndex is
+    pub handle: string
+end
+
+;; ── Pomocniki ────────────────────────────────────────────────────────────
+
+fn rows_of(out: string) -> [string] is
+    let mut rows: [string] = []
+    if db::is_sql_error(out) is return rows end
+    let lines: [string] = str::split(out, "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if lines[i] != "" is rows.push(lines[i]) end
+        i += 1
+    end
+    return rows
+end
+
+fn count_of(out: string) -> int is
+    let rows: [string] = rows_of(out)
+    if rows.len() == 0 is return 0 end
+    if !str::is_numeric(rows[0]) is return 0 end
+    return conv::str_to_int(rows[0])
+end
+
+fn normalize_path(p: string) -> string is
+    if p.starts_with("/") is return p end
+    return "/" + p
+end
+
+;; `p.trim_start_matches('/')`
+fn trim_leading_slashes(p: string) -> string is
+    let n: int = string_len(p)
+    let mut i: int = 0
+    while i < n && string_at(p, i) == "/" is
+        i += 1
+    end
+    return str::slice(p, i, n)
+end
+
+fn store_path_of(name: string, version: string, store_hash: string) -> string is
+    return compat::path_join(build_mode::store_dir(), name + "-" + version + "-" + store_hash)
+end
+
+;; ── FileIndex ────────────────────────────────────────────────────────────
+
+impl FileIndex is
+    pub fn open() -> FileIndex is
+        let handle: string = build_mode::db_path()
+        let dir: string = compat::path_parent(handle)
+        if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
+        let idx: FileIndex = FileIndex { handle: handle }
+        db::sql_run(handle, "PRAGMA journal_mode=WAL;")
+        idx.ensure_table()
+        return idx
+    end
+
+    fn ensure_table(self) is
+        db::sql_run(self.handle,
+            "CREATE TABLE IF NOT EXISTS file_index (" +
+            " path TEXT NOT NULL, package TEXT NOT NULL, PRIMARY KEY (path, package));" +
+            " CREATE INDEX IF NOT EXISTS idx_file_index_pkg  ON file_index(package);" +
+            " CREATE INDEX IF NOT EXISTS idx_file_index_path ON file_index(path);")
+    end
+
+    ;; Wstawia pliki paczki `pkg_name` z katalogu `store_path`; zwraca liczbe.
+    fn insert_store_files(self, pkg_name: string, store_path: string) -> int is
+        let files: [string] = fs::walk(store_path)
+        let mut count: int = 0
+        let mut batch: string = ""
+        let plen: int = string_len(store_path)
+        let mut i: int = 0
+        while i < files.len() is
+            let f: string = files[i]
+            i += 1
+            if f.starts_with(store_path) && string_len(f) > plen is
+                ;; "/rel/path" = sciezka bez prefiksu store (prefiks konczy sie przed '/')
+                let installed: string = str::slice(f, plen, string_len(f))
+                let installed_path: string = if installed.starts_with("/") then installed else "/" + installed
+                batch = batch + "INSERT OR REPLACE INTO file_index (path, package) VALUES (" +
+                    db::q(installed_path) + "," + db::q(pkg_name) + ");"
+                count += 1
+                if string_len(batch) > 100000 is
+                    db::sql_run(self.handle, "BEGIN; " + batch + " COMMIT;")
+                    batch = ""
+                end
+            end
+        end
+        if batch != "" is
+            db::sql_run(self.handle, "BEGIN; " + batch + " COMMIT;")
+        end
+        return count
+    end
+
+    ;; Po udanej instalacji/upgrade. Gdy store jeszcze niewidoczny (pending
+    ;; generation) — pomija. "" = Ok.
+    pub fn index_package(self, pkg_name: string, store_hash: string, version: string) -> string is
+        let store_path: string = store_path_of(pkg_name, version, store_hash)
+        if !fs::exists(store_path) is return "" end
+
+        db::sql_run(self.handle, "DELETE FROM file_index WHERE package = " + db::q(pkg_name) + ";")
+        let count: int = self.insert_store_files(pkg_name, store_path)
+        log::info("file_index: zindeksowano " + to_string(count) + " plików dla " + pkg_name)
+        return ""
+    end
+
+    pub fn remove_package(self, pkg_name: string) -> string is
+        let deleted: int = count_of(db::sql_run(self.handle,
+            "SELECT COUNT(*) FROM file_index WHERE package = " + db::q(pkg_name)))
+        db::sql_run(self.handle, "DELETE FROM file_index WHERE package = " + db::q(pkg_name) + ";")
+        log::info("file_index: usunięto " + to_string(deleted) + " wpisów dla " + pkg_name)
+        return ""
+    end
+
+    ;; Paczki z dokladnie tym plikiem.
+    pub fn lookup(self, file: string) -> [string] is
+        let norm: string = normalize_path(file)
+        return rows_of(db::sql_run(self.handle,
+            "SELECT package FROM file_index WHERE path = " + db::q(norm) + " ORDER BY package"))
+    end
+
+    ;; LIKE '%wzorzec%'; elementy: "sciezka\tpaczka" (max 50).
+    pub fn lookup_fuzzy(self, pattern: string) -> [string] is
+        let like: string = "%" + trim_leading_slashes(pattern) + "%"
+        return rows_of(db::sql_run(self.handle,
+            "SELECT path, package FROM file_index WHERE path LIKE " + db::q(like) +
+            " ORDER BY path LIMIT 50"))
+    end
+
+    pub fn is_empty(self) -> bool is
+        return count_of(db::sql_run(self.handle, "SELECT COUNT(*) FROM file_index")) == 0
+    end
+
+    ;; Odbudowa calego indeksu ze store; zwraca liczbe plikow.
+    pub fn rebuild_all(self) -> int is
+        db::sql_run(self.handle, "DELETE FROM file_index;")
+
+        let idb: db::InstalledDb = db::InstalledDb::open()
+        let all: [db::InstalledPackage] = idb.list_all()
+        let mut total: int = 0
+        let mut i: int = 0
+        while i < all.len() is
+            let inst: db::InstalledPackage = all[i]
+            i += 1
+            let store_path: string = store_path_of(inst.name, inst.version, inst.store_hash)
+            if fs::exists(store_path) is
+                total += self.insert_store_files(inst.name, store_path)
+            end
+        end
+        log::info("file_index: rebuild zakończony, " + to_string(total) + " plików")
+        return total
+    end
+end
+
+;; ── hammer what <plik> ───────────────────────────────────────────────────
+
+
+;; "" = Ok, inaczej blad.
+pub fn cmd_what(args: [string]) -> string is
+    if args.len() == 0 is return "Użycie: hammer what <ścieżka-pliku>" end
+    let path_str: string = args[0]
+
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Która paczka dostarcza " + ui::bold(path_str) + "?")
+    write("  " + ui::dim(str::repeat("─", 65)))
+
+    let idx: FileIndex = FileIndex::open()
+
+    ;; pierwsze uruchomienie na systemie < 0.5: odbuduj indeks
+    if idx.is_empty() is
+        write("  " + ui::yellow("·") + " Indeks plików jest pusty — odbudowuję ze store (jednorazowo)…")
+        let n: int = idx.rebuild_all()
+        write("  " + ui::bright_green("✔") + " Zindeksowano " + to_string(n) + " plików.")
+    end
+
+    ;; 1. dokladne dopasowanie
+    let exact: [string] = idx.lookup(path_str)
+    if exact.len() > 0 is
+        let mut i: int = 0
+        while i < exact.len() is
+            write("  " + ui::bright_green("✔") + " " + ui::bold(path_str) + " → " + ui::cyan_bold(exact[i]))
+            i += 1
+        end
+        write("")
+        return ""
+    end
+
+    ;; 2. fuzzy
+    let fuzzy: [string] = idx.lookup_fuzzy(path_str)
+    if fuzzy.len() == 0 is
+        write("  " + ui::dim("·") + " Żadna zainstalowana paczka nie dostarcza '" + ui::bold(path_str) + "'.")
+        write("  Wskazówka: spróbuj " + ui::cyan("hammer search") + " aby sprawdzić dostępne paczki.")
+    else is
+        write("  " + ui::yellow("·") + " Brak dokładnego trafienia, podobne pliki:")
+        write("")
+        let mut k: int = 0
+        while k < fuzzy.len() is
+            let cols: [string] = str::split(fuzzy[k], "\t")
+            let file: string = if cols.len() > 0 then cols[0] else ""
+            let pkg: string = if cols.len() > 1 then cols[1] else ""
+            write("  " + ui::dim("·") + " " + ui::bold(file) + "  (" + ui::cyan(pkg) + ")")
+            k += 1
+        end
+    end
+
+    write("")
+    return ""
+end
+
+pub fn cmd_what_rebuild() -> string is
+    write("")
+    write("  " + ui::accent_bold("⬡") + "  Odbudowywanie indeksu plików…")
+    let idx: FileIndex = FileIndex::open()
+    let n: int = idx.rebuild_all()
+    write("  " + ui::bright_green("✔") + " Zindeksowano " + to_string(n) + " plików.")
+    write("")
+    return ""
+end
