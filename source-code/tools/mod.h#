@@ -1,0 +1,8 @@
+mod notify
+mod selfupdate
+mod mirror
+mod setup
+mod completion
+mod hk_tools
+mod build_dep
+mod pending
