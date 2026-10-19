@@ -1,0 +1,112 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+
+;; hammer -> oci::oci_transaction_lock
+;;
+;; Port of source-code/oci/transaction_lock.rs (Rust) to H#.
+;; Wylaczna blokada `<lock_dir>/lock` + znacznik `.incomplete` (przerwana
+;; transakcja).
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. BRAK `flock(2)` (crate `fslock`): jak w `internal/lock.h#` — plik z
+;;    PID-em tworzony atomowo (`set -C`), martwy wlasciciel wykrywany przez
+;;    `kill -0`. Ograniczenie: ponowne uzycie PID-u (patrz `internal/lock.h#`).
+;; 2. BRAK `Drop`: wolajacy MUSI wywolac `lock_release(l)` na kazdej sciezce
+;;    wyjscia. Rust trzymal deskryptor do konca procesu; tu plik blokady
+;;    znika przy `lock_release`, a `.incomplete` znika dopiero po
+;;    `mark_complete` (czyli przerwana transakcja zostawia `.incomplete`,
+;;    tak jak w Rust).
+;; 3. `Result<Self>` -> `LockResult { lock, err }` ("" = OK).
+
+pub struct TransactionLock is
+    pub lock_path:        string
+    pub incomplete_path:  string
+    pub found_incomplete: bool
+    pub pid:              int
+end
+
+pub struct LockResult is
+    pub lock: TransactionLock
+    pub err:  string
+end
+
+fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+fn empty_lock(lp: string, ip: string) -> TransactionLock is
+    return TransactionLock { lock_path: lp, incomplete_path: ip, found_incomplete: false, pid: 0 }
+end
+
+fn owner_pid(path: string) -> int is
+    let t: string = str::trim(proc::shell("cat -- " + shq(path) + " 2>/dev/null"))
+    if t == "" || !str::is_numeric(t) is return 0 end
+    return conv::str_to_int(t)
+end
+
+fn pid_alive(pid: int) -> bool is
+    if pid <= 0 is return false end
+    return str::trim(proc::shell("kill -0 " + to_string(pid) + " 2>/dev/null && echo alive || echo dead")) == "alive"
+end
+
+fn try_create(path: string) -> bool is
+    let cmd: string = "( set -C; echo " + to_string(compat::os_pid()) + " > " + shq(path) + " ) 2>/dev/null && echo created || echo exists"
+    return str::trim(proc::shell(cmd)) == "created"
+end
+
+fn acquire_once(path: string) -> bool is
+    if try_create(path) is return true end
+    let owner: int = owner_pid(path)
+    if owner == compat::os_pid() is return true end
+    if !pid_alive(owner) is
+        proc::shell("rm -f -- " + shq(path))
+        return try_create(path)
+    end
+    return false
+end
+
+;; Rust: `TransactionLock::acquire(lock_dir)`.
+pub fn lock_acquire(lock_dir: string) -> LockResult is
+    let lp: string = compat::path_join(lock_dir, "lock")
+    let ip: string = compat::path_join(lock_dir, ".incomplete")
+    proc::shell("mkdir -p -- " + shq(lock_dir) + " 2>/dev/null")
+    if !fs::is_dir(lock_dir) is
+        return LockResult { lock: empty_lock(lp, ip), err: "mkdir -p " + lock_dir }
+    end
+    let found: bool = fs::exists(ip)
+    if !acquire_once(lp) is
+        return LockResult { lock: empty_lock(lp, ip), err: "Another 'hammer oci' transaction is already running.\n  Lock: " + lp + "\n  If no other instance is running, remove the lock file." }
+    end
+    ;; Oznacz transakcje jako trwajaca.
+    fs::write(ip, "pid=" + to_string(compat::os_pid()) + "\n")
+    return LockResult {
+        lock: TransactionLock { lock_path: lp, incomplete_path: ip, found_incomplete: found, pid: compat::os_pid() },
+        err: ""
+    }
+end
+
+;; Rust: `mark_complete` — usuwa `.incomplete` po pomyslnym zakonczeniu.
+pub fn mark_complete(l: TransactionLock) is
+    if fs::exists(l.incomplete_path) is fs::remove(l.incomplete_path) end
+end
+
+;; Rust: `found_incomplete()`.
+pub fn found_incomplete(l: TransactionLock) -> bool is
+    return l.found_incomplete
+end
+
+pub fn lock_path(l: TransactionLock) -> string is
+    return l.lock_path
+end
+
+;; Zamiennik `Drop` — zwalnia plik blokady, jesli nadal jest nasz.
+pub fn lock_release(l: TransactionLock) is
+    if l.pid <= 0 is return end
+    if owner_pid(l.lock_path) == l.pid is
+        proc::shell("rm -f -- " + shq(l.lock_path))
+    end
+end
