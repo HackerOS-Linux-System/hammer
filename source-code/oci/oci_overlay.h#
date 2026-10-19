@@ -1,0 +1,178 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+
+mod internal
+mod oci_process
+
+;; hammer -> oci::oci_overlay
+;;
+;; Port of source-code/oci/overlay.rs (Rust) to H#: sesja overlayfs
+;; (lower = checkout deploymentu, upper = zmiany, merged = widok dla
+;; skryptow maintainera), bind-mounty /proc /sys /dev, splaszczanie do
+;; katalogu gotowego pod `ostree commit`.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `nix::mount` -> polecenia `mount`/`umount -l` (MNT_DETACH = `-l`).
+;;    Wymaga roota (CAP_SYS_ADMIN), jak w Rust.
+;; 2. Stan niemutowalny: `end_session`/`discard_session` zwracaja NOWA
+;;    sesje z `mounted = false` — wolajacy MUSI ja podstawic.
+;; 3. `walkdir` + `std::fs::copy` -> `cp -a` (zachowuje wlasciciela,
+;;    uprawnienia, xattrs, twarde dowiazania — Rust `fs::copy` gubil
+;;    wlasciciela i xattrs, a to dla obrazu systemu istotne).
+;; 4. Whiteouty: poza `.wh.<nazwa>` (OCI, jedyne w Rust) obslugiwane sa tez
+;;    PRAWDZIWE whiteouty overlayfs (urzadzenia znakowe 0/0) — bez tego
+;;    `cp -a` skopiowalby wezel urzadzenia do commita. Marker `.wh..wh..opq`
+;;    jest usuwany z wyniku.
+;; 5. `Result<T>` -> `string` ("" = OK) lub struktura z polem `err`.
+
+pub struct OverlaySession is
+    pub lower_dir:  string
+    pub upper_dir:  string
+    pub work_dir:   string
+    pub merged_dir: string
+    pub mounted:    bool
+end
+
+pub struct SessionResult is
+    pub session: OverlaySession
+    pub err:     string
+end
+
+fn session_of(root: string, lower: string, mounted: bool) -> OverlaySession is
+    return OverlaySession {
+        lower_dir: lower,
+        upper_dir: compat::path_join(root, "upper"),
+        work_dir: compat::path_join(root, "work"),
+        merged_dir: compat::path_join(root, "merged"),
+        mounted: mounted
+    }
+end
+
+fn session_root(work_root: string) -> string is
+    return compat::path_join(work_root, "session")
+end
+
+;; Rust: `OverlayManager::begin_session`.
+pub fn begin_session(work_root: string, lower_dir: string) -> SessionResult is
+    let root: string = session_root(work_root)
+    let s: OverlaySession = session_of(root, lower_dir, false)
+    if fs::exists(root) is
+        let rc: oci_process::RunResult = oci_process::run_capture("rm", ["-rf", root])
+        if !rc.status_ok || fs::exists(root) is
+            return SessionResult { session: s, err: "Cleaning stale overlay session " + root }
+        end
+    end
+    let mk: oci_process::RunResult = oci_process::run_capture("mkdir", ["-p", s.upper_dir, s.work_dir, s.merged_dir])
+    if !mk.status_ok is
+        return SessionResult { session: s, err: "mkdir -p " + root + ": " + str::trim(mk.stderr) }
+    end
+    let opts: string = "lowerdir=" + lower_dir + ",upperdir=" + s.upper_dir + ",workdir=" + s.work_dir
+    let m: oci_process::RunResult = oci_process::run_capture("mount", ["-t", "overlay", "overlay", "-o", opts, s.merged_dir])
+    if !m.status_ok is
+        return SessionResult { session: s, err: "mount overlay -> " + s.merged_dir + " (" + opts + "): " + str::trim(m.stderr) }
+    end
+    return SessionResult { session: session_of(root, lower_dir, true), err: "" }
+end
+
+;; Rust: `bind_mount_virtual_fs` — /proc /sys /dev /dev/pts + resolv.conf.
+pub fn bind_mount_virtual_fs(s: OverlaySession) -> string is
+    let srcs: [string] = ["/proc", "/sys", "/dev", "/dev/pts"]
+    let rels: [string] = ["proc", "sys", "dev", "dev/pts"]
+    let mut i: int = 0
+    while i < srcs.len() is
+        let dest: string = compat::path_join(s.merged_dir, rels[i])
+        oci_process::run_capture("mkdir", ["-p", dest])
+        let m: oci_process::RunResult = oci_process::run_capture("mount", ["--rbind", srcs[i], dest])
+        if !m.status_ok is
+            return "bind-mount " + srcs[i] + " -> " + dest + ": " + str::trim(m.stderr)
+        end
+        i += 1
+    end
+    let resolv: string = compat::path_join(s.merged_dir, "etc/resolv.conf")
+    oci_process::run_capture("mkdir", ["-p", compat::path_parent(resolv)])
+    oci_process::run_capture("cp", ["/etc/resolv.conf", resolv])
+    return ""
+end
+
+;; Rust: `unbind_virtual_fs` — wywolywac PRZED `end_session`/`discard_session`.
+pub fn unbind_virtual_fs(s: OverlaySession) -> string is
+    let rels: [string] = ["dev/pts", "dev", "sys", "proc"]
+    let mut i: int = 0
+    while i < rels.len() is
+        let dest: string = compat::path_join(s.merged_dir, rels[i])
+        if fs::exists(dest) is oci_process::run_capture("umount", ["-l", dest]) end
+        i += 1
+    end
+    return ""
+end
+
+;; Rust: `end_session` — odmontowuje merged, zachowuje upper.
+pub fn end_session(s: OverlaySession) -> SessionResult is
+    if s.mounted is
+        let u: oci_process::RunResult = oci_process::run_capture("umount", ["-l", s.merged_dir])
+        if !u.status_ok is
+            return SessionResult { session: s, err: "umount " + s.merged_dir + ": " + str::trim(u.stderr) }
+        end
+        return SessionResult {
+            session: OverlaySession { lower_dir: s.lower_dir, upper_dir: s.upper_dir, work_dir: s.work_dir, merged_dir: s.merged_dir, mounted: false },
+            err: ""
+        }
+    end
+    return SessionResult { session: s, err: "" }
+end
+
+;; Rust: `discard_session` — jak `end_session` + usuniecie upper/work.
+pub fn discard_session(s: OverlaySession) -> SessionResult is
+    let r: SessionResult = end_session(s)
+    if r.err != "" is return r end
+    oci_process::run_capture("rm", ["-rf", s.upper_dir, s.work_dir])
+    return r
+end
+
+;; Skrypt splaszczajacy: argumenty $1 lower, $2 upper, $3 dest.
+fn flatten_script() -> string is
+    return "set -e\nlower=\"$1\"; upper=\"$2\"; dest=\"$3\"\nrm -rf \"$dest\"; mkdir -p \"$dest\"\nif [ -d \"$lower\" ]; then cp -a \"$lower\"/. \"$dest\"/; fi\nif [ -d \"$upper\" ]; then\n  cp -a \"$upper\"/. \"$dest\"/\n  (cd \"$upper\" && find . -type c -print0) | while IFS= read -r -d '' p; do rm -rf \"$dest/$p\"; done\n  (cd \"$upper\" && find . -name '.wh.*' -print0) | while IFS= read -r -d '' p; do\n    d=$(dirname \"$p\"); b=$(basename \"$p\")\n    rm -rf \"$dest/$p\"\n    if [ \"$b\" != '.wh..wh..opq' ]; then\n      real=$(printf '%s' \"$b\" | sed 's/^\\.wh\\.//')\n      rm -rf \"$dest/$d/$real\"\n    fi\n  done\nfi\n"
+end
+
+;; Rust: `flatten_to` — lower + upper -> `dest` (upper wygrywa).
+pub fn flatten_to(s: OverlaySession, dest: string) -> string is
+    if dest == "" || dest == "/" is return "Refusing to flatten into '" + dest + "'" end
+    let script: string = fs::temp_file("hammer-oci-flatten")
+    fs::write(script, flatten_script())
+    let r: oci_process::RunResult = oci_process::run_capture("bash", [script, s.lower_dir, s.upper_dir, dest])
+    proc::shell("rm -f -- " + oci_process::shq(script))
+    if !r.status_ok is
+        return "Flattening overlay into " + dest + ": " + str::trim(r.stderr)
+    end
+    return ""
+end
+
+;; Rust: `detect_orphaned_session` -> Option<PathBuf> ("" = brak).
+pub fn detect_orphaned_session(work_root: string) -> string is
+    let session: string = session_root(work_root)
+    if fs::exists(compat::path_join(session, "merged")) || fs::exists(compat::path_join(session, "upper")) is
+        return session
+    end
+    return ""
+end
+
+;; Rust: `repair_orphaned_session`.
+pub fn repair_orphaned_session(session_dir: string) -> string is
+    let merged: string = compat::path_join(session_dir, "merged")
+    if fs::exists(merged) is
+        ;; wirtualne FS pod merged tez (rekursywny bind) — odmontuj od najglebszych
+        let rels: [string] = ["dev/pts", "dev", "sys", "proc"]
+        let mut i: int = 0
+        while i < rels.len() is
+            oci_process::run_capture("umount", ["-l", compat::path_join(merged, rels[i])])
+            i += 1
+        end
+        oci_process::run_capture("umount", ["-l", merged])
+    end
+    let r: oci_process::RunResult = oci_process::run_capture("rm", ["-rf", session_dir])
+    if !r.status_ok || fs::exists(session_dir) is
+        return "Removing orphaned overlay session " + session_dir + ": " + str::trim(r.stderr)
+    end
+    return ""
+end
