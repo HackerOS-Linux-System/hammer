@@ -1,0 +1,156 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "bit -> hk-parser" from "hkp"
+
+mod internal
+mod oci_types
+
+;; hammer -> oci::oci_config
+;;
+;; Port of source-code/oci/config.rs (Rust) to H#: wczytywanie
+;; /etc/hammer/oci.hk (albo legacy /etc/deb-ostree/deb-ostree.hk).
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `.hk` czyta biblioteka `hk-parser` (jak Rust: `load_hk_file` +
+;;    `resolve_interpolations`) — `hkp::parse_file`, `resolve`, `has`, `get`,
+;;    `get_bool`, `keys`, `type_of`; sciezki kropkowe "sekcja.klucz".
+;; 2. `anyhow::Result<Config>` -> `ConfigResult { cfg, err }` ("" = OK).
+;; 3. `[apt] -> source_N`: petla po `source_0, source_1, ...` konczy sie na
+;;    pierwszym brakujacym kluczu (jak w Rust).
+;; 4. `read_system_apt_sources` czyta `*.list` przez `fs::list_dir`
+;;    (kolejnosc alfabetyczna; `read_dir` w Rust nie gwarantuje zadnej).
+
+pub fn oci_hk_path() -> string is return "/etc/hammer/oci.hk" end
+pub fn legacy_debostree_hk() -> string is return "/etc/deb-ostree/deb-ostree.hk" end
+
+pub struct ConfigResult is
+    pub cfg: oci_types::Config
+    pub err: string
+end
+
+fn cfg_err(cfg: oci_types::Config, msg: string) -> ConfigResult is
+    return ConfigResult { cfg: cfg, err: msg }
+end
+
+;; Surowe linie `deb ...` / `deb-src ...` (bez komentarzy i pustych).
+fn push_sources_file(out: [string], path: string) -> [string] is
+    let mut acc: [string] = out
+    if !fs::is_file(path) is return acc end
+    let lines: [string] = str::split(fs::read(path), "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        let l: string = str::trim(lines[i])
+        i += 1
+        if l == "" || l.starts_with("#") is continue end
+        if l.starts_with("deb ") || l.starts_with("deb-src ") is
+            acc.push(l)
+        end
+    end
+    return acc
+end
+
+;; Rust: `read_system_apt_sources` — analog `sources_parser.cpp`.
+pub fn read_system_apt_sources(list_path: string, list_dir: string) -> [string] is
+    let mut out: [string] = []
+    out = push_sources_file(out, list_path)
+    if fs::is_dir(list_dir) is
+        let entries: [string] = fs::list_dir(list_dir)
+        let mut i: int = 0
+        while i < entries.len() is
+            let p: string = entries[i]
+            i += 1
+            if p.ends_with(".list") is
+                out = push_sources_file(out, compat::path_join(list_dir, compat::path_filename(p)))
+            end
+        end
+    end
+    return out
+end
+
+;; Wartosc tekstowa `sekcja.klucz` albo nil.
+fn hk_str(h: hkp::HkConfig, key: string) -> string? is
+    if h.has(key) is return h.get(key) end
+    return nil
+end
+
+;; Rust: `load_config(path)`. `path` == "" -> domyslne miejsca.
+pub fn load_config(path: string) -> ConfigResult is
+    let mut cfg: oci_types::Config = oci_types::config_default()
+
+    let mut chosen: string = ""
+    if path != "" is
+        chosen = path
+    elsif fs::exists(oci_hk_path()) is
+        chosen = oci_hk_path()
+    elsif fs::exists(legacy_debostree_hk()) is
+        chosen = legacy_debostree_hk()
+    end
+    if chosen == "" is return ConfigResult { cfg: cfg, err: "" } end
+
+    let h: hkp::HkConfig = hkp::parse_file(chosen)
+    if !h.is_valid() is
+        return cfg_err(cfg, "Parsing " + chosen + ": " + hkp::last_error())
+    end
+    if !h.resolve() is
+        let e: string = hkp::last_error()
+        h.free()
+        return cfg_err(cfg, "Resolving interpolations in " + chosen + ": " + e)
+    end
+
+    let sections: [string] = h.keys("")
+    let mut i: int = 0
+    while i < sections.len() is
+        let sec: string = sections[i]
+        i += 1
+        if h.type_of(sec) != "map" is continue end
+
+        if sec == "sysroot" is
+            let v: string? = hk_str(h, "sysroot.path")
+            if v != nil is cfg.sysroot_path = v end
+        elsif sec == "ostree" is
+            let v: string? = hk_str(h, "ostree.repo_path")
+            if v != nil is cfg.ostree_repo_path = v end
+        elsif sec == "system" is
+            let os: string? = hk_str(h, "system.osname")
+            if os != nil is cfg.osname = os end
+            let ar: string? = hk_str(h, "system.arch")
+            if ar != nil is cfg.arch = ar end
+        elsif sec == "overlay" is
+            let v: string? = hk_str(h, "overlay.work_dir")
+            if v != nil is cfg.overlay_work_dir = v end
+        elsif sec == "apt" is
+            let a: string? = hk_str(h, "apt.lists_path")
+            if a != nil is cfg.apt_lists_path = a end
+            let b: string? = hk_str(h, "apt.sources_list")
+            if b != nil is cfg.apt_sources_list = b end
+            let c: string? = hk_str(h, "apt.sources_dir")
+            if c != nil is cfg.apt_sources_dir = c end
+            let d: string? = hk_str(h, "apt.keyring_dir")
+            if d != nil is cfg.keyring_dir = d end
+            if h.has("apt.require_gpg") is cfg.require_gpg = h.get_bool("apt.require_gpg") end
+            ;; [apt] -> source_0, source_1, ... nadpisuje odczyt z systemu
+            let mut srcs: [string] = []
+            let mut n: int = 0
+            while true is
+                let s: string? = hk_str(h, "apt.source_" + to_string(n))
+                if s == nil is break end
+                srcs.push(s)
+                n += 1
+            end
+            cfg.apt_sources = srcs
+        elsif sec == "confext" is
+            let v: string? = hk_str(h, "confext.mode")
+            if v != nil is cfg.confext_mode = v end
+        elsif sec == "origin" is
+            let v: string? = hk_str(h, "origin.refspec")
+            if v != nil is cfg.origin_refspec = v end
+        end
+    end
+    h.free()
+
+    if cfg.apt_sources.len() == 0 is
+        cfg.apt_sources = read_system_apt_sources(cfg.apt_sources_list, cfg.apt_sources_dir)
+    end
+    return ConfigResult { cfg: cfg, err: "" }
+end
