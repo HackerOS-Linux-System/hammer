@@ -1,0 +1,88 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+
+mod internal
+mod oci_process
+
+;; hammer -> oci::oci_puller
+;;
+;; Port of source-code/oci/oci_puller.rs (Rust) to H#: pobranie obrazu OCI
+;; (`skopeo copy`), zlozenie warstw z poprawna obsluga whiteoutow
+;; (`podman create` + `podman export`) i rozpakowanie rootfs.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `podman export | tar -xpf -` (dwa `Command` z potokiem w Rust) -> jedno
+;;    polecenie `bash -c 'set -o pipefail; ...'` z argumentami przekazanymi
+;;    jako $1/$2, wiec nic nie jest doklejane do tekstu skryptu.
+;; 2. `OciPuller { work_dir }` -> argument `work_dir` w kazdej funkcji.
+;; 3. Zwraca `PullResult { rootfs, err }` ("" = OK). Katalog `rootfs`
+;;    nalezy do wolajacego (usuwa go).
+
+pub struct PullResult is
+    pub rootfs: string
+    pub err:    string
+end
+
+fn missing_tools() -> [string] is
+    let mut out: [string] = []
+    let tools: [string] = ["skopeo", "podman"]
+    let mut i: int = 0
+    while i < tools.len() is
+        if !oci_process::tool_available(tools[i]) is out.push(tools[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; Rust: `check_tools_available` — "" = OK.
+pub fn check_tools_available() -> string is
+    let missing: [string] = missing_tools()
+    if missing.len() > 0 is
+        return "hammer oci requires the following tool(s) which were not found in $PATH: " + str::join(missing, ", ") + ".\n  Install them (e.g. `apt install skopeo podman`) before pulling OCI base images."
+    end
+    return ""
+end
+
+fn fail(msg: string) -> PullResult is
+    return PullResult { rootfs: "", err: msg }
+end
+
+;; Rust: `pull_and_unpack(image_ref)`.
+pub fn pull_and_unpack(work_dir: string, image_ref: string) -> PullResult is
+    let te: string = check_tools_available()
+    if te != "" is return fail(te) end
+    proc::shell("mkdir -p -- " + oci_process::shq(work_dir) + " 2>/dev/null")
+    if !fs::is_dir(work_dir) is return fail("mkdir -p " + work_dir) end
+
+    let layout_dir: string = compat::path_join(work_dir, "oci-layout")
+    let rootfs_dir: string = compat::path_join(work_dir, "rootfs")
+    proc::shell("rm -rf -- " + oci_process::shq(layout_dir) + " " + oci_process::shq(rootfs_dir))
+
+    ;; 1) skopeo copy docker://<ref> oci:<layout>:latest
+    let dest: string = "oci:" + layout_dir + ":latest"
+    let ce: string = oci_process::run_inherit_in("skopeo", ["copy", "docker://" + image_ref, dest], work_dir)
+    if ce != "" is return fail("skopeo copy docker://" + image_ref + " " + dest + ": " + ce) end
+
+    ;; 2) podman create z ukladu OCI; zapas: containers-storage.
+    let pid: string = to_string(compat::os_pid())
+    let container: string = "oci-archive-import-" + pid
+    let cr: oci_process::RunResult = oci_process::run_capture("podman", ["create", "--name", container, "oci-archive:" + layout_dir])
+    if !(cr.err == "" && cr.status_ok) is
+        let storage_tag: string = "localhost/hammer-oci-base:" + pid
+        let se: string = oci_process::run_inherit_in("skopeo", ["copy", dest, "containers-storage:" + storage_tag], work_dir)
+        if se != "" is return fail(se) end
+        let pe: string = oci_process::run_inherit_in("podman", ["create", "--name", container, storage_tag], work_dir)
+        if pe != "" is return fail(pe) end
+    end
+
+    oci_process::run_capture("mkdir", ["-p", rootfs_dir])
+    ;; `podman export` -> tar zlaczone potokiem.
+    let ex: oci_process::RunResult = oci_process::run_capture("bash",
+        ["-c", "set -o pipefail; podman export \"$1\" | tar -xpf - -C \"$2\"", "hammer-oci-export", container, rootfs_dir])
+    oci_process::run_capture("podman", ["rm", "-f", container])
+    if !ex.status_ok is
+        return fail("Extracting exported OCI rootfs failed: " + str::trim(ex.stderr))
+    end
+    return PullResult { rootfs: rootfs_dir, err: "" }
+end
