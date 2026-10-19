@@ -1,0 +1,119 @@
+use "std -> fs" from "fs"
+
+mod internal
+mod ffi
+
+;; hammer -> oci::oci_ostree_repo
+;;
+;; Port of source-code/oci/ostree_repo.rs (Rust) to H#: cienka warstwa nad
+;; `oci_ffi` (tam: CLI `ostree` zamiast libostree — patrz naglowek
+;; `ffi/oci_ffi.h#`).
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `Result<T>` -> struktury z polem `err` ("" = OK); `.with_context(..)`
+;;    -> prefiks w tresci bledu, takie same teksty.
+;; 2. `content_size` zostaje 0 (jak w Rust).
+;; 3. `prune(_keep_refs_older_than_days)`: argument ignorowany, jak w Rust —
+;;    pominiety.
+
+pub struct CommitInfo is
+    pub checksum:     string
+    pub subject:      string
+    pub body:         string
+    pub timestamp:    int
+    pub content_size: int
+end
+
+pub struct Repo is
+    pub path:  string
+    pub inner: oci_ffi::FfiRepo
+end
+
+pub struct RepoResult is
+    pub repo: Repo
+    pub err:  string
+end
+
+pub struct CommitInfoResult is
+    pub info: CommitInfo
+    pub err:  string
+end
+
+fn wrap(path: string, r: oci_ffi::FfiRepoResult, ctx: string) -> RepoResult is
+    let repo: Repo = Repo { path: path, inner: r.repo }
+    if r.err != "" is return RepoResult { repo: repo, err: ctx + ": " + r.err } end
+    return RepoResult { repo: repo, err: "" }
+end
+
+;; Rust: `Repo::open`.
+pub fn repo_open(path: string) -> RepoResult is
+    return wrap(path, oci_ffi::repo_open_at(path),
+        "Opening OSTree repo at " + path + ". If it doesn't exist yet, run 'hammer oci deploy <image>' first (it will initialise it).")
+end
+
+;; Rust: `Repo::create` (bare-user).
+pub fn repo_create(path: string) -> RepoResult is
+    return wrap(path, oci_ffi::repo_create_at(path), "Creating OSTree repo at " + path)
+end
+
+;; Rust: `Repo::open_or_create`.
+pub fn repo_open_or_create(path: string) -> RepoResult is
+    let r: oci_ffi::FfiRepoResult = oci_ffi::repo_open_or_create(path)
+    return RepoResult { repo: Repo { path: path, inner: r.repo }, err: r.err }
+end
+
+pub struct CommitResult is
+    pub checksum: string
+    pub err:      string
+end
+
+;; Rust: `commit_directory`.
+pub fn commit_directory(repo: Repo, dir_path: string, refspec: string, subject: string, body: string) -> CommitResult is
+    let r: oci_ffi::StrResult = oci_ffi::commit_directory(repo.inner, dir_path, refspec, subject, body)
+    if r.err != "" is
+        return CommitResult { checksum: "", err: "Committing " + dir_path + " as " + refspec + ": " + r.err }
+    end
+    return CommitResult { checksum: r.value, err: "" }
+end
+
+;; Rust: `resolve_ref` -> Option<String> (`found == false` = None).
+pub fn resolve_ref(repo: Repo, refspec: string) -> oci_ffi::ResolveResult is
+    return oci_ffi::resolve_rev(repo.inner, refspec)
+end
+
+;; Rust: `checkout_commit` (union, tryb user).
+pub fn checkout_commit(repo: Repo, checksum: string, dest_dir: string) -> string is
+    let e: string = oci_ffi::checkout_at(repo.inner, checksum, dest_dir)
+    if e != "" is return "Checking out " + checksum + " -> " + dest_dir + ": " + e end
+    return ""
+end
+
+;; Rust: `read_commit_info`.
+pub fn read_commit_info(repo: Repo, checksum: string) -> CommitInfoResult is
+    let r: oci_ffi::CommitMetaResult = oci_ffi::load_commit_metadata(repo.inner, checksum)
+    let info: CommitInfo = CommitInfo {
+        checksum: r.meta.checksum, subject: r.meta.subject, body: r.meta.body,
+        timestamp: r.meta.timestamp, content_size: 0
+    }
+    if r.err != "" is
+        return CommitInfoResult { info: info, err: "Reading commit metadata for " + checksum + ": " + r.err }
+    end
+    return CommitInfoResult { info: info, err: "" }
+end
+
+;; Rust: `check_integrity(slow_fsck)`.
+pub fn check_integrity(repo: Repo, slow_fsck: bool) -> string is
+    let cfg: string = compat::path_join(repo.path, "config")
+    if !fs::exists(cfg) is return "OSTree repo config missing at " + cfg end
+    if slow_fsck is
+        let r: oci_ffi::FsckResult = oci_ffi::repo_fsck(repo.inner)
+        if r.err != "" is return r.err end
+        log::info("oci: fsck OK — " + to_string(r.refs) + " ref(s), " + to_string(r.objects) + " reachable object(s) verified")
+    end
+    return ""
+end
+
+;; Rust: `prune` — usuwa nieosiagalne obiekty.
+pub fn prune(repo: Repo) -> string is
+    return oci_ffi::repo_prune(repo.inner)
+end
