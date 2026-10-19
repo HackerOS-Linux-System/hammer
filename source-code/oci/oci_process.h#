@@ -1,0 +1,120 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+
+;; hammer -> oci::oci_process
+;;
+;; Port of source-code/oci/process.rs (Rust) to H#: uruchamianie programow
+;; zewnetrznych (skopeo, podman, ostree, chroot, tar, ...).
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `Command::new(..).args(..)` -> JEDNO polecenie powloki z kazdym
+;;    argumentem w apostrofach (`shq`), wiec argumenty ze spacja/apostrofem
+;;    nie sa rozbijane — tak samo jak w Rust, gdzie argumenty nie przechodza
+;;    przez powloke.
+;; 2. `run_capture` zbiera stdout/stderr do plikow tymczasowych
+;;    (`mktemp`-owych, usuwanych po odczycie) i kod wyjscia z `$?`.
+;;    Kod 127 (nie znaleziono programu) = blad "Cannot spawn", jak
+;;    `Command::output()` w Rust.
+;; 3. `run_inherit*` -> `system()` (extern z `internal/compat.h#`), czyli
+;;    dziedziczy terminal rodzica; kod wyjscia = `status / 256`.
+;; 4. `anyhow::Result<T>` -> struktura z polem `err` ("" = OK) albo `string`
+;;    ("" = OK).
+
+pub fn shq(s: string) -> string is
+    return "'" + str::replace_all(s, "'", "'\\''") + "'"
+end
+
+;; `program arg1 arg2 ...` z cytowaniem kazdego tokenu.
+pub fn command_line(program: string, args: [string]) -> string is
+    let mut cmd: string = shq(program)
+    let mut i: int = 0
+    while i < args.len() is
+        cmd = cmd + " " + shq(args[i])
+        i += 1
+    end
+    return cmd
+end
+
+;; `a b c` — jak `args.join(" ")` w komunikatach bledow Rust.
+pub fn join_args(args: [string]) -> string is
+    return str::join(args, " ")
+end
+
+pub struct RunResult is
+    pub status_ok: bool
+    pub stdout:    string
+    pub stderr:    string
+    ;; "" = proces sie uruchomil; inaczej "Cannot spawn '<program>'".
+    pub err:       string
+end
+
+fn exit_code_of(s: string) -> int is
+    let t: string = str::trim(s)
+    if str::is_numeric(t) is return conv::str_to_int(t) end
+    return 1
+end
+
+;; Rust: `run_capture` — przechwytuje stdout/stderr, nie dziedziczy terminala.
+pub fn run_capture(program: string, args: [string]) -> RunResult is
+    let out_f: string = fs::temp_file("hammer-oci-out")
+    let err_f: string = fs::temp_file("hammer-oci-err")
+    let cmd: string = command_line(program, args)
+    let rc_txt: string = proc::shell("( " + cmd + " ) </dev/null >" + shq(out_f) + " 2>" + shq(err_f) + "; echo $?")
+    let rc: int = exit_code_of(rc_txt)
+    let mut so: string = ""
+    let mut se: string = ""
+    if fs::exists(out_f) is so = fs::read(out_f) end
+    if fs::exists(err_f) is se = fs::read(err_f) end
+    proc::shell("rm -f -- " + shq(out_f) + " " + shq(err_f))
+    if rc == 127 is
+        return RunResult { status_ok: false, stdout: so, stderr: se, err: "Cannot spawn '" + program + "'" }
+    end
+    return RunResult { status_ok: rc == 0, stdout: so, stderr: se, err: "" }
+end
+
+;; Rust: `run_capture_checked` — blad, jesli proces nie zakonczyl sie 0.
+;; Zwraca stdout; `err` != "" przy bledzie.
+pub struct CheckedResult is
+    pub stdout: string
+    pub err:    string
+end
+
+pub fn run_capture_checked(program: string, args: [string]) -> CheckedResult is
+    let r: RunResult = run_capture(program, args)
+    if r.err != "" is return CheckedResult { stdout: "", err: r.err } end
+    if !r.status_ok is
+        return CheckedResult { stdout: "", err: "'" + program + " " + join_args(args) + "' failed: " + str::trim(r.stderr) }
+    end
+    return CheckedResult { stdout: r.stdout, err: "" }
+end
+
+;; Rust: `run_inherit` — dziedziczy stdin/stdout/stderr rodzica.
+pub fn run_inherit(program: string, args: [string]) -> string is
+    let rc: int = system(command_line(program, args)) / 256
+    if rc == 127 is return "Cannot spawn '" + program + "'" end
+    if rc != 0 is
+        return "'" + program + " " + join_args(args) + "' exited with exit status: " + to_string(rc)
+    end
+    return ""
+end
+
+;; Rust: `run_inherit_in` — jak `run_inherit`, w katalogu `cwd`.
+pub fn run_inherit_in(program: string, args: [string], cwd: string) -> string is
+    let cmd: string = "cd " + shq(cwd) + " && " + command_line(program, args)
+    let rc: int = system(cmd) / 256
+    if rc == 127 is return "Cannot spawn '" + program + "' in " + cwd end
+    if rc != 0 is
+        return "'" + program + " " + join_args(args) + "' (cwd=" + cwd + ") exited with exit status: " + to_string(rc)
+    end
+    return ""
+end
+
+;; Rust: `tool_available` — czy `program` jest w $PATH.
+pub fn tool_available(program: string) -> bool is
+    let out: string = str::trim(proc::shell("command -v " + shq(program) + " >/dev/null 2>&1 && echo yes || echo no"))
+    return out == "yes"
+end
