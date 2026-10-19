@@ -1,0 +1,137 @@
+use "std -> strings" from "str"
+
+;; hammer -> oci::oci_types
+;;
+;; Port of source-code/oci/types.rs (Rust) to H#.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. Nazwa pliku: `types.h#` -> `oci_types.h#` (nazwa modulu = nazwa pliku;
+;;    prefiks `oci_` w calym katalogu, zeby nie zderzac sie z modulami
+;;    `package`, `db`, `deb`, `diff`, `status`... z reszty portu).
+;; 2. `LayerOp` (enum) -> `string`: "Install" | "Uninstall" | "Override".
+;;    Taka sama pisownia jak `serde` w Rust, wiec `hammer-layers.json`
+;;    zapisany przez wersje Rust jest czytany bez zmian (i odwrotnie).
+;; 3. `PathBuf` -> `string`. `Option<String>` -> `string?`.
+;; 4. `TransactionResult::ok/err` -> `tr_ok` / `tr_err`.
+;; 5. `Default for Config` -> `config_default()`.
+
+pub struct PackageLayer is
+    pub name:    string
+    pub version: string
+    ;; "Install" | "Uninstall" | "Override"
+    pub op:      string
+end
+
+pub fn op_install() -> string is return "Install" end
+pub fn op_uninstall() -> string is return "Uninstall" end
+pub fn op_override() -> string is return "Override" end
+
+;; Rust: `default_op()` — brak pola `op` w JSON oznacza Install.
+pub fn default_op() -> string is return "Install" end
+
+pub fn layer_new(name: string, version: string) -> PackageLayer is
+    return PackageLayer { name: name, version: version, op: "Install" }
+end
+
+pub struct Deployment is
+    pub id:               string
+    pub timestamp:        int
+    pub osname:           string
+    pub checksum:         string
+    pub serial:           int
+    pub booted:           bool
+    pub staged:           bool
+    pub pinned:           bool
+    pub origin_refspec:   string
+    pub layered_packages: [PackageLayer]
+end
+
+pub struct TransactionResult is
+    pub success:         bool
+    pub new_checksum:    string
+    pub error_message:   string
+    pub requires_reboot: bool
+end
+
+pub fn tr_ok(new_checksum: string, requires_reboot: bool) -> TransactionResult is
+    return TransactionResult { success: true, new_checksum: new_checksum, error_message: "", requires_reboot: requires_reboot }
+end
+
+pub fn tr_err(msg: string) -> TransactionResult is
+    return TransactionResult { success: false, new_checksum: "", error_message: msg, requires_reboot: false }
+end
+
+pub struct Config is
+    ;; Sciezka sysroot OSTree, zwykle "/".
+    pub sysroot_path:     string
+    ;; Sciezka repo OSTree, zwykle "/ostree/repo".
+    pub ostree_repo_path: string
+    ;; Nazwa "systemu operacyjnego" w sensie OSTree (osname), np. "hackeros".
+    pub osname:           string
+    ;; Katalog roboczy sesji overlay (jedyna wlasna sciezka hammer-oci).
+    pub overlay_work_dir: string
+    ;; Cache indeksow Packages — odpowiednik /var/lib/apt/lists.
+    pub apt_lists_path:   string
+    ;; Plik sources.list (czytany, nie zarzadzany przez hammer-oci).
+    pub apt_sources_list: string
+    ;; Katalog sources.list.d/.
+    pub apt_sources_dir:  string
+    ;; Katalog zaufanych kluczy GPG.
+    pub keyring_dir:      string
+    ;; Architektura docelowa, domyslnie "amd64".
+    pub arch:             string
+    ;; Tryb confext dla plikow /etc.
+    pub confext_mode:     string
+    ;; Zrodla apt — z apt_sources_list/apt_sources_dir lub `[apt] -> source_N`.
+    pub apt_sources:      [string]
+    ;; Refspec obrazu bazowego OCI (origin).
+    pub origin_refspec:   string?
+    ;; `[apt] -> require_gpg` — brak/zly podpis GPG przerywa twardym bledem.
+    pub require_gpg:      bool
+end
+
+pub fn config_default() -> Config is
+    let srcs: [string] = []
+    return Config {
+        sysroot_path:     "/",
+        ostree_repo_path: "/ostree/repo",
+        osname:           "hackeros",
+        overlay_work_dir: "/var/lib/hammer/oci/overlay-work",
+        apt_lists_path:   "/var/lib/hammer/oci/apt-cache",
+        apt_sources_list: "/etc/apt/sources.list",
+        apt_sources_dir:  "/etc/apt/sources.list.d",
+        keyring_dir:      "/etc/apt/trusted.gpg.d",
+        arch:             "amd64",
+        confext_mode:     "none",
+        apt_sources:      srcs,
+        origin_refspec:   nil,
+        require_gpg:      false
+    }
+end
+
+;; ── Pomocnicze wspolne dla komend (w Rust: `sanitize`/`sanitize_ref`
+;; kopiowane do kazdego pliku cmd/*.rs) ───────────────────────────────────
+
+;; Znaki spoza [A-Za-z0-9] -> '_' (nazwy refow OSTree).
+pub fn sanitize_ref(s: string) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < string_len(s) is
+        let c: string = string_at(s, i)
+        let alnum: bool = (c >= "0" && c <= "9") || (c >= "a" && c <= "z") || (c >= "A" && c <= "Z")
+        if alnum is out = out + c else out = out + "_" end
+        i += 1
+    end
+    return out
+end
+
+;; Pierwsze 12 znakow checksum (`&checksum[..12.min(len)]`).
+pub fn short_sum(s: string) -> string is
+    if string_len(s) <= 12 is return s end
+    return str::slice(s, 0, 12)
+end
+
+;; `hammer-oci/<sanitized origin>` — nazwa refa warstwowych commitow.
+pub fn layer_ref(origin: string) -> string is
+    return "hammer-oci/" + sanitize_ref(origin)
+end
