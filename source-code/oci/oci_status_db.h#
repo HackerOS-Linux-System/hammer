@@ -1,0 +1,355 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod oci_process
+
+;; hammer -> oci::oci_status_db
+;;
+;; Port of source-code/oci/status_db.rs (Rust) to H#: `dpkg/status`,
+;; `dpkg/info/<pkg>.list` i `apt/extended_states` wewnatrz rootfs.
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `HashMap<String,String>` pol RFC822 -> rownolegle tablice (klucze,
+;;    wartosci); przy duplikacie wygrywa PIERWSZE wystapienie? NIE — jak w
+;;    Rust (`insert`) wygrywa OSTATNIE; `fields_get` szuka od konca.
+;; 2. `HashSet<String>` auto-installed -> `[string]`.
+;; 3. `Result<T>` -> struktury z polem `err` / `string` ("" = OK).
+;; 5. BLAD ORYGINALU, KTORY NAPRAWIAM: `write_status` zapisywal
+;;    `Installed-By: hammer-oci` rowniez dla pakietow z PUSTYM `installed_by`
+;;    (obraz bazowy), wiec po pierwszym `upsert` KAZDY pakiet bazy wygladal
+;;    na warstwowy i `load()` zwracal cala baze. Teraz pole jest pomijane,
+;;    gdy puste (zgodnie z komentarzem przy strukturze). Do cofniecia.
+;; 4. Parser pol jak w oryginale: uproszczony (bez pelnej obslugi
+;;    kontynuacji z kropka) — to NIE jest bug portu, tylko zachowanie Rust.
+
+pub struct InstalledPackage is
+    pub name:           string
+    pub version:        string
+    pub architecture:   string
+    pub maintainer:     string
+    pub description:    string
+    pub depends:        string
+    pub pre_depends:    string
+    pub provides:       string
+    pub section:        string
+    pub priority:       string
+    pub installed_size: int
+    pub files:          [string]
+    pub status:         string
+    ;; Puste dla pakietow obrazu bazowego, "hammer-oci" dla warstwowych.
+    pub installed_by:   string
+end
+
+pub struct StatusLoad is
+    pub pkgs: [InstalledPackage]
+    pub err:  string
+end
+
+pub fn installed_by_marker() -> string is return "hammer-oci" end
+pub fn default_status() -> string is return "install ok installed" end
+
+pub fn dpkg_status_path(rootfs: string) -> string is
+    return compat::path_join(rootfs, "var/lib/dpkg/status")
+end
+pub fn dpkg_info_dir(rootfs: string) -> string is
+    return compat::path_join(rootfs, "var/lib/dpkg/info")
+end
+pub fn dpkg_list_path(rootfs: string, pkg: string) -> string is
+    return compat::path_join(dpkg_info_dir(rootfs), pkg + ".list")
+end
+;; Standardowy plik apt/apt-mark/apt autoremove (ten sam format RFC822).
+pub fn extended_states_path(rootfs: string) -> string is
+    return compat::path_join(rootfs, "var/lib/apt/extended_states")
+end
+
+;; ── Pola RFC822 ──────────────────────────────────────────────────────────
+
+pub struct Fields is
+    pub keys: [string]
+    pub vals: [string]
+end
+
+fn fields_empty() -> Fields is
+    let k: [string] = []
+    let v: [string] = []
+    return Fields { keys: k, vals: v }
+end
+
+fn fields_index(f: Fields, key: string) -> int is
+    let mut i: int = f.keys.len() - 1
+    while i >= 0 is
+        if f.keys[i] == key is return i end
+        i -= 1
+    end
+    return -1
+end
+
+pub fn fields_has(f: Fields, key: string) -> bool is
+    return fields_index(f, key) >= 0
+end
+
+pub fn fields_get(f: Fields, key: string) -> string is
+    let i: int = fields_index(f, key)
+    if i < 0 is return "" end
+    return f.vals[i]
+end
+
+;; Rust: `parse_rfc822_fields`.
+pub fn parse_rfc822_fields(block: string) -> Fields is
+    let mut f: Fields = fields_empty()
+    let lines: [string] = str::split(block, "\n")
+    let mut cur: int = -1
+    let mut i: int = 0
+    while i < lines.len() is
+        let line: string = lines[i]
+        i += 1
+        if line.starts_with(" ") is
+            if cur >= 0 is
+                f.vals[cur] = f.vals[cur] + "\n" + str::slice(line, 1, string_len(line))
+            end
+            continue
+        end
+        let c: int = compat::str_index_of(line, ":")
+        if c >= 0 is
+            let k: string = str::trim(str::slice(line, 0, c))
+            let v: string = str::trim(str::slice(line, c + 1, string_len(line)))
+            let existing: int = fields_index(f, k)
+            if existing >= 0 is
+                f.vals[existing] = v
+                cur = existing
+            else
+                f.keys.push(k)
+                f.vals.push(v)
+                cur = f.keys.len() - 1
+            end
+        end
+    end
+    return f
+end
+
+;; Bloki rozdzielone pusta linia; puste pomijane.
+fn split_blocks(text: string) -> [string] is
+    let mut out: [string] = []
+    let parts: [string] = str::split(text, "\n\n")
+    let mut i: int = 0
+    while i < parts.len() is
+        if str::trim(parts[i]) != "" is out.push(parts[i]) end
+        i += 1
+    end
+    return out
+end
+
+;; ── auto-installed (extended_states) ─────────────────────────────────────
+
+;; Rust: `load_auto_installed` — nazwy z `Auto-Installed: 1`.
+pub fn load_auto_installed(rootfs: string) -> [string] is
+    let mut out: [string] = []
+    let path: string = extended_states_path(rootfs)
+    if !fs::is_file(path) is return out end
+    let blocks: [string] = split_blocks(fs::read(path))
+    let mut i: int = 0
+    while i < blocks.len() is
+        let f: Fields = parse_rfc822_fields(blocks[i])
+        i += 1
+        if str::trim(fields_get(f, "Auto-Installed")) == "1" && fields_has(f, "Package") is
+            out.push(fields_get(f, "Package"))
+        end
+    end
+    return out
+end
+
+;; Rust: `set_auto_installed` — auto=true dopisuje wpis, false = brak wpisu.
+pub fn set_auto_installed(rootfs: string, name: string, arch: string, auto: bool) -> string is
+    let path: string = extended_states_path(rootfs)
+    let mut blocks: [Fields] = []
+    if fs::is_file(path) is
+        let raw: [string] = split_blocks(fs::read(path))
+        let mut i: int = 0
+        while i < raw.len() is
+            let f: Fields = parse_rfc822_fields(str::trim(raw[i]))
+            if fields_get(f, "Package") != name is blocks.push(f) end
+            i += 1
+        end
+    end
+    if auto is
+        blocks.push(Fields { keys: ["Package", "Architecture", "Auto-Installed"], vals: [name, arch, "1"] })
+    end
+    let parent: string = compat::path_parent(path)
+    if parent != "" is oci_process::run_capture("mkdir", ["-p", parent]) end
+    let keys: [string] = ["Package", "Architecture", "Auto-Installed"]
+    let mut out: [string] = []
+    let mut b: int = 0
+    while b < blocks.len() is
+        let mut k: int = 0
+        while k < keys.len() is
+            if fields_has(blocks[b], keys[k]) is
+                out.push(keys[k] + ": " + fields_get(blocks[b], keys[k]) + "\n")
+            end
+            k += 1
+        end
+        out.push("\n")
+        b += 1
+    end
+    fs::write(path, str::join(out, ""))
+    if !fs::exists(path) is return "Writing " + path end
+    return ""
+end
+
+;; ── dpkg/status ──────────────────────────────────────────────────────────
+
+fn parse_status_blocks(text: string) -> [InstalledPackage] is
+    let mut out: [InstalledPackage] = []
+    let blocks: [string] = split_blocks(text)
+    let mut i: int = 0
+    while i < blocks.len() is
+        let f: Fields = parse_rfc822_fields(blocks[i])
+        i += 1
+        if !fields_has(f, "Package") is continue end
+        let sz: string = str::trim(fields_get(f, "Installed-Size"))
+        let mut kib: int = 0
+        if str::is_numeric(sz) is kib = conv::str_to_int(sz) end
+        let none: [string] = []
+        let mut status: string = default_status()
+        if fields_has(f, "Status") is status = fields_get(f, "Status") end
+        out.push(InstalledPackage {
+            name: fields_get(f, "Package"),
+            version: fields_get(f, "Version"),
+            architecture: fields_get(f, "Architecture"),
+            maintainer: fields_get(f, "Maintainer"),
+            description: fields_get(f, "Description"),
+            depends: fields_get(f, "Depends"),
+            pre_depends: fields_get(f, "Pre-Depends"),
+            provides: fields_get(f, "Provides"),
+            section: fields_get(f, "Section"),
+            priority: fields_get(f, "Priority"),
+            installed_size: kib * 1024,
+            files: none,
+            status: status,
+            installed_by: fields_get(f, "Installed-By")
+        })
+    end
+    return out
+end
+
+;; Rust: `load_all` — WSZYSTKIE pakiety (z obrazem bazowym).
+pub fn load_all(rootfs: string) -> StatusLoad is
+    let path: string = dpkg_status_path(rootfs)
+    let none: [InstalledPackage] = []
+    if !fs::is_file(path) is return StatusLoad { pkgs: none, err: "" } end
+    return StatusLoad { pkgs: parse_status_blocks(fs::read(path)), err: "" }
+end
+
+;; Rust: `load` — tylko `Installed-By: hammer-oci`.
+pub fn load(rootfs: string) -> StatusLoad is
+    let all: StatusLoad = load_all(rootfs)
+    let mut out: [InstalledPackage] = []
+    let mut i: int = 0
+    while i < all.pkgs.len() is
+        if all.pkgs[i].installed_by == installed_by_marker() is out.push(all.pkgs[i]) end
+        i += 1
+    end
+    return StatusLoad { pkgs: out, err: all.err }
+end
+
+fn write_status(rootfs: string, all: [InstalledPackage]) -> string is
+    let path: string = dpkg_status_path(rootfs)
+    let parent: string = compat::path_parent(path)
+    if parent != "" is oci_process::run_capture("mkdir", ["-p", parent]) end
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < all.len() is
+        let p: InstalledPackage = all[i]
+        i += 1
+        out.push("Package: " + p.name + "\n")
+        out.push("Status: " + (if p.status == "" then default_status() else p.status) + "\n")
+        if p.priority != "" is out.push("Priority: " + p.priority + "\n") end
+        if p.section != "" is out.push("Section: " + p.section + "\n") end
+        if p.architecture != "" is out.push("Architecture: " + p.architecture + "\n") end
+        out.push("Version: " + p.version + "\n")
+        if p.maintainer != "" is out.push("Maintainer: " + p.maintainer + "\n") end
+        if p.installed_size > 0 is out.push("Installed-Size: " + to_string(p.installed_size / 1024) + "\n") end
+        if p.depends != "" is out.push("Depends: " + p.depends + "\n") end
+        if p.pre_depends != "" is out.push("Pre-Depends: " + p.pre_depends + "\n") end
+        if p.provides != "" is out.push("Provides: " + p.provides + "\n") end
+        if p.installed_by != "" is out.push("Installed-By: " + p.installed_by + "\n") end
+        if p.description != "" is out.push("Description: " + p.description + "\n") end
+        out.push("\n")
+    end
+    fs::write(path, str::join(out, ""))
+    if !fs::exists(path) is return "Writing " + path end
+    return ""
+end
+
+;; Rust: `upsert` — status + `dpkg/info/<pkg>.list`.
+pub fn upsert(rootfs: string, pkg: InstalledPackage) -> string is
+    let loaded: StatusLoad = load_all(rootfs)
+    if loaded.err != "" is return loaded.err end
+    let mut all: [InstalledPackage] = loaded.pkgs
+    let mut found: bool = false
+    let mut i: int = 0
+    while i < all.len() is
+        if !found && all[i].name == pkg.name is
+            all[i] = pkg
+            found = true
+        end
+        i += 1
+    end
+    if !found is all.push(pkg) end
+    let we: string = write_status(rootfs, all)
+    if we != "" is return we end
+    oci_process::run_capture("mkdir", ["-p", dpkg_info_dir(rootfs)])
+    let list_path: string = dpkg_list_path(rootfs, pkg.name)
+    fs::write(list_path, str::join(pkg.files, "\n") + "\n")
+    if !fs::exists(list_path) is return "Writing " + list_path end
+    return ""
+end
+
+;; Rust: `remove` — status + `dpkg/info/<pkg>.*`.
+pub fn remove(rootfs: string, name: string) -> string is
+    let loaded: StatusLoad = load_all(rootfs)
+    if loaded.err != "" is return loaded.err end
+    let mut kept: [InstalledPackage] = []
+    let mut i: int = 0
+    while i < loaded.pkgs.len() is
+        if loaded.pkgs[i].name != name is kept.push(loaded.pkgs[i]) end
+        i += 1
+    end
+    let we: string = write_status(rootfs, kept)
+    if we != "" is return we end
+    let exts: [string] = ["list", "postinst", "preinst", "postrm", "prerm", "md5sums"]
+    let mut e: int = 0
+    while e < exts.len() is
+        let p: string = compat::path_join(dpkg_info_dir(rootfs), name + "." + exts[e])
+        if fs::exists(p) is fs::remove(p) end
+        e += 1
+    end
+    return ""
+end
+
+;; Rust: `is_installed` — w dowolny sposob.
+pub fn is_installed(rootfs: string, name: string) -> bool is
+    let all: StatusLoad = load_all(rootfs)
+    let mut i: int = 0
+    while i < all.pkgs.len() is
+        if all.pkgs[i].name == name is return true end
+        i += 1
+    end
+    return false
+end
+
+;; Lista plikow z `dpkg/info/<pkg>.list` (Rust: leniwie przez `dpkg_list_path`).
+pub fn load_file_list(rootfs: string, name: string) -> [string] is
+    let mut out: [string] = []
+    let p: string = dpkg_list_path(rootfs, name)
+    if !fs::is_file(p) is return out end
+    let lines: [string] = str::split(fs::read(p), "\n")
+    let mut i: int = 0
+    while i < lines.len() is
+        if str::trim(lines[i]) != "" is out.push(lines[i]) end
+        i += 1
+    end
+    return out
+end
