@@ -1,0 +1,373 @@
+use "std -> fs"      from "fs"
+use "std -> strings" from "str"
+use "std -> process" from "proc"
+use "std -> conv"    from "conv"
+
+mod internal
+mod ffi
+mod oci_types
+mod oci_ostree_repo
+
+;; hammer -> oci::oci_sysroot
+;;
+;; Port of source-code/oci/sysroot.rs (Rust) to H#: lista deploymentow,
+;; deploy / rollback / cleanup / pin oraz metadane warstw pakietow
+;; (`<sysroot>/ostree/deploy/<osname>/hammer-layers.json`).
+;;
+;; ── Odejscia od oryginalu ───────────────────────────────────────────────
+;; 1. `serde_json` -> `internal/jsonlite.h#` (tokenizer) + wlasny zapis.
+;;    Format pliku bez zmian: obiekt `checksum -> { origin_refspec,
+;;    layered_packages: [{name, version, op}] }` (`op` bez pola = "Install").
+;;    Zapis jest wciety (jak `to_string_pretty`), kolejnosc wpisow = kolejnosc
+;;    w pliku (Rust uzywal `HashMap`, czyli losowej).
+;; 2. Brak `&self`/`impl` na strukturze z uchwytem: funkcje przyjmuja
+;;    `Sysroot`. `Result<TransactionResult>` -> `TransactionResult` (blad =
+;;    `success == false`), a bledy otwarcia -> `SysrootResult.err`.
+;; 3. `rollback`: zachowanie jak w Rust — zdejmuje wpis 0 (`undeploy 0`).
+
+pub struct Sysroot is
+    pub path:   string
+    pub repo:   oci_ostree_repo::Repo
+    pub osname: string
+    pub inner:  oci_ffi::FfiSysroot
+end
+
+pub struct SysrootResult is
+    pub sysroot: Sysroot
+    pub err:     string
+end
+
+pub struct DeploymentsList is
+    pub items: [oci_types::Deployment]
+    pub err:   string
+end
+
+pub struct LayerMeta is
+    pub origin: string
+    pub layers: [oci_types::PackageLayer]
+end
+
+;; ── Otwieranie ───────────────────────────────────────────────────────────
+
+;; Rust: `Sysroot::open(path, repo_path, osname)`.
+pub fn sysroot_open(path: string, repo_path: string, osname: string) -> SysrootResult is
+    let rr: oci_ostree_repo::RepoResult = oci_ostree_repo::repo_open_or_create(repo_path)
+    let none: oci_ffi::FfiSysroot = oci_ffi::FfiSysroot { path: path }
+    let empty: Sysroot = Sysroot { path: path, repo: rr.repo, osname: osname, inner: none }
+    if rr.err != "" is return SysrootResult { sysroot: empty, err: rr.err } end
+    let sr: oci_ffi::FfiSysrootResult = oci_ffi::sysroot_load(path)
+    if sr.err != "" is
+        return SysrootResult { sysroot: empty, err: "Loading OSTree sysroot at " + path + ": " + sr.err }
+    end
+    return SysrootResult { sysroot: Sysroot { path: path, repo: rr.repo, osname: osname, inner: sr.sysroot }, err: "" }
+end
+
+;; ── Metadane warstw (hammer-layers.json) ─────────────────────────────────
+
+pub fn layer_metadata_path(s: Sysroot) -> string is
+    return compat::path_join(compat::path_join(compat::path_join(s.path, "ostree/deploy"), s.osname), "hammer-layers.json")
+end
+
+pub struct LayersParse is
+    pub layers: [oci_types::PackageLayer]
+    pub next:   int
+end
+
+;; `toks[pos] == "["` -> tablica obiektow {name, version, op}.
+fn parse_layers(toks: [string], pos: int) -> LayersParse is
+    let mut out: [oci_types::PackageLayer] = []
+    if pos >= toks.len() || toks[pos] != "[" is return LayersParse { layers: out, next: -1 } end
+    let mut p: int = pos + 1
+    while p < toks.len() && toks[p] != "]" is
+        if toks[p] == "," is
+            p += 1
+            continue
+        end
+        if toks[p] != "{" is return LayersParse { layers: out, next: -1 } end
+        let mut name: string = ""
+        let mut version: string = ""
+        let mut op: string = oci_types::default_op()
+        p += 1
+        while p < toks.len() && toks[p] != "}" is
+            if toks[p] == "," is
+                p += 1
+                continue
+            end
+            if !jsonlite::is_string_tok(toks[p]) || p + 2 >= toks.len() is
+                return LayersParse { layers: out, next: -1 }
+            end
+            let key: string = jsonlite::tok_text(toks[p])
+            let vpos: int = p + 2
+            if jsonlite::is_string_tok(toks[vpos]) is
+                let v: string = jsonlite::tok_text(toks[vpos])
+                if key == "name" is name = v end
+                if key == "version" is version = v end
+                if key == "op" is op = v end
+            end
+            let nx: int = jsonlite::skip_value(toks, vpos)
+            if nx < 0 is return LayersParse { layers: out, next: -1 } end
+            p = nx
+        end
+        p += 1
+        out.push(oci_types::PackageLayer { name: name, version: version, op: op })
+    end
+    return LayersParse { layers: out, next: p + 1 }
+end
+
+pub struct MetaFile is
+    pub keys:    [string]
+    pub origins: [string]
+    pub layers:  [[oci_types::PackageLayer]]
+end
+
+fn meta_empty() -> MetaFile is
+    let k: [string] = []
+    let o: [string] = []
+    let l: [[oci_types::PackageLayer]] = []
+    return MetaFile { keys: k, origins: o, layers: l }
+end
+
+;; Cały plik; blad skladni -> pusty (Rust: `unwrap_or_default`).
+fn meta_load(path: string) -> MetaFile is
+    let mut m: MetaFile = meta_empty()
+    if !fs::exists(path) is return m end
+    let toks: [string] = jsonlite::tokenize(fs::read(path))
+    if toks.len() < 2 || toks[0] != "{" is return m end
+    let mut p: int = 1
+    while p < toks.len() && toks[p] != "}" is
+        if toks[p] == "," is
+            p += 1
+            continue
+        end
+        if !jsonlite::is_string_tok(toks[p]) || p + 2 >= toks.len() is return meta_empty() end
+        let csum: string = jsonlite::tok_text(toks[p])
+        let vpos: int = p + 2
+        let after: int = jsonlite::skip_value(toks, vpos)
+        if after < 0 || toks[vpos] != "{" is return meta_empty() end
+        let mut origin: string = ""
+        let mut layers: [oci_types::PackageLayer] = []
+        let mut q: int = vpos + 1
+        while q < after - 1 is
+            if toks[q] == "," is
+                q += 1
+                continue
+            end
+            if !jsonlite::is_string_tok(toks[q]) || q + 2 >= toks.len() is return meta_empty() end
+            let key: string = jsonlite::tok_text(toks[q])
+            let ipos: int = q + 2
+            if key == "origin_refspec" && jsonlite::is_string_tok(toks[ipos]) is
+                origin = jsonlite::tok_text(toks[ipos])
+            end
+            if key == "layered_packages" is
+                let lp: LayersParse = parse_layers(toks, ipos)
+                if lp.next >= 0 is layers = lp.layers end
+            end
+            let nx: int = jsonlite::skip_value(toks, ipos)
+            if nx < 0 is return meta_empty() end
+            q = nx
+        end
+        m.keys.push(csum)
+        m.origins.push(origin)
+        m.layers.push(layers)
+        p = after
+    end
+    return m
+end
+
+fn q(s: string) -> string is
+    return "\"" + jsonlite::escape(s) + "\""
+end
+
+fn layers_json(layers: [oci_types::PackageLayer]) -> string is
+    if layers.len() == 0 is return "[]" end
+    let mut out: string = "[\n"
+    let mut i: int = 0
+    while i < layers.len() is
+        out = out + "        {{\n          \"name\": " + q(layers[i].name) + ",\n          \"version\": " + q(layers[i].version) + ",\n          \"op\": " + q(layers[i].op) + "\n        }}"
+        if i + 1 < layers.len() is out = out + "," end
+        out = out + "\n"
+        i += 1
+    end
+    return out + "      ]"
+end
+
+fn meta_to_json(m: MetaFile) -> string is
+    if m.keys.len() == 0 is return "{{}}" end
+    let mut out: string = "{{\n"
+    let mut i: int = 0
+    while i < m.keys.len() is
+        out = out + "  " + q(m.keys[i]) + ": {{\n    \"origin_refspec\": " + q(m.origins[i]) + ",\n    \"layered_packages\": " + layers_json(m.layers[i]) + "\n  }}"
+        if i + 1 < m.keys.len() is out = out + "," end
+        out = out + "\n"
+        i += 1
+    end
+    return out + "}}"
+end
+
+fn meta_index(m: MetaFile, csum: string) -> int is
+    let mut i: int = 0
+    while i < m.keys.len() is
+        if m.keys[i] == csum is return i end
+        i += 1
+    end
+    return -1
+end
+
+;; Rust: `write_layer_metadata` (prywatna).
+pub fn write_layer_metadata(s: Sysroot, checksum: string, origin_refspec: string, layered: [oci_types::PackageLayer]) -> string is
+    let path: string = layer_metadata_path(s)
+    let mut m: MetaFile = meta_load(path)
+    let idx: int = meta_index(m, checksum)
+    if idx >= 0 is
+        m.origins[idx] = origin_refspec
+        m.layers[idx] = layered
+    else
+        m.keys.push(checksum)
+        m.origins.push(origin_refspec)
+        m.layers.push(layered)
+    end
+    let parent: string = compat::path_parent(path)
+    if parent != "" is proc::shell("mkdir -p -- " + oci_process::shq(parent) + " 2>/dev/null") end
+    fs::write(path, meta_to_json(m))
+    if !fs::exists(path) is return "Writing " + path end
+    return ""
+end
+
+;; Rust: `read_layer_metadata` -> (origin, layers); brak/blad = puste.
+pub fn read_layer_metadata(s: Sysroot, checksum: string) -> LayerMeta is
+    let m: MetaFile = meta_load(layer_metadata_path(s))
+    let idx: int = meta_index(m, checksum)
+    let none: [oci_types::PackageLayer] = []
+    if idx < 0 is return LayerMeta { origin: "", layers: none } end
+    return LayerMeta { origin: m.origins[idx], layers: m.layers[idx] }
+end
+
+;; ── Deploymenty ──────────────────────────────────────────────────────────
+
+;; Rust: `list_deployments` (0 = najnowszy).
+pub fn list_deployments(s: Sysroot) -> DeploymentsList is
+    let mut out: [oci_types::Deployment] = []
+    let r: oci_ffi::DeploymentsResult = oci_ffi::sysroot_deployments(s.inner)
+    if r.err != "" is return DeploymentsList { items: out, err: "ostree_sysroot_get_deployments: " + r.err } end
+    let mut idx: int = 0
+    while idx < r.items.len() is
+        let d: oci_ffi::DeploymentInfo = r.items[idx]
+        let lm: LayerMeta = read_layer_metadata(s, d.checksum)
+        out.push(oci_types::Deployment {
+            id: d.checksum + "." + to_string(d.serial),
+            timestamp: 0,
+            osname: d.osname,
+            checksum: d.checksum,
+            serial: d.serial,
+            booted: d.booted,
+            staged: idx == 0 && !d.booted,
+            pinned: d.pinned,
+            origin_refspec: d.origin_refspec,
+            layered_packages: lm.layers
+        })
+        idx += 1
+    end
+    return DeploymentsList { items: out, err: "" }
+end
+
+pub struct BootedResult is
+    pub found: bool
+    pub dep:   oci_types::Deployment
+    pub err:   string
+end
+
+fn no_dep() -> oci_types::Deployment is
+    let none: [oci_types::PackageLayer] = []
+    return oci_types::Deployment { id: "", timestamp: 0, osname: "", checksum: "", serial: 0, booted: false, staged: false, pinned: false, origin_refspec: "", layered_packages: none }
+end
+
+;; Rust: `booted_deployment` -> Option.
+pub fn booted_deployment(s: Sysroot) -> BootedResult is
+    let l: DeploymentsList = list_deployments(s)
+    if l.err != "" is return BootedResult { found: false, dep: no_dep(), err: l.err } end
+    let mut i: int = 0
+    while i < l.items.len() is
+        if l.items[i].booted is return BootedResult { found: true, dep: l.items[i], err: "" } end
+        i += 1
+    end
+    return BootedResult { found: false, dep: no_dep(), err: "" }
+end
+
+;; Rust: `deploy_commit` — wchodzi w zycie po reboot.
+pub fn deploy_commit(s: Sysroot, checksum: string, origin_refspec: string, layered: [oci_types::PackageLayer]) -> oci_types::TransactionResult is
+    let e: string = oci_ffi::sysroot_deploy(s.inner, s.osname, checksum, origin_refspec)
+    if e != "" is return oci_types::tr_err(e) end
+    let we: string = write_layer_metadata(s, checksum, origin_refspec, layered)
+    if we != "" is log::warn("oci: could not write layer metadata: " + we) end
+    return oci_types::tr_ok(checksum, true)
+end
+
+;; Rust: `rollback` — zdejmuje deployment 0.
+pub fn rollback(s: Sysroot) -> oci_types::TransactionResult is
+    let l: DeploymentsList = list_deployments(s)
+    if l.err != "" is return oci_types::tr_err(l.err) end
+    if l.items.len() < 2 is
+        return oci_types::tr_err("No previous deployment available to roll back to.")
+    end
+    if l.items[0].pinned is
+        return oci_types::tr_err("The current deployment is pinned; unpin it first if you really want to roll back past it.")
+    end
+    let e: string = oci_ffi::sysroot_undeploy(s.inner, 0)
+    if e != "" is return oci_types::tr_err(e) end
+    let after: DeploymentsList = list_deployments(s)
+    if after.err != "" is return oci_types::tr_err(after.err) end
+    if after.items.len() > 0 is return oci_types::tr_ok(after.items[0].checksum, true) end
+    return oci_types::tr_ok("", true)
+end
+
+;; Rust: `cleanup(keep_last_n)` — od najstarszego, pomija przypiete.
+pub fn cleanup(s: Sysroot, keep_last_n: int) -> oci_types::TransactionResult is
+    let l: DeploymentsList = list_deployments(s)
+    if l.err != "" is return oci_types::tr_err(l.err) end
+    if l.items.len() <= keep_last_n is
+        let pe: string = oci_ostree_repo::prune(s.repo)
+        if pe != "" is return oci_types::tr_err(pe) end
+        return oci_types::tr_ok("", false)
+    end
+    let mut idx: int = l.items.len() - 1
+    while idx >= keep_last_n is
+        let dep: oci_types::Deployment = l.items[idx]
+        if dep.pinned is
+            log::info("oci cleanup: skipping pinned deployment " + dep.id)
+        else
+            let e: string = oci_ffi::sysroot_undeploy(s.inner, idx)
+            if e != "" is return oci_types::tr_err(e) end
+        end
+        idx -= 1
+    end
+    let pe2: string = oci_ostree_repo::prune(s.repo)
+    if pe2 != "" is return oci_types::tr_err(pe2) end
+    return oci_types::tr_ok("", false)
+end
+
+;; Rust: `set_pinned(deployment_id, pinned)` — po id albo prefiksie checksum.
+pub fn set_pinned(s: Sysroot, deployment_id: string, pinned: bool) -> oci_types::TransactionResult is
+    let l: DeploymentsList = list_deployments(s)
+    if l.err != "" is return oci_types::tr_err(l.err) end
+    let mut found: int = -1
+    let mut i: int = 0
+    while i < l.items.len() is
+        if found < 0 && (l.items[i].id == deployment_id || l.items[i].checksum.starts_with(deployment_id)) is found = i end
+        i += 1
+    end
+    if found < 0 is return oci_types::tr_err("No such deployment: " + deployment_id) end
+    let e: string = oci_ffi::sysroot_set_pinned(s.inner, found, pinned)
+    if e != "" is return oci_types::tr_err(e) end
+    return oci_types::tr_ok(l.items[found].checksum, false)
+end
+
+;; Rust: `deployment_path` — `<sysroot>/ostree/deploy/<osname>/deploy/<csum>.<serial>`.
+pub fn deployment_path(s: Sysroot, dep: oci_types::Deployment) -> string is
+    let base: string = compat::path_join(compat::path_join(compat::path_join(s.path, "ostree/deploy"), s.osname), "deploy")
+    return compat::path_join(base, dep.checksum + "." + to_string(dep.serial))
+end
+
+;; Rust: `check_repo_integrity`.
+pub fn check_repo_integrity(s: Sysroot, slow_fsck: bool) -> string is
+    return oci_ostree_repo::check_integrity(s.repo, slow_fsck)
+end
