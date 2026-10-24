@@ -36,10 +36,6 @@ mod oci
 ;; 8. ZACHOWANE: help wymienia `list --available`, ktorego `cmd_list` nie
 ;;    obsluguje (jest tylko `--installed`, `--upgrades`/`--upgradable`).
 
-fn live_safe(cmd: string) -> bool is
-    return cmd == "immutable" || cmd == "doctor" || cmd == "version" || cmd == "features" || cmd == "log" || cmd == "logs"
-end
-
 ;; Wycina `n` pierwszych elementow.
 fn tail_from(args: [string], n: int) -> [string] is
     let mut out: [string] = []
@@ -90,11 +86,6 @@ pub fn run(argv: [string]) -> string is
         print_help()
         return ""
     end
-
-    ;; ── Straznik systemu live ───────────────────────────────────────
-    ui::trace("live guard: normal_mode=" + to_string(build_mode::normal_mode()))
-    if !build_mode::normal_mode() && !live_safe(cmd) is livecheck::assert_not_live() end
-    ui::trace("live guard passed")
 
     if flags.user_mode is return cli_user::run_user(cmd, rest, flags) end
 
