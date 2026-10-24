@@ -234,9 +234,8 @@ pub fn features_print(f: Features) is
     if normal_mode() is
         write("    Classic apt-style installs — works on any system, including containers.")
     else is
-        write("    Generations + immutable store — requires HackerOS installed to disk;")
-        write("    will refuse to run in a live/container environment. For containers, use")
-        write("    HAMMER_MODE=normal or a binary built with 'bit build-normal'.")
+        write("    Generations + immutable store — intended for HackerOS installed to disk.")
+        write("    For containers/chroots use HAMMER_MODE=normal or 'bit build-normal'.")
     end
     write("")
 
