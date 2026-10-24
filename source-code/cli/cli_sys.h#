@@ -809,7 +809,6 @@ pub fn cmd_doctor() -> string is
         write("  " + ui::bright_green("✔") + "  No pending changes")
     end
     d = check_item(d, "GRUB generator installed", fs::exists(grub::grub_generator()), "run `hammer init`")
-    d = check_item(d, "Running on installed system", livecheck::live_reason() == nil, "hammer cannot run in a live system")
     warn_item("Immutable filesystem enabled", immutable::is_immutable_enabled(), "run `hammer immutable enable`")
     warn_item("Trusted GPG keys configured", dir_nonempty(gpg_verify::keyring_dir()), "add keys: `hammer key add <url>`")
     warn_item("gpgv available", sh_ok("command -v gpgv"), "hammer install gnupg")
@@ -1303,8 +1302,15 @@ pub fn cmd_check(args: [string]) -> string is
     write(rule(60))
 
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load()
     let all: [db::InstalledPackage] = idb.list_all()
+    ;; tylko wersje z repo dla zainstalowanych pakietow (bez parsowania calego indeksu)
+    let mut all_names: [string] = []
+    let mut ai: int = 0
+    while ai < all.len() is
+        all_names.push(all[ai].name)
+        ai += 1
+    end
+    let c: cache::PackageCache = cache::cache_load_names(all_names)
     let names: [string] = cli_types::non_flag_args(args)
 
     let mut to_check: [db::InstalledPackage] = []
@@ -1403,8 +1409,16 @@ end
 pub fn cmd_why(args: [string]) -> string is
     if args.len() == 0 is return "Usage: hammer why <package>" end
     let name: string = args[0]
-    let c: cache::PackageCache = cache::cache_load()
     let idb: db::InstalledDb = db::InstalledDb::open()
+    let inst_all: [db::InstalledPackage] = idb.list_all()
+    let mut inst_names: [string] = []
+    let mut ii: int = 0
+    while ii < inst_all.len() is
+        inst_names.push(inst_all[ii].name)
+        ii += 1
+    end
+    let want: [string] = [name]
+    let c: cache::PackageCache = cache::cache_load_subset(want, inst_names, false, true)
     let s: solver::Solver = solver::solver_new(c, idb)
 
     write("")
@@ -1438,8 +1452,16 @@ end
 pub fn cmd_why_not(args: [string]) -> string is
     if args.len() == 0 is return "Usage: hammer why-not <package>" end
     let name: string = args[0]
-    let c: cache::PackageCache = cache::cache_load()
     let idb: db::InstalledDb = db::InstalledDb::open()
+    let inst_all: [db::InstalledPackage] = idb.list_all()
+    let mut inst_names: [string] = []
+    let mut ii: int = 0
+    while ii < inst_all.len() is
+        inst_names.push(inst_all[ii].name)
+        ii += 1
+    end
+    let want: [string] = [name]
+    let c: cache::PackageCache = cache::cache_load_subset(want, inst_names, false, true)
     let s: solver::Solver = solver::solver_new(c, idb)
 
     write("")
