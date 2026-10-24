@@ -3,6 +3,7 @@ use "std -> strings" from "str"
 use "std -> process" from "proc"
 use "std -> fmt"     from "fmt"
 use "std -> conv"    from "conv"
+use "std -> collections" from "col"
 
 mod internal
 mod cli
@@ -64,6 +65,22 @@ fn pick_arch(flags: cli_types::GlobalFlags) -> ArchPick is
         return ArchPick { arch: r.arch, err: "" }
     end
     return ArchPick { arch: cache::detect_arch(), err: "" }
+end
+
+;; Nazwy zainstalowanych pakietow (kontekst dla szybkiego ladowania indeksu).
+fn installed_names(idb: db::InstalledDb) -> [string] is
+    let all: [db::InstalledPackage] = idb.list_all()
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < all.len() is
+        out.push(all[i].name)
+        i += 1
+    end
+    return out
+end
+
+fn reading_lists() is
+    write("  " + ui::dim("·") + " Reading package lists…")
 end
 
 ;; Wola `body(...)` pod systemowa blokada hammera. Zwalnia ja ZAWSZE.
@@ -146,8 +163,11 @@ end
 
 fn install_inner(names: [string], yes: bool, no_recomm: bool, arch: string) -> string is
     ui::print_header()
+    reading_lists()
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load_for_arch(arch)
+    ;; Tylko zadane pakiety + ich zaleznosci (natywny awk) — NIE caly indeks
+    ;; (~71 tys. pakietow), ktory w H# ladowal sie dziesiatki minut.
+    let c: cache::PackageCache = cache::cache_load_for_install(names, installed_names(idb), no_recomm)
     let s: solver::Solver = solver::solver_new(c, idb)
     let pr: solver::PlanResult = solver::solver_resolve_install(s, names, no_recomm)
     if pr.err != "" is return pr.err end
@@ -176,8 +196,9 @@ pub fn cmd_reinstall(args: [string]) -> string is
     let lr: lock::LockResult = lock::system_lock()
     if lr.err != "" is return lr.err end
     ui::print_header()
+    reading_lists()
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load_for_arch(cache::detect_arch())
+    let c: cache::PackageCache = cache::cache_load_for_install(names, installed_names(idb), true)
     let s: solver::Solver = solver::solver_new(c, idb)
     let pr: solver::PlanResult = solver::solver_resolve_reinstall(s, names)
     if pr.err != "" is return with_lock_result("", lr, pr.err) end
@@ -199,8 +220,9 @@ pub fn cmd_remove(args: [string], flags: cli_types::GlobalFlags) -> string is
     let lr: lock::LockResult = lock::system_lock()
     if lr.err != "" is return lr.err end
     ui::print_header()
+    reading_lists()
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load()
+    let c: cache::PackageCache = cache::cache_load_for_installed(installed_names(idb))
     let s: solver::Solver = solver::solver_new(c, idb)
     let pr: solver::PlanResult = solver::solver_resolve_remove(s, names)
     if pr.err != "" is return with_lock_result("", lr, pr.err) end
@@ -265,8 +287,9 @@ end
 fn upgrade_system(pkgs: [string], yes: bool, flags: cli_types::GlobalFlags) -> string is
     let ap: ArchPick = pick_arch(flags)
     if ap.err != "" is return ap.err end
+    reading_lists()
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load_for_arch(ap.arch)
+    let c: cache::PackageCache = cache::cache_load_subset(pkgs, installed_names(idb), true, true)
     let s: solver::Solver = solver::solver_new(c, idb)
     let pr: solver::PlanResult = if pkgs.len() == 0 then solver::solver_resolve_upgrade(s) else solver::solver_resolve_install(s, pkgs, false)
     if pr.err != "" is return pr.err end
@@ -294,8 +317,9 @@ pub fn cmd_dist_upgrade(args: [string]) -> string is
     if lr.err != "" is return lr.err end
     ui::print_header()
     write("  " + ui::accent_bold("⬡") + "  dist-upgrade — aggressive upgrade")
+    reading_lists()
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load()
+    let c: cache::PackageCache = cache::cache_load_for_installed(installed_names(idb))
     let s: solver::Solver = solver::solver_new(c, idb)
     let pr: solver::PlanResult = solver::solver_resolve_dist_upgrade(s)
     if pr.err != "" is return with_lock_result("", lr, pr.err) end
@@ -320,8 +344,9 @@ pub fn cmd_autoremove(args: [string]) -> string is
     let yes: bool = cli_types::has_flag(args, "-y")
     let lr: lock::LockResult = lock::system_lock()
     if lr.err != "" is return lr.err end
+    reading_lists()
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load()
+    let c: cache::PackageCache = cache::cache_load_for_installed(installed_names(idb))
     let s: solver::Solver = solver::solver_new(c, idb)
     let pr: solver::PlanResult = solver::solver_resolve_autoremove(s)
     if pr.err != "" is return with_lock_result("", lr, pr.err) end
@@ -339,8 +364,9 @@ pub fn cmd_fix_broken(args: [string]) -> string is
     if lr.err != "" is return lr.err end
     ui::print_header()
     write("  " + ui::accent_bold("⬡") + "  Checking for broken dependencies…")
+    reading_lists()
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load()
+    let c: cache::PackageCache = cache::cache_load_for_installed(installed_names(idb))
     let s: solver::Solver = solver::solver_new(c, idb)
     let pr: solver::PlanResult = solver::solver_resolve_fix_broken(s)
     if pr.err != "" is return with_lock_result("", lr, pr.err) end
@@ -385,13 +411,23 @@ pub fn cmd_search(args: [string], flags: cli_types::GlobalFlags) -> string is
     let ap: ArchPick = pick_arch(flags)
     if ap.err != "" is return ap.err end
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load_for_arch(ap.arch)
+    let c: cache::PackageCache = cache::cache_load_search(query)
+
+    ;; zbior zainstalowanych nazw budowany RAZ — `idb.is_installed` na kazdy wynik
+    ;; uruchamialo sqlite3 i parsowalo dpkg/status od nowa (setki razy przy `search`).
+    let inst_set: any = col::hashmap_new()
+    let inst_list: [string] = installed_names(idb)
+    let mut ni: int = 0
+    while ni < inst_list.len() is
+        col::hashmap_insert(inst_set, inst_list[ni], "1")
+        ni += 1
+    end
 
     let found: [package::Package] = cache::cache_search(c, query)
     let mut filtered: [package::Package] = []
     let mut i: int = 0
     while i < found.len() is
-        if !installed_only || idb.is_installed(found[i].name) is filtered.push(found[i]) end
+        if !installed_only || col::hashmap_contains(inst_set, found[i].name) is filtered.push(found[i]) end
         i += 1
     end
     let results: [package::Package] = sort_pkgs(filtered)
@@ -403,7 +439,7 @@ pub fn cmd_search(args: [string], flags: cli_types::GlobalFlags) -> string is
     ui::print_search_header(query, results.len())
     let mut k: int = 0
     while k < results.len() is
-        ui::print_search_result(results[k], idb.is_installed(results[k].name))
+        ui::print_search_result(results[k], col::hashmap_contains(inst_set, results[k].name))
         k += 1
     end
     return ""
@@ -415,7 +451,8 @@ pub fn cmd_info(args: [string], flags: cli_types::GlobalFlags) -> string is
     let ap: ArchPick = pick_arch(flags)
     if ap.err != "" is return ap.err end
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load_for_arch(ap.arch)
+    let one: [string] = [name]
+    let c: cache::PackageCache = cache::cache_load_names(one)
     let po: package::Package? = cache::cache_get(c, name)
     if po == nil is return "Package '" + name + "' not found. Run `hammer sync`." end
     let pkg: package::Package = po
@@ -444,7 +481,8 @@ pub fn cmd_list(args: [string]) -> string is
     let installed_only: bool = cli_types::has_flag(args, "--installed") || cli_types::has_flag(args, "-i")
     let upgrades_only: bool = cli_types::has_flag(args, "--upgrades") || cli_types::has_flag(args, "-u") || cli_types::has_flag(args, "--upgradable")
     let idb: db::InstalledDb = db::InstalledDb::open()
-    let c: cache::PackageCache = cache::cache_load()
+    ;; --installed / --upgradable potrzebuja tylko wersji z repo dla zainstalowanych pakietow.
+    let c: cache::PackageCache = if installed_only || upgrades_only then cache::cache_load_for_installed(installed_names(idb)) else cache::cache_load()
 
     if json_mode is
         let mut out: [string] = []
@@ -589,7 +627,8 @@ pub fn cmd_download(args: [string]) -> string is
     let no_verify: bool = cli_types::has_flag(args, "--no-verify")
     let arch: string = cache::detect_arch()
 
-    let c: cache::PackageCache = cache::cache_load_for_arch(arch)
+    let one: [string] = [name]
+    let c: cache::PackageCache = cache::cache_load_names(one)
     let po: package::Package? = cache::cache_get(c, name)
     if po == nil is return "Package '" + name + "' not found. Run 'hammer sync'." end
     let pkg: package::Package = po
