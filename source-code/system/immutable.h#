@@ -500,11 +500,6 @@ pub fn enable_immutable() -> string is
         write("  " + ui::cyan("ℹ") + " Normal-mode build — immutable filesystem disabled.")
         return ""
     end
-    if livecheck::is_live_system() is
-        log::info("immutable: live system — skipping")
-        write("  " + ui::dim("·") + " Live system detected — immutable mode not activated.")
-        return ""
-    end
     let e: string = ensure_root("hammer immutable enable")
     if e != "" is return e end
 
@@ -549,7 +544,7 @@ end
 pub fn unlock_for_transaction() -> GuardResult is
     let off: ImmutableGuard = ImmutableGuard { was_locked: false }
     if build_mode::normal_mode() is return GuardResult { guard: off, err: "" } end
-    if livecheck::is_live_system() || !is_immutable_enabled() is
+    if !is_immutable_enabled() is
         return GuardResult { guard: off, err: "" }
     end
     log::info("immutable: unlocking for transaction")
@@ -560,7 +555,7 @@ end
 
 pub fn relock() -> string is
     if build_mode::normal_mode() is return "" end
-    if livecheck::is_live_system() || !is_immutable_enabled() is return "" end
+    if !is_immutable_enabled() is return "" end
     log::info("immutable: relocking after transaction")
     return lock_by_backend(saved_backend())
 end
@@ -722,7 +717,7 @@ end
 pub fn install_immutable_service() -> string is
     let mut bin: string = str::trim(proc::shell("readlink -f /proc/self/exe 2>/dev/null"))
     if bin == "" is bin = "/usr/bin/hammer" end
-    let unit: string = "[Unit]\nDescription=Hammer Immutable Filesystem\nDefaultDependencies=no\nAfter=local-fs.target\nBefore=sysinit.target\nConditionVirtualization=no\nConditionPathExists=!/run/live\nConditionPathExists=" + flag_file() + "\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=" + bin + " immutable enable\nExecStop=" + bin + " immutable disable\nTimeoutSec=60\n\n[Install]\nWantedBy=sysinit.target\n"
+    let unit: string = "[Unit]\nDescription=Hammer Immutable Filesystem\nDefaultDependencies=no\nAfter=local-fs.target\nBefore=sysinit.target\nConditionVirtualization=no\nConditionPathExists=" + flag_file() + "\n\n[Service]\nType=oneshot\nRemainAfterExit=yes\nExecStart=" + bin + " immutable enable\nExecStop=" + bin + " immutable disable\nTimeoutSec=60\n\n[Install]\nWantedBy=sysinit.target\n"
     if !fs::write("/etc/systemd/system/hammer-immutable.service", unit) is
         return "Cannot write /etc/systemd/system/hammer-immutable.service"
     end
@@ -739,10 +734,6 @@ fn print_immutable_status() -> string is
     write("  " + ui::accent_bold("⬡") + "  Filesystem Immutability — hammer v" + build_mode::hammer_version())
     write("  " + ui::dim(str::repeat("─", 60)))
 
-    if livecheck::is_live_system() is
-        write("  " + ui::cyan_bold("ℹ") + "  Running as " + ui::yellow("live system") + " — immutable mode inactive")
-        return ""
-    end
     if build_mode::normal_mode() is
         write("  " + ui::cyan_bold("ℹ") + "  Built in " + ui::yellow("normal-mode") + " — immutable FS subsystem disabled.")
         return ""
