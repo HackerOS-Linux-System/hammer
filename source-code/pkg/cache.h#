@@ -147,10 +147,9 @@ fn is_name_char(c: string) -> bool is
     return false
 end
 
-;; Wczytuje wszystkie *.pkgs z katalogu list. Brak katalogu = pusty cache.
-pub fn cache_load() -> PackageCache is
+;; Wczytuje wszystkie *.pkgs z podanego katalogu. Brak katalogu = pusty cache.
+fn load_dir(dir: string) -> PackageCache is
     let mut c: PackageCache = cache_empty()
-    let dir: string = lists_dir()
     if !fs::exists(dir) is return c end
 
     let files: [string] = fs::walk(dir)
@@ -174,10 +173,254 @@ pub fn cache_load() -> PackageCache is
     return c
 end
 
+;; Wczytuje WSZYSTKIE *.pkgs z katalogu list. Uwaga: dla pelnego indeksu
+;; Debiana (~70 tys. pakietow) to bardzo wolne w H# — komendy interaktywne
+;; uzywaja `cache_load_subset` / `cache_load_search` (patrz nizej).
+pub fn cache_load() -> PackageCache is
+    return load_dir(lists_dir())
+end
+
 ;; Rust: `load_for_arch(_arch)` — argument ignorowany tak samo jak w oryginale.
 pub fn cache_load_for_arch(arch: string) -> PackageCache is
     return cache_load()
 end
+
+;; ══════════════════════════════════════════════════════════════════════
+;;  Szybkie ladowanie PODZBIORU indeksu (natywny `awk`)
+;; ══════════════════════════════════════════════════════════════════════
+;;
+;; PROBLEM (naprawiony): `hammer install nano` wisial po naglowku przez
+;; dziesiatki minut. Przyczyna: kazda komenda wolala `cache_load()`, czyli
+;; parsowala w H# WSZYSTKIE ~71 tys. stanz (`package::parse_index`), potem
+;; `provides_build` przechodzil po calosci, a `libsolv_verify` konwertowal
+;; CALE universum przez FFI. Nic sie nie zawieszalo — to byly minuty pracy
+;; bez zadnego postepu na ekranie.
+;;
+;; ROZWIAZANIE: natywny `awk` (2 przebiegi po plikach `.pkgs`, ~1-3 s dla
+;; pelnego Debiana):
+;;   1. `closure.awk` liczy domkniecie zaleznosci od zadanych korzeni
+;;      (Pre-Depends/Depends; Recommends opcjonalnie, tylko od pakietow
+;;      zadanych przez uzytkownika). Z alternatywy `a | b` bierze pierwsza
+;;      dostepna; pakiet wirtualny rozwija do max. 8 dostawcow.
+;;   2. `extract.awk` wypisuje tylko wybrane stanzy do katalogu tymczasowego
+;;      (z zachowaniem naglowka `# hammer-base-uri:` kazdego zrodla).
+;; Dalej dziala STARY kod (`load_dir`) — tylko na kilkuset zamiast 70 tys.
+;; pakietow. Solver, provides i libsolv nie wymagaja zmian.
+;; Gdy `awk`/`mktemp` zawiedzie, wraca (z ostrzezeniem) do pelnego ladowania.
+
+fn closure_awk() -> string is
+    let lines: [string] = [
+        "function clean(s,   p) {{",
+        "  p = index(s, \"(\"); if (p > 0) s = substr(s, 1, p - 1)",
+        "  p = index(s, \"[\"); if (p > 0) s = substr(s, 1, p - 1)",
+        "  p = index(s, \"<\"); if (p > 0) s = substr(s, 1, p - 1)",
+        "  p = index(s, \":\"); if (p > 0) s = substr(s, 1, p - 1)",
+        "  p = index(s, \"=\"); if (p > 0) s = substr(s, 1, p - 1)",
+        "  p = index(s, \"/\"); if (p > 0) s = substr(s, 1, p - 1)",
+        "  gsub(/[ \\t]/, \"\", s)",
+        "  return s",
+        "}}",
+        "function add(n, r) {{",
+        "  if (n in SEEN) {{",
+        "    if (r && !RECF[n]) {{ RECF[n] = 1; Q[qt++] = n }}",
+        "    return",
+        "  }}",
+        "  SEEN[n] = 1; RECF[n] = r; Q[qt++] = n",
+        "}}",
+        "function addprov(nm, r,   np, pl, k) {{",
+        "  np = split(PROV[nm], pl, \" \")",
+        "  for (k = 1; k <= np && k <= 8; k++) add(pl[k], r)",
+        "}}",
+        "function resolve_name(nm, r) {{",
+        "  if (nm in HAS) {{ add(nm, r); return 1 }}",
+        "  if (nm in PROV) {{ addprov(nm, r); return 1 }}",
+        "  return 0",
+        "}}",
+        "function process_field(s, r,   ng, g, i, na, alts, j, nm, done) {{",
+        "  ng = split(s, g, \",\")",
+        "  for (i = 1; i <= ng; i++) {{",
+        "    na = split(g[i], alts, \"|\"); done = 0",
+        "    for (j = 1; j <= na && !done; j++) {{",
+        "      nm = clean(alts[j])",
+        "      if (nm == \"\") continue",
+        "      done = resolve_name(nm, r)",
+        "    }}",
+        "  }}",
+        "}}",
+        "BEGIN {{",
+        "  RS = \"\\n\"",
+        "  while ((getline l < ROOTS_R) > 0) {{ l = clean(l); if (l != \"\") RR[l] = 1 }}",
+        "  while ((getline l < ROOTS_D) > 0) {{ l = clean(l); if (l != \"\") RD[l] = 1 }}",
+        "  RS = \"\"; FS = \"\\n\"",
+        "}}",
+        "{{",
+        "  name = \"\"; dep = \"\"; pre = \"\"; rec = \"\"; prov = \"\"",
+        "  for (i = 1; i <= NF; i++) {{",
+        "    l = $i; c = substr(l, 1, 1)",
+        "    if (c == \" \" || c == \"\\t\" || c == \"#\") continue",
+        "    if (index(l, \"Package: \") == 1) name = substr(l, 10)",
+        "    else if (index(l, \"Depends: \") == 1) dep = substr(l, 10)",
+        "    else if (index(l, \"Pre-Depends: \") == 1) pre = substr(l, 14)",
+        "    else if (index(l, \"Recommends: \") == 1) rec = substr(l, 13)",
+        "    else if (index(l, \"Provides: \") == 1) prov = substr(l, 11)",
+        "  }}",
+        "  if (name == \"\") next",
+        "  HAS[name] = 1",
+        "  if (dep != \"\") DEP[name] = DEP[name] \",\" dep",
+        "  if (pre != \"\") PRE[name] = PRE[name] \",\" pre",
+        "  if (rec != \"\") REC[name] = REC[name] \",\" rec",
+        "  if (prov != \"\") {{",
+        "    np = split(prov, pl, \",\")",
+        "    for (i = 1; i <= np; i++) {{",
+        "      pn = clean(pl[i])",
+        "      if (pn != \"\" && pn != name) PROV[pn] = PROV[pn] \" \" name",
+        "    }}",
+        "  }}",
+        "}}",
+        "END {{",
+        "  for (n in RR) resolve_name(n, FOLLOW + 0)",
+        "  for (n in RD) resolve_name(n, 0)",
+        "  if (CLOSURE + 0 == 0) {{ for (n in SEEN) print n; exit }}",
+        "  qh = 0",
+        "  while (qh < qt) {{",
+        "    n = Q[qh++]",
+        "    process_field(PRE[n], RECF[n])",
+        "    process_field(DEP[n], RECF[n])",
+        "    if (RECF[n] && REC[n] != \"\") process_field(REC[n], 1)",
+        "  }}",
+        "  for (n in SEEN) print n",
+        "}}"
+    ]
+    return str::join(lines, "\n") + "\n"
+end
+
+fn extract_awk() -> string is
+    let lines: [string] = [
+        "BEGIN {{",
+        "  RS = \"\\n\"",
+        "  if (WANTED != \"\") while ((getline l < WANTED) > 0) if (l != \"\") SEEN[l] = 1",
+        "  q = \"\"",
+        "  if (QFILE != \"\") {{ getline q < QFILE; q = tolower(q) }}",
+        "  RS = \"\"; FS = \"\\n\"",
+        "}}",
+        "{{",
+        "  fn = FILENAME; sub(/.*\\//, \"\", fn); out = OUTDIR \"/\" fn",
+        "  start = 1",
+        "  if (FNR == 1) {{",
+        "    hdr = \"\"",
+        "    while (start <= NF && substr($start, 1, 1) == \"#\") {{ hdr = hdr $start \"\\n\"; start++ }}",
+        "    printf \"%s\", hdr > out",
+        "  }}",
+        "  name = \"\"; desc = \"\"",
+        "  for (i = start; i <= NF; i++) {{",
+        "    if (index($i, \"Package: \") == 1) name = substr($i, 10)",
+        "    else if (index($i, \"Description: \") == 1) desc = substr($i, 14)",
+        "  }}",
+        "  if (name == \"\") next",
+        "  ok = 0",
+        "  if (WANTED != \"\") {{ if (name in SEEN) ok = 1 }}",
+        "  else if (q != \"\") {{ if (index(tolower(name), q) > 0 || index(tolower(desc), q) > 0) ok = 1 }}",
+        "  if (ok) {{",
+        "    body = $start",
+        "    for (i = start + 1; i <= NF; i++) body = body \"\\n\" $i",
+        "    printf \"%s\\n\\n\", body > out",
+        "  }}",
+        "}}"
+    ]
+    return str::join(lines, "\n") + "\n"
+end
+
+fn join_lines(xs: [string]) -> string is
+    return str::join(xs, "\n") + "\n"
+end
+
+fn subset_fallback(why: string) -> PackageCache is
+    ui::eprint_line("  ! fast index extraction failed (" + why + ") — loading the full index, this can take a long time.")
+    return cache_load()
+end
+
+;; `roots`     — pakiety zadane przez uzytkownika (np. do `install`),
+;; `installed` — nazwy zainstalowanych pakietow (kontekst dla solvera),
+;; `follow_recommends` — czy wlaczac Recommends pakietow z `roots`,
+;; `closure`   — false = tylko same korzenie (bez zaleznosci).
+pub fn cache_load_subset(roots: [string], installed: [string], follow_recommends: bool, closure: bool) -> PackageCache is
+    let dir: string = lists_dir()
+    if !fs::exists(dir) is return cache_empty() end
+    if roots.len() == 0 && installed.len() == 0 is return cache_empty() end
+
+    let work: string = str::trim(proc::shell("mktemp -d /tmp/hammer-subset.XXXXXX 2>/dev/null"))
+    if work == "" is return subset_fallback("cannot create temp dir") end
+
+    fs::write(work + "/closure.awk", closure_awk())
+    fs::write(work + "/extract.awk", extract_awk())
+    fs::write(work + "/roots_r", join_lines(roots))
+    fs::write(work + "/roots_d", join_lines(installed))
+    fs::mkdir(work + "/out")
+
+    let follow: string = if follow_recommends then "1" else "0"
+    let clo: string = if closure then "1" else "0"
+    let pkgs_glob: string = shq(dir) + "/*.pkgs"
+    let step1: string = "awk -v ROOTS_R=" + shq(work + "/roots_r") + " -v ROOTS_D=" + shq(work + "/roots_d") +
+        " -v FOLLOW=" + follow + " -v CLOSURE=" + clo + " -f " + shq(work + "/closure.awk") + " " + pkgs_glob +
+        " > " + shq(work + "/wanted") + " 2>" + shq(work + "/awk.err")
+    let step2: string = "awk -v WANTED=" + shq(work + "/wanted") + " -v OUTDIR=" + shq(work + "/out") +
+        " -f " + shq(work + "/extract.awk") + " " + pkgs_glob + " 2>>" + shq(work + "/awk.err")
+
+    if !sys_ok(step1) || !sys_ok(step2) is
+        let why: string = str::trim(proc::shell("head -c 200 " + shq(work + "/awk.err") + " 2>/dev/null"))
+        system("rm -rf -- " + shq(work))
+        let reason: string = if why == "" then "awk error" else why
+        return subset_fallback(reason)
+    end
+
+    let c: PackageCache = load_dir(work + "/out")
+    system("rm -rf -- " + shq(work))
+    return c
+end
+
+;; `hammer install` / `reinstall`: zadane pakiety + ich zaleznosci + kontekst
+;; zainstalowanych. Recommends tylko gdy solver ma je rozwiazywac.
+pub fn cache_load_for_install(names: [string], installed: [string], no_recommends: bool) -> PackageCache is
+    return cache_load_subset(names, installed, !no_recommends, true)
+end
+
+;; `upgrade`, `dist-upgrade`, `autoremove`, `fix-broken`, `remove`: korzenie =
+;; zainstalowane pakiety (oraz ich ewentualne nowe zaleznosci z repozytorium).
+pub fn cache_load_for_installed(installed: [string]) -> PackageCache is
+    let none: [string] = []
+    return cache_load_subset(none, installed, false, true)
+end
+
+;; `info`, `download`, straznik pakietow krytycznych: tylko wskazane nazwy.
+pub fn cache_load_names(names: [string]) -> PackageCache is
+    let none: [string] = []
+    return cache_load_subset(names, none, false, false)
+end
+
+;; `search`: tylko stanzy, w ktorych nazwa albo krotki opis zawiera zapytanie
+;; (bez rozrozniania wielkosci liter) — ta sama regula co `cache_search`.
+pub fn cache_load_search(query: string) -> PackageCache is
+    let dir: string = lists_dir()
+    if !fs::exists(dir) is return cache_empty() end
+    let work: string = str::trim(proc::shell("mktemp -d /tmp/hammer-subset.XXXXXX 2>/dev/null"))
+    if work == "" is return subset_fallback("cannot create temp dir") end
+
+    fs::write(work + "/extract.awk", extract_awk())
+    fs::write(work + "/query", query + "\n")
+    fs::mkdir(work + "/out")
+    let cmd: string = "awk -v QFILE=" + shq(work + "/query") + " -v OUTDIR=" + shq(work + "/out") +
+        " -f " + shq(work + "/extract.awk") + " " + shq(dir) + "/*.pkgs 2>" + shq(work + "/awk.err")
+    if !sys_ok(cmd) is
+        let why: string = str::trim(proc::shell("head -c 200 " + shq(work + "/awk.err") + " 2>/dev/null"))
+        system("rm -rf -- " + shq(work))
+        let reason: string = if why == "" then "awk error" else why
+        return subset_fallback(reason)
+    end
+    let c: PackageCache = load_dir(work + "/out")
+    system("rm -rf -- " + shq(work))
+    return c
+end
+
 
 pub fn cache_get(c: PackageCache, name: string) -> package::Package? is
     let i: int = index_of_name(c, name)
