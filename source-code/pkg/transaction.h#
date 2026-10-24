@@ -150,7 +150,8 @@ pub fn execute_transaction(ctx: TransactionContext, note: string) -> TxResult is
 
     ;; ── Straznik: pakiety krytyczne przed usunieciem ─────────────────
     if plan.to_remove.len() > 0 is
-        let c: cache::PackageCache = cache::cache_load()
+        ;; wystarczy priorytet usuwanych pakietow — bez parsowania calego indeksu
+        let c: cache::PackageCache = cache::cache_load_names(plan.to_remove)
         let gerr: string = essential::guard_essential_removal(plan.to_remove, ctx.force_essential, c)
         if gerr != "" is return tx_failed("Essential package protection: " + gerr) end
     end
