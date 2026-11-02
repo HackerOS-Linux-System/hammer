@@ -49,6 +49,14 @@ impl Fields is
     end
 end
 
+;; Rozpakowuje `string?` do `string` ("" dla nil). Dzieki temu kod nie zalezy od tego,
+;; czy backend C++ rozpakuje wiazanie z `match` na wartosci opcjonalnej.
+fn opt_text(v: string?) -> string is
+    if v == nil is return "" end
+    let s: string = v
+    return s
+end
+
 ;; Parses a single control-file block (no blank lines inside it) into an
 ;; ordered set of fields. Folded continuation lines (starting with a
 ;; space or tab) are un-folded and appended to the previous field's
@@ -70,9 +78,8 @@ pub fn parse_block(block: string) -> Fields is
                     let trimmed: string = ltrim(line)
                     let cont: string = if trimmed == "." then "" else trimmed
                     let existing: string? = fields.get(key)
-                    match existing is
-                        nil => is end
-                        v   => is fields.set(key, v + "\n" + cont) end
+                    if existing != nil is
+                        fields.set(key, opt_text(existing) + "\n" + cont)
                     end
                 end
             end
