@@ -273,7 +273,8 @@ pub fn dependency_closure(s: solver::Solver, names: [string]) -> [string] is
     let pmap: provides::ProvidesMap = provides::provides_build(s.cache, s.idb)
     let visited: any = col::hashmap_new()
     let mut order: [string] = []
-    let mut queue: [string] = names
+    let mut queue: [string] = []
+    for n0 in names is queue.push(n0) end
     let mut head: int = 0
 
     while head < queue.len() is
