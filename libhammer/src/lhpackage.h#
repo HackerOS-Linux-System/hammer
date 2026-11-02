@@ -268,7 +268,9 @@ fn parse_provides_list(val: string) -> [string] is
     let mut out: [string] = []
     for part in string_split(val, ",") is
         let paren: int = string_find(part, "(")
-        let name: string = string_trim(if paren >= 0 then string_slice(part, 0, paren) else part)
+        let mut base: string = part
+        if paren >= 0 is base = string_slice(part, 0, paren) end
+        let name: string = string_trim(base)
         if name != "" is out.push(name) end
     end
     return out
