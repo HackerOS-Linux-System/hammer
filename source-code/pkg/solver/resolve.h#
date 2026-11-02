@@ -1054,8 +1054,9 @@ fn resolve_replaces_with_provides(pkg: package::Package, idb: db::InstalledDb, p
         while ai < alts.len() is
             let alt: package::DepAlternative = alts[ai]
             let providers: [string] = provides::providers_of(pmap, alt.name)
+            let n_providers: int = providers.len()
             let mut candidates: [string] = providers
-            if providers.len() == 0 is candidates = [alt.name] end
+            if n_providers == 0 is candidates = [alt.name] end
             let mut ci: int = 0
             while ci < candidates.len() is
                 let io: db::InstalledPackage? = idb.get(candidates[ci])
