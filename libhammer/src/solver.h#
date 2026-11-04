@@ -1,4 +1,5 @@
 use "bit -> satsolv" from "sv"
+use "std -> map" from "map"
 
 mod lhpackage
 mod dep
@@ -75,12 +76,23 @@ pub fn resolve(installed: [lhpackage::Package], available: [lhpackage::Package],
                 arch: string, allow_downgrade: bool) -> SolveOutcome is
 
     let p: int = pool::new()
-    pool::set_arch(p, arch)
+    ;; Debian: porownywanie wersji (epoch:upstream-rev) i polityka architektur dpkg — MUSI byc przed set_arch
+    if pool::set_disttype(p, pool::DISTTYPE_DEB) < 0 is
+        pool::destroy(p)
+        return SolveOutcome::Err(solver_error::SolverError::unsat(
+            "libsolv zbudowany bez MULTI_SEMANTICS: nie obsluguje semantyki Debiana (przebuduj satsolv: bit upgrade satsolv)"))
+    end
+    ;; pakiety `Architecture: all` (dokumentacja, skrypty, wiekszosc bibliotek perl/python) musza byc widoczne obok `amd64`:
+    ;; libsolv w trybie DEB bierze arch dosłownie, wiec dopisujemy polityke "arch:all"
+    let mut pool_arch: string = arch
+    if string_find(arch, ":") < 0 is pool_arch = arch + ":all" end
+    pool::set_arch(p, pool_arch)
 
+    let known: map::Map<string, string> = known_names(installed, available)
     let system: int = repo::new(p, "installed")
     pool::set_installed_repo(p, system)
     if installed.len() > 0 is
-        let sys_pkgs: [repo::Pkg] = to_satsolv_pkgs(installed)
+        let sys_pkgs: [repo::Pkg] = to_satsolv_pkgs(installed, known)
         match repo::add_packages(p, system, sys_pkgs) is
             SatResult::Err(msg) => is
                 repo::destroy(system, false)
@@ -96,7 +108,7 @@ pub fn resolve(installed: [lhpackage::Package], available: [lhpackage::Package],
     let avail: int = repo::new(p, "available")
     repo::set_priority(avail, 0, 0)
     if available.len() > 0 is
-        let avail_pkgs: [repo::Pkg] = to_satsolv_pkgs(available)
+        let avail_pkgs: [repo::Pkg] = to_satsolv_pkgs(available, known)
         match repo::add_packages(p, avail, avail_pkgs) is
             SatResult::Err(msg) => is
                 repo::destroy(avail, false)
@@ -150,8 +162,9 @@ pub fn resolve(installed: [lhpackage::Package], available: [lhpackage::Package],
     let mut steps: [ResolvedStep] = []
     let mut si: int = 0
     while si < array_len(ids) is
-        let label: string = pool::solvable_to_str(p, ids[si])
-        steps.push(parse_solvable_label(label))
+        ;; nazwa / evr / arch wprost z solvable (etykieta "name-evr.arch" jest dla Debiana niejednoznaczna)
+        steps.push(ResolvedStep { name: pool::solvable_name(p, ids[si]), version: pool::solvable_evr(p, ids[si]),
+                                  arch: pool::solvable_arch(p, ids[si]) })
         si += 1
     end
     transaction::destroy(t)
@@ -193,26 +206,50 @@ end
 ;; Converts hammer `Package`s into `satsolv::repo::Pkg`s for
 ;; `repo::add_packages`. See the module doc comment's simplification #1
 ;; for the OR-alternative collapsing.
-fn to_satsolv_pkgs(pkgs: [lhpackage::Package]) -> [repo::Pkg] is
+;; Nazwy znane solverowi: nazwy pakietow + nazwy z `Provides` (do wyboru alternatywy w zaleznosciach).
+fn known_names(installed: [lhpackage::Package], available: [lhpackage::Package]) -> map::Map<string, string> is
+    let known: map::Map<string, string> = map::Map::new()
+    let mut round: int = 0
+    while round < 2 is
+        let pkgs: [lhpackage::Package] = if round == 0 then installed else available
+        let mut i: int = 0
+        while i < pkgs.len() is
+            known.put(pkgs[i].name, "1")
+            let pl: [string] = pkgs[i].provides_list
+            let mut k: int = 0
+            while k < pl.len() is
+                known.put(pl[k], "1")
+                k += 1
+            end
+            i += 1
+        end
+        round += 1
+    end
+    return known
+end
+
+
+fn to_satsolv_pkgs(pkgs: [lhpackage::Package], known: map::Map<string, string>) -> [repo::Pkg] is
     let mut out: [repo::Pkg] = []
     let mut i: int = 0
     while i < pkgs.len() is
-        out.push(to_satsolv_pkg(pkgs[i]))
+        out.push(to_satsolv_pkg(pkgs[i], known))
         i += 1
     end
     return out
 end
 
-fn to_satsolv_pkg(pkg: lhpackage::Package) -> repo::Pkg is
-    let release: string = extract_release(pkg.version)
-    let mut p: repo::Pkg = repo::new_pkg(pkg.name, pkg.version, release, pkg.architecture)
+fn to_satsolv_pkg(pkg: lhpackage::Package, known: map::Map<string, string>) -> repo::Pkg is
+    ;; release "" => `version` to pelny Debianowy EVR ("1:2.3-4"); satsolv nie dokleja drugiego "-release"
+    let mut p: repo::Pkg = repo::new_pkg(pkg.name, pkg.version, "", pkg.architecture)
 
-    p.requires  = dep_field_to_tokens(pkg.depends) + dep_field_to_tokens(pkg.pre_depends)
-    p.provides  = pkg.provides_list
-    p.conflicts = dep_field_to_tokens(pkg.conflicts)
-    p.obsoletes = dep_field_to_tokens(pkg.replaces)
-    p.recommends = dep_field_to_tokens(pkg.recommends)
-    p.suggests   = dep_field_to_tokens(pkg.suggests)
+    p.requires  = dep_field_to_tokens(pkg.depends, known) + dep_field_to_tokens(pkg.pre_depends, known)
+    p.provides  = provides_to_tokens(pkg)
+    ;; `Breaks` (Debian) dziala dla solvera jak `Conflicts`
+    p.conflicts = dep_field_to_tokens(pkg.conflicts, known) + dep_field_to_tokens(pkg.breaks, known)
+    p.obsoletes = dep_field_to_tokens(pkg.replaces, known)
+    p.recommends = dep_field_to_tokens(pkg.recommends, known)
+    p.suggests   = dep_field_to_tokens(pkg.suggests, known)
     return p
 end
 
@@ -236,7 +273,7 @@ end
 
 ;; `Depends: "libssl3 (>= 3.0), libz1g | zlib1g"` → `["libssl3 >= 3.0", "libz1g"]`
 ;; (see this module's doc comment, simplification #1, for the OR collapse).
-fn dep_field_to_tokens(field: string?) -> [string] is
+fn dep_field_to_tokens(field: string?, known: map::Map<string, string>) -> [string] is
     if field == nil is return [] end
     let f: string = field
     let groups: [lhpackage::DepGroup] = dep::parse_dep_field(f)
@@ -245,18 +282,55 @@ fn dep_field_to_tokens(field: string?) -> [string] is
     while i < groups.len() is
         let alts: [lhpackage::DepAlternative] = groups[i].alternatives
         if alts.len() > 0 is
-            out.push(alt_to_token(alts[0]))
+            ;; grupa `a | b | c`: jak apt — pierwsza alternatywa, KTORA ISTNIEJE w indeksie (nazwa albo provides);
+            ;; gdy zadnej nie ma, pierwsza (libsolv zglosi wtedy prawdziwy "nothing provides").
+            ;; Podanie libsolv-owi calego OR dawalo inny wybor niz apt (np. pinentry-gnome3 zamiast pinentry-curses
+            ;; => ciagnie gtk/gstreamer/mesa) — libsolv nie zna kolejnosci alternatyw.
+            let mut pick: int = 0
+            let mut a: int = 0
+            while a < alts.len() is
+                if known.has(alts[a].name) is
+                    pick = a
+                    a = alts.len()
+                else is
+                    a += 1
+                end
+            end
+            out.push(alt_to_token(alts[pick]))
         end
         i += 1
     end
     return out
 end
 
+;; Operatory wersji Debiana -> skladnia libsolv: `<<` = `<`, `>>` = `>` (`<=`, `>=`, `=` bez zmian).
+fn solv_op(op: string) -> string is
+    if op == "<<" is return "<" end
+    if op == ">>" is return ">" end
+    return op
+end
+
 fn alt_to_token(alt: lhpackage::DepAlternative) -> string is
     let c: lhpackage::VersionConstraint? = alt.constraint
     if c == nil is return alt.name end
     let c2: lhpackage::VersionConstraint = c
-    return alt.name + " " + c2.op + " " + c2.version
+    return alt.name + " " + solv_op(c2.op) + " " + c2.version
+end
+
+;; `Provides: foo (= 1.2), bar` -> ["foo = 1.2", "bar"]. Wersjonowane provides sa potrzebne, gdy cos zalezy od
+;; `foo (>= 1.0)` spelnianego przez wirtualny pakiet; wczesniej wersje byly gubione (provides_list).
+fn provides_to_tokens(pkg: lhpackage::Package) -> [string] is
+    if pkg.provides == nil is return pkg.provides_list end
+    let raw: string = pkg.provides
+    let groups: [lhpackage::DepGroup] = dep::parse_dep_field(raw)
+    let mut out: [string] = []
+    let mut i: int = 0
+    while i < groups.len() is
+        let alts: [lhpackage::DepAlternative] = groups[i].alternatives
+        if alts.len() > 0 is out.push(alt_to_token(alts[0])) end
+        i += 1
+    end
+    return out
 end
 
 ;; ── Wygodna struktura wyniku (dla innych pakietow) ───────────────────────
