@@ -143,7 +143,7 @@ fn mirror_index(cfg: MirrorConfig) -> IndexResult is
     end
     let text: string = fs::read(tmp_ir)
 
-    let mut ir: gpg_verify::InRelease = blank
+    let mut ir: gpg_verify::InRelease = gpg_verify::inrelease_parse("")
     let mut have_ir: bool = false
     if cfg.insecure is
         write("  " + ui::yellow("!") + " InRelease (unverified)")
