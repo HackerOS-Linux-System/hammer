@@ -1,6 +1,7 @@
 use "std -> fs"      from "fs"
 use "std -> strings" from "str"
 use "std -> conv"    from "conv"
+use "std -> collections" from "col"
 
 mod internal
 mod dpkg_status
@@ -128,6 +129,16 @@ pub struct InstalledDb is
     ;; Czy laczyc wlasna baze z /var/lib/dpkg/status (patrz komentarz przy
     ;; zapytaniach); `false` dla baz testowych/prywatnych.
     pub use_dpkg_fallback: bool
+    ;; Pamiec podreczna odczytu /var/lib/dpkg/status (wypelniana RAZ na uchwyt). Wczesniej kazde `is_installed` /
+    ;; `get` / `list_all` parsowalo caly plik od nowa (setki pakietow x dziesiatki wywolan = minuty i GB pamieci,
+    ;; bo H# nie zwalnia pamieci).
+    pub dpkg_ready: bool
+    pub dpkg_list:  [InstalledPackage]
+    pub dpkg_idx:   any
+    ;; Nazwy z wlasnej tabeli `installed` (jedno zapytanie zamiast procesu sqlite3 na kazde is_installed);
+    ;; uniewazniane w apply() — kazdy zapis przechodzi przez apply.
+    pub names_ready: bool
+    pub names_idx:   any
 end
 
 ;; ── Sciezka bazy ─────────────────────────────────────────────────────────
@@ -267,7 +278,7 @@ impl InstalledDb is
         let dir: string = compat::path_parent(db_file)
         if dir != "" && !fs::exists(dir) is fs::mkdir(dir) end
         let h: string = db_file
-        let db: InstalledDb = InstalledDb { handle: h, use_dpkg_fallback: fallback }
+        let db: InstalledDb = InstalledDb { handle: h, use_dpkg_fallback: fallback, dpkg_ready: false, dpkg_list: [], dpkg_idx: col::hashmap_new(), names_ready: false, names_idx: col::hashmap_new() }
         ;; `foreign_keys` dziala per polaczenie; przy modelu "jeden proces
         ;; sqlite3 na zapytanie" ustawienie jest no-op, ale zachowujemy
         ;; je dla zgodnosci z Rust (tabele i tak nie definiuja FK).
@@ -301,17 +312,54 @@ impl InstalledDb is
     ;; Kazde zapytanie sprawdza najpierw wlasna tabele `installed`, potem
     ;; (dla `list_all`: laczy z) /var/lib/dpkg/status. Wlasny wpis hammera
     ;; wygrywa, bo ma dokladny `store_hash`/`reason`.
+    ;; Wczytuje /var/lib/dpkg/status do pamieci podrecznej uchwytu (jednorazowo) i buduje indeks nazw.
+    fn dpkg_load(self) is
+        if self.dpkg_ready is return end
+        let all: [InstalledPackage] = dpkg_status::read_all()
+        let idx: any = col::hashmap_new()
+        let mut i: int = 0
+        while i < all.len() is
+            col::hashmap_insert(idx, all[i].name, to_string(i))
+            i += 1
+        end
+        self.dpkg_list = all
+        self.dpkg_idx = idx
+        self.dpkg_ready = true
+    end
+
+    ;; Uniewaznia pamiec podreczna dpkg (np. po zewnetrznej zmianie /var/lib/dpkg/status).
+    pub fn dpkg_refresh(self) is
+        self.dpkg_ready = false
+    end
+
     pub fn is_installed(self, name: string) -> bool is
-        let rows: [string] = run_rows(self, "SELECT 1 FROM installed WHERE name = " + q(name))
-        if rows.len() > 0 is return true end
-        return self.use_dpkg_fallback && dpkg_status::is_installed(name)
+        if !self.names_ready is
+            let nrows: [string] = run_rows(self, "SELECT name FROM installed")
+            let nidx: any = col::hashmap_new()
+            let mut ni: int = 0
+            while ni < nrows.len() is
+                col::hashmap_insert(nidx, str::trim(nrows[ni]), "1")
+                ni += 1
+            end
+            self.names_idx = nidx
+            self.names_ready = true
+        end
+        if col::hashmap_contains(self.names_idx, name) is return true end
+        if !self.use_dpkg_fallback is return false end
+        self.dpkg_load()
+        return col::hashmap_contains(self.dpkg_idx, name)
     end
 
     pub fn get(self, name: string) -> InstalledPackage? is
         let rows: [string] = run_rows(self,
             "SELECT " + pkg_columns() + " FROM installed WHERE name = " + q(name))
         if rows.len() > 0 is return row_to_pkg(rows[0]) end
-        if self.use_dpkg_fallback is return dpkg_status::get(name) end
+        if self.use_dpkg_fallback is
+            self.dpkg_load()
+            if col::hashmap_contains(self.dpkg_idx, name) is
+                return self.dpkg_list[conv::str_to_int(col::hashmap_get(self.dpkg_idx, name))]
+            end
+        end
         return nil
     end
 
@@ -327,7 +375,8 @@ impl InstalledDb is
         if !self.use_dpkg_fallback is return out end
 
         ;; dpkg dopelnia tylko pakiety, ktorych hammer nie zna; potem sort po nazwie.
-        let from_dpkg: [InstalledPackage] = dpkg_status::read_all()
+        self.dpkg_load()
+        let from_dpkg: [InstalledPackage] = self.dpkg_list
         let mut j: int = 0
         while j < from_dpkg.len() is
             let mut known: bool = false
@@ -377,6 +426,7 @@ impl InstalledDb is
 
     ;; "" = Ok, inaczej komunikat bledu sqlite3.
     fn apply(self, batch: string) -> string is
+        self.names_ready = false
         let out: string = sql_run(self.handle, "BEGIN; " + batch + " COMMIT;")
         if is_sql_error(out) is return out end
         return ""
