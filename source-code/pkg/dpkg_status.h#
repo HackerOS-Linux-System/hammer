@@ -53,6 +53,12 @@ fn fields_opt(f: Fields, key: string) -> string? is
     return f.vals[i]
 end
 
+fn wanted_key(k: string) -> bool is
+    return k == "Package" || k == "Status" || k == "Version" || k == "Architecture" || k == "Installed-Size" ||
+           k == "Section" || k == "Maintainer" || k == "Description" || k == "Depends" || k == "Recommends" ||
+           k == "Multi-Arch"
+end
+
 fn parse_rfc822_fields(block: string) -> Fields is
     let mut keys: [string] = []
     let mut vals: [string] = []
@@ -69,6 +75,13 @@ fn parse_rfc822_fields(block: string) -> Fields is
             let pos: int = compat::str_index_of(line, ":")
             if pos >= 0 is
                 let k: string = str::trim(str::slice(line, 0, pos))
+                ;; parsujemy tylko pola, ktorych hammer uzywa (parse_block) — reszta (Conffiles, dlugie Description,
+                ;; Homepage...) generowala tylko smieci: H# nie zwalnia pamieci, a status ma setki blokow
+                if !wanted_key(k) is
+                    current = -1
+                    n += 1
+                    continue
+                end
                 let v: string = str::trim(str::slice(line, pos + 1, string_len(line)))
                 let mut j: int = 0
                 let mut found: int = -1
@@ -97,7 +110,7 @@ fn first_line(s: string) -> string is
     return str::slice(s, 0, pos)
 end
 
-fn parse_block(block: string) -> db::InstalledPackage? is
+fn parse_block(block: string, installed_at: string) -> db::InstalledPackage? is
     let f: Fields = parse_rfc822_fields(block)
     if !fields_has(f, "Package") is return nil end
     let name: string = fields_get(f, "Package")
@@ -124,7 +137,7 @@ fn parse_block(block: string) -> db::InstalledPackage? is
         section:           fields_opt(f, "Section"),
         maintainer:        fields_opt(f, "Maintainer"),
         description_short: desc,
-        installed_at:      compat::time_format(compat::time_now_unix(), "%Y-%m-%dT%H:%M:%S"),
+        installed_at:      installed_at,
         ;; Pakiety dpkg-a sa dla hammera "po prostu tu": najblizszy powod to
         ;; Dependency (nie oferuj autoremove jak dla pakietu z prosby usera).
         reason:            db::InstallReason::Dependency,
@@ -135,17 +148,24 @@ fn parse_block(block: string) -> db::InstalledPackage? is
     }
 end
 
+;; Znacznik czasu "teraz" liczony RAZ na odczyt. Wczesniej `compat::time_format` (osobny proces `date`) bylo wolane dla
+;; KAZDEGO bloku pliku status — setki forkow na jedno `read_all`.
+fn now_stamp() -> string is
+    return compat::time_format(compat::time_now_unix(), "%Y-%m-%dT%H:%M:%S")
+end
+
 ;; Brak pliku to nie blad (system bez dpkg jest calkiem normalny).
 pub fn read_all_from(file: string) -> [db::InstalledPackage] is
     let mut out: [db::InstalledPackage] = []
     if !fs::exists(file) is return out end
     let text: string = fs::read(file)
+    let stamp: string = now_stamp()
     let blocks: [string] = str::split(text, "\n\n")
     let mut i: int = 0
     while i < blocks.len() is
         let b: string = str::trim(blocks[i])
         if b != "" is
-            let p: db::InstalledPackage? = parse_block(b)
+            let p: db::InstalledPackage? = parse_block(b, stamp)
             if p != nil is
                 let pkg: db::InstalledPackage = p
                 out.push(pkg)
@@ -160,12 +180,22 @@ pub fn read_all() -> [db::InstalledPackage] is
     return read_all_from(dpkg_status_path())
 end
 
-;; Liniowy skan (plik nie ma indeksu), jak w oryginale.
+;; Pojedyncze zapytanie: znajduje blok `Package: <name>` i parsuje TYLKO jego. Wczesniej kazde `get` / `is_installed`
+;; parsowalo CALY plik status (kazdy blok + fork `date`) — solver pyta o setki nazw, wiec "Reading package lists..."
+;; trwalo minuty i zjadalo gigabajty (H# nie zwalnia pamieci).
 pub fn get(name: string) -> db::InstalledPackage? is
-    let all: [db::InstalledPackage] = read_all()
+    let file: string = dpkg_status_path()
+    if !fs::exists(file) is return nil end
+    let text: string = fs::read(file)
+    let key: string = "Package: " + name
+    let blocks: [string] = str::split(text, "\n\n")
     let mut i: int = 0
-    while i < all.len() is
-        if all[i].name == name is return all[i] end
+    while i < blocks.len() is
+        let b: string = blocks[i]
+        ;; blok moze zaczynac sie od pustych linii; pole `Package:` jest w dpkg status zawsze pierwsze
+        if b.starts_with(key + "\n") || b.starts_with("\n" + key + "\n") || b == key is
+            return parse_block(str::trim(b), now_stamp())
+        end
         i += 1
     end
     return nil
