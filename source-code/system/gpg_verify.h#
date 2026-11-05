@@ -246,6 +246,52 @@ fn is_key_ext(name: string) -> bool is
     return name.ends_with(".gpg") || name.ends_with(".asc") || name.ends_with(".pgp")
 end
 
+;; Klucze systemowego menedzera pakietow (jak apt): `/etc/apt/trusted.gpg.d/*` oraz keyringi ARCHIWOW dystrybucji
+;; z `/usr/share/keyrings` (debian-archive-keyring.gpg, ubuntu-archive-keyring.gpg, ...). Bez tego swiezy system
+;; z pustym `/etc/hammer/trusted.gpg.d` nie mial ZADNEGO zaufanego klucza: kazdy InRelease byl "skipped"
+;; (niezweryfikowany), a kazdy pobrany pakiet odrzucany ("repo is not GPG-verified"). Z `/usr/share/keyrings`
+;; celowo bierzemy tylko pliki `*archive-keyring*` — inne klucze tam (np. repozytoria zewnetrzne) apt wiaze
+;; per-zrodlo przez `signed-by`, a hammer takiego wiazania nie ma.
+fn dir_key_files(dir: string, only_archive: bool) -> [string] is
+    let mut out: [string] = []
+    if !fs::exists(dir) is return out end
+    let names: [string] = fs::list_dir(dir)
+    let mut i: int = 0
+    while i < names.len() is
+        let n: string = names[i]
+        if is_key_ext(n) && (!only_archive || string_find(n, "archive-keyring") >= 0) is
+            out.push(compat::path_join(dir, n))
+        end
+        i += 1
+    end
+    return out
+end
+
+pub fn system_key_files() -> [string] is
+    let mut out: [string] = dir_key_files("/etc/apt/trusted.gpg.d", false)
+    let extra: [string] = dir_key_files("/usr/share/keyrings", true)
+    let mut i: int = 0
+    while i < extra.len() is
+        out.push(extra[i])
+        i += 1
+    end
+    return out
+end
+
+;; Pliki kluczy z katalogu `dir`; gdy to keyring hammera, dolaczane sa klucze systemowe.
+fn collect_key_files(dir: string) -> [string] is
+    let mut out: [string] = dir_key_files(dir, false)
+    if dir == keyring_dir() is
+        let sys: [string] = system_key_files()
+        let mut i: int = 0
+        while i < sys.len() is
+            out.push(sys[i])
+            i += 1
+        end
+    end
+    return out
+end
+
 ;; Sklada jeden plik keyring dla gpgv: pliki binarne doklejane, `.asc` przez
 ;; `gpg --dearmor`. "" gdy sie nie udalo.
 fn build_combined_keyring(keyfiles: [string]) -> string is
@@ -289,20 +335,9 @@ end
 ;; (Rust zwracal `Ok(())` w obu przypadkach — `cache::update` uznawal wtedy
 ;; zrodlo za zweryfikowane i zapisywal znacznik zaufania `.gpg-verified`.)
 pub fn verify_inrelease_status(content: string, keyring: string) -> VerifyStatus is
-    if !fs::exists(keyring) is
-        log::warn("gpg: no keyring directory — skipping signature verification")
-        return vs("skipped", "")
-    end
-
-    let names: [string] = fs::list_dir(keyring)
-    let mut keyfiles: [string] = []
-    let mut i: int = 0
-    while i < names.len() is
-        if is_key_ext(names[i]) is keyfiles.push(compat::path_join(keyring, names[i])) end
-        i += 1
-    end
+    let keyfiles: [string] = collect_key_files(keyring)
     if keyfiles.len() == 0 is
-        log::warn("gpg: keyring is empty — skipping signature verification")
+        log::warn("gpg: no trusted keys (hammer keyring and system archive keyrings are empty) — skipping signature verification")
         return vs("skipped", "")
     end
 
@@ -510,14 +545,7 @@ end
 ;; --dearmor) — plik tymczasowy do skasowania przez wolajacego; "" gdy brak
 ;; kluczy albo nie da sie utworzyc pliku.
 pub fn keyring_from_dir(dir: string) -> string is
-    if !fs::exists(dir) is return "" end
-    let names: [string] = fs::list_dir(dir)
-    let mut keyfiles: [string] = []
-    let mut i: int = 0
-    while i < names.len() is
-        if is_key_ext(names[i]) is keyfiles.push(compat::path_join(dir, names[i])) end
-        i += 1
-    end
+    let keyfiles: [string] = collect_key_files(dir)
     if keyfiles.len() == 0 is return "" end
     return build_combined_keyring(keyfiles)
 end
