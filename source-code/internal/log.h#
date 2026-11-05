@@ -300,27 +300,33 @@ end
 
 ;; Escapowanie stringa do JSON (`"`, `\`, sterujace).
 pub fn json_escape(s: string) -> string is
-    let mut out: string = ""
+    ;; szybka sciezka: bez znakow specjalnych zwracamy napis bez zmian. Wczesniej KAZDY znak dolaczany byl przez
+    ;; `out = out + c` (kopia calego dotychczasowego napisu, a H# nie zwalnia pamieci): dlugie pola (Description,
+    ;; Depends) x setki pakietow = gigabajty smieci przy eksporcie bazy.
+    if string_find(s, "\"") < 0 && string_find(s, "\\") < 0 && string_find(s, "\n") < 0 && string_find(s, "\r") < 0 && string_find(s, "\t") < 0 is
+        return s
+    end
+    let mut parts: [string] = []
     let n: int = string_len(s)
     let mut i: int = 0
     while i < n is
         let c: string = string_at(s, i)
         if c == "\"" is
-            out = out + "\\\""
+            parts.push("\\\"")
         elsif c == "\\" is
-            out = out + "\\\\"
+            parts.push("\\\\")
         elsif c == "\n" is
-            out = out + "\\n"
+            parts.push("\\n")
         elsif c == "\r" is
-            out = out + "\\r"
+            parts.push("\\r")
         elsif c == "\t" is
-            out = out + "\\t"
+            parts.push("\\t")
         else is
-            out = out + c
+            parts.push(c)
         end
         i += 1
     end
-    return out
+    return str::join(parts, "")
 end
 
 fn colour_line(line: string) -> string is
