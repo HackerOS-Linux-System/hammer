@@ -900,7 +900,9 @@ pub fn cache_update(sources: repo::SourcesList, client: download::HttpClient) ->
                     let nosig: string = if !gpg_ok then ui::yellow("(no signature)") else ""
                     lines.push("  " + ui::bold(ui::pad(label, 42)) + "  " + sig_icon + "  " + ui::cyan(to_string(count)) +
                         " packages" + sha_note + "  " + nosig)
-                    if !gpg_ok is gpg_failed += 1 end
+                    ;; zrodlo bez pakietow (np. forky-security: Debian nie publikuje security dla testing) nie ma co
+                    ;; podpisywac — nie moze tez dostarczyc pliku, wiec nie blokuje znacznika zaufania pozostalych
+                    if !gpg_ok && count > 0 is gpg_failed += 1 end
                     ok_count += 1
                 end
             end
