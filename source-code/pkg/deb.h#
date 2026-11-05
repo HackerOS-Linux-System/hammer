@@ -276,10 +276,26 @@ pub fn parse_file(deb_path: string) -> ParseResult is
     let mut data_tar: string = ""
     let mut data_comp: Compression = Compression::None
 
+    ;; Preferuj `dpkg-deb`: dekompresuje gz/xz/zst/bz2 WLASNYMI bibliotekami, wiec nie wymaga osobnych narzedzi.
+    ;; Wczesniej `tar` potrzebowal polecenia `zstd`, ktorego minimalne obrazy Debiana nie maja (nie jest Essential),
+    ;; a nowe paczki (control.tar.zst / data.tar.zst) konczyly sie mylacym "./control not found in control.tar".
+    let mut via_dpkg: bool = false
+    if run_ok("command -v dpkg-deb >/dev/null 2>&1") is
+        if run_ok("dpkg-deb --ctrl-tarfile " + shq(deb_path) + " > " + shq(work + "/control.tar") + " 2>/dev/null") &&
+           run_ok("dpkg-deb --fsys-tarfile " + shq(deb_path) + " > " + shq(work + "/data.tar") + " 2>/dev/null") is
+            control_tar = work + "/control.tar"
+            data_tar = work + "/data.tar"
+            via_dpkg = true
+        end
+    end
+
     let mut i: int = 0
-    while i < listed.members.len() is
+    while !via_dpkg && i < listed.members.len() is
         let m: ArMember = listed.members[i]
         i += 1
+        if m.name.ends_with(".zst") && !run_ok("command -v zstd >/dev/null 2>&1") is
+            return ParseResult { deb: nil, err: "Package uses zstd compression ('" + m.name + "') but neither dpkg-deb nor zstd is installed (apt install zstd)" }
+        end
         if m.name.starts_with("control.tar") is
             control_comp = comp_from_name(m.name)
             control_tar = work + "/" + m.name
