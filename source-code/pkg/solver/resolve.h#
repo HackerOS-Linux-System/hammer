@@ -720,13 +720,14 @@ fn ctx_build_plan(ctx: ResolveCtx) -> solver::PlanResult is
     let mut k: int = 0
     while k < fresh.len() is
         plan.download_bytes += if fresh[k].download_size == nil then 0 else fresh[k].download_size
-        plan.install_bytes += if fresh[k].installed_size_kb == nil then 0 else fresh[k].installed_size_kb
+        ;; installed_size_kb jest w KiB, a install_bytes w bajtach (jak freed_bytes) — wczesniej brakowalo * 1024
+        plan.install_bytes += (if fresh[k].installed_size_kb == nil then 0 else fresh[k].installed_size_kb) * 1024
         k += 1
     end
     let mut u: int = 0
     while u < upgrades.len() is
         plan.download_bytes += if upgrades[u].download_size == nil then 0 else upgrades[u].download_size
-        plan.install_bytes += if upgrades[u].installed_size_kb == nil then 0 else upgrades[u].installed_size_kb
+        plan.install_bytes += (if upgrades[u].installed_size_kb == nil then 0 else upgrades[u].installed_size_kb) * 1024
         u += 1
     end
 
@@ -877,7 +878,7 @@ pub fn resolve_fix_broken(s: solver::Solver) -> solver::PlanResult is
                                 let fix_pkg: package::Package = fo
                                 if !plan_has_install(plan, providers[0]) is
                                     plan.download_bytes += if fix_pkg.download_size == nil then 0 else fix_pkg.download_size
-                                    plan.install_bytes += if fix_pkg.installed_size_kb == nil then 0 else fix_pkg.installed_size_kb
+                                    plan.install_bytes += (if fix_pkg.installed_size_kb == nil then 0 else fix_pkg.installed_size_kb) * 1024
                                     plan.to_install = append_pkg(plan.to_install, fix_pkg)
                                 end
                             end
