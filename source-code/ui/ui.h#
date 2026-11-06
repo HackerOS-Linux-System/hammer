@@ -202,6 +202,16 @@ pub fn confirm(prompt: string) -> bool is
     return t == "" || t == "y" || t == "yes"
 end
 
+;; Jak `confirm`, ale DOMYSLNIE NIE: tylko jawne "y"/"yes" => true (pytania o
+;; rzeczy ryzykowne, np. instalacja bez weryfikacji GPG). Bez terminala (stdin
+;; nie jest TTY) => false, bez czekania na wejscie.
+pub fn confirm_no(prompt: string) -> bool is
+    if system("[ -t 0 ]") != 0 is return false end
+    let line: string = io::read_line("\n  " + bold(prompt) + " [y/N] ")
+    let t: string = str::to_lower(str::trim(line))
+    return t == "y" || t == "yes"
+end
+
 ;; 0 -> "" (jak w Rust). Arytmetyka calkowita, wyniki zgodne z `{:.1}`/`{:.0}`
 ;; na zaokragleniu polowek w gore (sprawdzone na 7 wartosciach).
 pub fn human_size(nbytes: int) -> string is
