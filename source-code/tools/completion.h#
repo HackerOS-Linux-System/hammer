@@ -147,7 +147,7 @@ end
 
 fn global_flags() -> [string] is
     return [
-"--user", "--arch=", "--yes", "-y", "--help", "-h", "--version", "--dry-run", "-n", "--json", "--no-progress", "--debug", "--verbose", "--quiet", "--color=always", "--color=never", "--root=", "--force", "--no-recommends", "--installed", "--upgrades", "--json"]
+"--user", "--arch=", "--yes", "-y", "--help", "-h", "--version", "--dry-run", "-n", "--json", "--no-progress", "--debug", "--verbose", "--quiet", "--color=always", "--color=never", "--root=", "--force", "--allow-unauthenticated", "--no-recommends", "--installed", "--upgrades", "--json"]
 end
 
 
