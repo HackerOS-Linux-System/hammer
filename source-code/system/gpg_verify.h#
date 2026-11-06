@@ -57,6 +57,23 @@ mod internal
 ;;    oryginalnym `Release`; tekst z prefiksu odpada — sprawdzone) i tylko ona
 ;;    jest parsowana (`VerifyStatus.content`).
 ;;
+;; ── NAPRAWA: "repo is not GPG-verified" ────────────────────
+;; I. KLUCZE ARMOROWANE BEZ `gpg`. Debian (trixie/forky) dostarcza klucze
+;;    archiwum takze jako `/etc/apt/trusted.gpg.d/*.asc` (ASCII-armor). Do
+;;    zamiany na binarny keyring uzywano wylacznie `gpg --dearmor ... || true`,
+;;    a w minimalnych systemach/kontenerach jest `gpgv` (zaleznosc apt), ale
+;;    NIE ma `gpg`. Skutek: wszystkie klucze `.asc` cicho znikaly, keyring byl
+;;    pusty, `gpgv` odrzucal InRelease, zrodla dostawaly "(no signature)", a
+;;    kazdy pakiet byl odrzucany. Teraz `.asc` jest rozpakowywane czystym
+;;    `awk` + `base64` (obecne w kazdym systemie), `gpg` to tylko zapas.
+;; II. FORMAT WYKRYWANY PO ZAWARTOSCI (`-----BEGIN`), nie po rozszerzeniu —
+;;    armorowany plik `.gpg`/`.pgp` byl doklejany jako smieci.
+;; III. POWOD w `VerifyStatus.reason` (brak gpgv / brak kluczy / klucz
+;;    podpisujacy nieznany / bledny podpis). `hammer update` pokazuje go zamiast
+;;    ogolnego "(no signature)", a `hammer key doctor` robi pelna diagnoze.
+;; IV. Pusty keyring po zlozeniu (zadne klucze nie dalo sie odczytac) nie jest
+;;    juz przekazywany do gpgv — zwracany jest jasny powod.
+;;
 ;; ── ZACHOWANE ZE ZLOGO ZACHOWANIA ORYGINALU (do Twojej decyzji) ──────────
 ;; D. FAIL-OPEN: `verify_inrelease` zwraca sukces (tylko ostrzezenie w
 ;;    logu), gdy brak katalogu kluczy, katalog jest pusty ALBO `gpgv` nie
@@ -269,6 +286,8 @@ end
 
 pub fn system_key_files() -> [string] is
     let mut out: [string] = dir_key_files("/etc/apt/trusted.gpg.d", false)
+    ;; stary, pojedynczy keyring apt (apt-key add) — nadal uzywany przez czesc systemow
+    if fs::exists("/etc/apt/trusted.gpg") && fs::size("/etc/apt/trusted.gpg") > 0 is out.push("/etc/apt/trusted.gpg") end
     let extra: [string] = dir_key_files("/usr/share/keyrings", true)
     let mut i: int = 0
     while i < extra.len() is
@@ -292,23 +311,47 @@ fn collect_key_files(dir: string) -> [string] is
     return out
 end
 
-;; Sklada jeden plik keyring dla gpgv: pliki binarne doklejane, `.asc` przez
-;; `gpg --dearmor`. "" gdy sie nie udalo.
+;; Program `awk` rozpakowujacy ASCII-armor (RFC 4880 §6) do binarnego OpenPGP: dla
+;; KAZDEGO bloku `-----BEGIN PGP ...-----` pomija naglowki (do pierwszej pustej
+;; linii), linie CRC (`=XXXX`) i stopke, a tresc base64 przepuszcza przez
+;; `base64 -d`. `close()` po kazdym bloku — kazdy blok ma wlasne dopelnienie `=`,
+;; wiec sklejenie kilku w jeden strumien rozwalaloby dekodowanie.
+fn awk_dearmor_prog() -> string is
+    return "/^-----BEGIN PGP/ {{ inb=1; hdr=1; next }} " +
+        "/^-----END PGP/ {{ if (inb) close(\"base64 -d 2>/dev/null\"); inb=0; next }} " +
+        "inb && hdr {{ if ($0 ~ /^[ \\t\\r]*$/) hdr=0; next }} " +
+        "inb && /^=/ {{ next }} " +
+        "inb {{ gsub(/\\r/, \"\"); print | \"base64 -d 2>/dev/null\" }} " +
+        "END {{ if (inb) close(\"base64 -d 2>/dev/null\") }}"
+end
+
+;; Funkcje powloki: `is_armored FILE` (po zawartosci, nie po rozszerzeniu) i
+;; `emit_key FILE` (binarny keyring na stdout; armor -> awk+base64, zapas: gpg).
+fn key_shell_helpers() -> string is
+    return "is_armored() {{ head -c 64 -- \"$1\" 2>/dev/null | grep -q -e '-----BEGIN PGP'; }}; " +
+        "emit_key() {{ if is_armored \"$1\"; then " +
+        "if command -v awk >/dev/null 2>&1 && command -v base64 >/dev/null 2>&1; then awk " + shq(awk_dearmor_prog()) + " < \"$1\"; " +
+        "elif command -v gpg >/dev/null 2>&1; then gpg --batch --yes --dearmor < \"$1\" 2>/dev/null; fi; " +
+        "else cat -- \"$1\"; fi; }}; "
+end
+
+;; Sklada jeden plik keyring dla gpgv: klucze binarne doklejane, armorowane
+;; rozpakowywane (patrz I/II w naglowku). \"\" gdy sie nie udalo ALBO gdy z kluczy
+;; nic nie dalo sie odczytac (pusty plik — patrz IV).
 fn build_combined_keyring(keyfiles: [string]) -> string is
     let dest: string = tmp_file("hammer_keyring")
     if dest == "" is return "" end
-    let mut cmd: string = ": > " + shq(dest) + "; "
+    let mut cmd: string = key_shell_helpers() + ": > " + shq(dest) + "; "
     let mut i: int = 0
     while i < keyfiles.len() is
-        let kf: string = keyfiles[i]
+        cmd = cmd + "emit_key " + shq(keyfiles[i]) + " >> " + shq(dest) + " 2>/dev/null || true; "
         i += 1
-        if kf.ends_with(".asc") is
-            cmd = cmd + "gpg --dearmor < " + shq(kf) + " >> " + shq(dest) + " 2>/dev/null || true; "
-        else is
-            cmd = cmd + "cat -- " + shq(kf) + " >> " + shq(dest) + " 2>/dev/null || true; "
-        end
     end
     system("sh -c " + shq(cmd))
+    if !fs::exists(dest) || fs::size(dest) == 0 is
+        system("rm -f -- " + shq(dest))
+        return ""
+    end
     return dest
 end
 
@@ -325,10 +368,32 @@ pub struct VerifyStatus is
     ;; "verified", inaczej "". TYLKO z tej tresci wolno czytac skroty
     ;; plikow — patrz G w naglowku.
     pub content: string
+    ;; Krotki, czytelny POWOD gdy state != "verified" (patrz III w naglowku),
+    ;; np. "gpgv not installed (apt install gnupg)". Dla "verified" = "".
+    pub reason:  string
 end
 
-fn vs(state: string, err: string) -> VerifyStatus is
-    return VerifyStatus { state: state, err: err, content: "" }
+fn vs(state: string, err: string, reason: string) -> VerifyStatus is
+    return VerifyStatus { state: state, err: err, content: "", reason: reason }
+end
+
+;; Krotki powod z stderr gpgv: brakujacy klucz (z ID) albo pierwsza linia bledu.
+fn gpgv_reason(stderr_text: string) -> string is
+    if string_find(stderr_text, "No public key") >= 0 || string_find(stderr_text, "NO_PUBKEY") >= 0 is
+        let id: string = str::trim(proc::shell("printf '%s' " + shq(stderr_text) +
+            " | grep -o -E '[0-9A-Fa-f]{16,40}' | head -n1"))
+        if id != "" is return "signing key " + id + " is not trusted (hammer key add <url>)" end
+        return "signing key is not trusted (hammer key add <url>)"
+    end
+    if string_find(stderr_text, "BAD signature") >= 0 || string_find(stderr_text, "BADSIG") >= 0 is
+        return "BAD signature — the index may have been tampered with"
+    end
+    if string_find(stderr_text, "EXPKEYSIG") >= 0 || string_find(stderr_text, "expired") >= 0 is
+        return "the signing key has expired"
+    end
+    let lines: [string] = lines_of(stderr_text)
+    if lines.len() > 0 is return str::trim(lines[0]) end
+    return "signature check failed"
 end
 
 ;; Jak `verify_inrelease`, ale ROZROZNIA "zweryfikowano" od "pominieto".
@@ -338,22 +403,24 @@ pub fn verify_inrelease_status(content: string, keyring: string) -> VerifyStatus
     let keyfiles: [string] = collect_key_files(keyring)
     if keyfiles.len() == 0 is
         log::warn("gpg: no trusted keys (hammer keyring and system archive keyrings are empty) — skipping signature verification")
-        return vs("skipped", "")
+        return vs("skipped", "", "no trusted keys found (install debian-archive-keyring or run: hammer key add <url>)")
     end
 
     if !have_cmd("gpgv") is
         ;; gpgv nie zainstalowany — ostrzezenie, bez bledu
         log::warn("gpg: gpgv not found — install gnupg for signature verification")
-        return vs("skipped", "")
+        return vs("skipped", "", "gpgv not installed (apt install gpgv)")
     end
 
     let tmp_content: string = tmp_file("hammer_inrelease")
-    if tmp_content == "" is return vs("failed", "Failed to run gpgv: cannot create temp file") end
+    if tmp_content == "" is return vs("failed", "Failed to run gpgv: cannot create temp file", "cannot create temp file in /tmp") end
     fs::write(tmp_content, content)
     let tmp_keyring: string = build_combined_keyring(keyfiles)
     if tmp_keyring == "" is
         system("rm -f -- " + shq(tmp_content))
-        return vs("failed", "Failed to run gpgv: cannot create temp keyring")
+        log::warn("gpg: none of the " + to_string(keyfiles.len()) + " key file(s) could be read into a keyring")
+        return vs("failed", "Failed to run gpgv: no usable key could be read from " + to_string(keyfiles.len()) + " key file(s)",
+            "no usable key could be read (" + to_string(keyfiles.len()) + " key file(s) found)")
     end
 
     ;; stderr gpgv -> plik, kod wyjscia osobno
@@ -368,9 +435,9 @@ pub fn verify_inrelease_status(content: string, keyring: string) -> VerifyStatus
 
     if rc == 0 is
         log::info("gpg: InRelease signature OK")
-        return VerifyStatus { state: "verified", err: "", content: verified_text }
+        return VerifyStatus { state: "verified", err: "", content: verified_text, reason: "" }
     end
-    return vs("failed", "GPG signature verification failed:\n" + stderr_text)
+    return vs("failed", "GPG signature verification failed:\n" + stderr_text, gpgv_reason(stderr_text))
 end
 
 ;; Zgodne z Rust: "" = Ok takze gdy weryfikacje POMINIETO (D). Kto potrzebuje
@@ -533,7 +600,11 @@ pub fn read_key_info(key_path: string) -> KeyInfoResult is
         ;; gpg niedostepny — wartosci zastepcze
         let mut stem: string = compat::path_stem(key_path)
         if stem == "" is stem = "unknown" end
-        return KeyInfoResult { info: KeyInfo { fingerprint: "unavailable", name: stem, email: nil, key_id: "unavailable" }, err: "" }
+        ;; Bez gpg nie ma odcisku — uzywamy SHA-256 pliku jako unikalnego, stabilnego identyfikatora. Wczesniej
+        ;; kazdy klucz dostawal \"unavailable\" => import drugiego klucza nadpisywal pierwszy (plik i wpis w bazie).
+        let h: string = sha256_file(key_path)
+        let fp: string = if h != "" then h else "unavailable"
+        return KeyInfoResult { info: KeyInfo { fingerprint: fp, name: stem, email: nil, key_id: if h != "" then str::slice(h, 48, 64) else "unavailable" }, err: "" }
     end
     let out: string = proc::shell("gpg --with-colons --import-options show-only --import " + shq(key_path) + " 2>/dev/null")
     return parse_gpg_colons(out)
@@ -567,4 +638,62 @@ pub fn verify_detached(data: string, sig: string) -> string is
         return ""
     end
     return "GPG signature verification failed for '" + data + "'" + (if msg != "" then ":\n" + msg else "")
+end
+
+;; ── Diagnostyka kluczy (`hammer key doctor`) ─────────────────────────────
+;;
+;; Zwraca linie z jednoznakowym znacznikiem na poczatku: `+ ` (OK), `! ` (ostrzezenie),
+;; `- ` (problem blokujacy weryfikacje) — CLI koloruje wg tego znaku. Pokazuje
+;; dokladnie to, co decyduje o \"(no signature)\" przy `hammer update`.
+pub fn doctor_lines() -> [string] is
+    let mut out: [string] = []
+    let mut blocking: int = 0
+
+    if have_cmd("gpgv") is
+        out.push("+ gpgv: found")
+    else is
+        out.push("- gpgv: NOT installed — without it nothing can be verified (apt install gpgv)")
+        blocking += 1
+    end
+    if have_cmd("awk") && have_cmd("base64") is
+        out.push("+ awk + base64: found (armored .asc keys can be read without gpg)")
+    elsif have_cmd("gpg") is
+        out.push("! awk/base64 missing — armored .asc keys will be read through gpg")
+    else is
+        out.push("! neither awk+base64 nor gpg found — armored .asc keys cannot be read")
+    end
+    if have_cmd("gpg") is
+        out.push("+ gpg: found (used for `hammer key add` fingerprints)")
+    else is
+        out.push("! gpg: not installed (optional; key fingerprints will show as 'unavailable')")
+    end
+
+    let own: [string] = dir_key_files(keyring_dir(), false)
+    let sys: [string] = system_key_files()
+    out.push((if own.len() > 0 then "+ " else "! ") + "hammer keyring " + keyring_dir() + ": " + to_string(own.len()) + " key file(s)")
+    let mut i: int = 0
+    while i < sys.len() is
+        out.push("+ system key: " + sys[i])
+        i += 1
+    end
+    if own.len() + sys.len() == 0 is
+        out.push("- no trusted keys anywhere — install debian-archive-keyring (or your distro's *-archive-keyring) or run: hammer key add <url>")
+        blocking += 1
+    else is
+        let ring: string = keyring_from_dir(keyring_dir())
+        if ring == "" is
+            out.push("- " + to_string(own.len() + sys.len()) + " key file(s) found, but NONE could be read into a keyring")
+            blocking += 1
+        else is
+            out.push("+ combined keyring built: " + to_string(fs::size(ring)) + " bytes")
+            system("rm -f -- " + shq(ring))
+        end
+    end
+
+    if blocking == 0 is
+        out.push("+ signature verification is possible — run `hammer update`")
+    else is
+        out.push("- " + to_string(blocking) + " problem(s) block GPG verification; until fixed, installs need --allow-unauthenticated")
+    end
+    return out
 end
