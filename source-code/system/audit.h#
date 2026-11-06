@@ -2,6 +2,7 @@ use "std -> fs"      from "fs"
 use "std -> strings" from "str"
 use "std -> process"    from "proc"
 use "std -> conv"    from "conv"
+use "std -> env"     from "env"
 
 mod internal
 ;; [mod package pominiete: source-code/pkg/package.h# nie rozwiazuje sie z tego katalogu (kompilator szuka tylko w katalogu pliku, source-code/ i korzeniu); modul jest ladowany przez pkg/mod.h# — wywolania package::fn dzialaja bez zmian]
@@ -871,6 +872,46 @@ fn verify_ed25519_sig(data_path: string, sig_path: string) -> string is
     return ""
 end
 
+;; ── Polityka dla repozytoriow NIEZWERYFIKOWANYCH GPG ─────────────────────
+;;
+;; Model zaufania Debiana: pakiety `.deb` nie sa podpisywane pojedynczo — podpisany
+;; jest `InRelease`, a w nim skroty indeksow `Packages`, a w nich SHA-256 kazdego
+;; `.deb`. Gdy `InRelease` NIE da sie zweryfikowac (brak kluczy / `gpgv`), hammer
+;; odrzucal KAZDA paczke bez mozliwosci obejscia — nawet gdy uzytkownik swiadomie
+;; chcial jej uzyc. Teraz (jak apt `--allow-unauthenticated`) mozna to jawnie
+;; dopuscic: flaga `--allow-unauthenticated`, zmienna `HAMMER_ALLOW_UNAUTHENTICATED=1`
+;; albo plik `/etc/hammer/allow-unauthenticated`. Domyslnie nadal FAIL-CLOSED.
+;; Integralnosc pobranego pliku wzgledem SHA-256 z indeksu jest sprawdzana zawsze
+;; (ui/download.h#) — dopuszczenie dotyczy tylko AUTENTYCZNOSCI zrodla.
+
+fn truthy(v: string?) -> bool is
+    if v == nil is return false end
+    let t: string = str::to_lower(str::trim(v))
+    return t == "1" || t == "true" || t == "yes" || t == "on"
+end
+
+pub fn allow_unauthenticated_file() -> string is return "/etc/hammer/allow-unauthenticated" end
+
+pub fn unauthenticated_allowed() -> bool is
+    if truthy(env::get("HAMMER_ALLOW_UNAUTHENTICATED")) is return true end
+    return fs::exists(allow_unauthenticated_file())
+end
+
+;; Paczka bez podpisu `.deb.sig`/`.deb.asc` z repo, ktorego InRelease NIE zostal
+;; zweryfikowany (brak znacznika `.gpg-verified`).
+pub fn package_untrusted(deb_path: string) -> bool is
+    if fs::exists(sig_path_for(deb_path, "deb.sig")) is return false end
+    if fs::exists(sig_path_for(deb_path, "deb.asc")) is return false end
+    return !gpg::is_repo_trusted(deb_path)
+end
+
+pub fn untrusted_message(deb_path: string) -> string is
+    return "No signature found for package '" + deb_path + "' and repo is not GPG-verified.\n" +
+        "  Why: run `hammer update` (it prints the reason) or `hammer key doctor`.\n" +
+        "  Fix: install the distro keyring (e.g. debian-archive-keyring) and gpgv, or `hammer key add <url>` / `hammer key import <keyfile>`, then `hammer update`.\n" +
+        "  Or, knowingly: re-run with --allow-unauthenticated (SHA-256 from the package index is still checked)."
+end
+
 ;; "" = Ok, inaczej tresc bledu.
 pub fn verify_package_signature(deb_path: string) -> string is
     let sig_path: string = sig_path_for(deb_path, "deb.sig")
@@ -883,6 +924,9 @@ pub fn verify_package_signature(deb_path: string) -> string is
         log::info("audit: no signature file for " + deb_path + " (repo trusted via InRelease)")
         return ""
     end
-    return "No signature found for package '" + deb_path + "' and repo is not GPG-verified.\n  " +
-        "Import the repository key with: hammer key import <keyfile>"
+    if unauthenticated_allowed() is
+        log::warn("audit: installing " + deb_path + " WITHOUT GPG verification (--allow-unauthenticated)")
+        return ""
+    end
+    return untrusted_message(deb_path)
 end
