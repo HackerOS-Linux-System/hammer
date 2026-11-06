@@ -950,6 +950,7 @@ pub fn cmd_key(args: [string]) -> string is
         if kl.db.keys.len() == 0 is
             write("  " + ui::dim("·") + " No trusted keys.")
             write("  Add: " + ui::cyan("hammer key add https://ftp-master.debian.org/keys/archive-key-12.gpg"))
+            write("  Or install your distro's archive keyring (system keys are picked up automatically) — see: " + ui::cyan("hammer key doctor"))
             return ""
         end
         let mut i: int = 0
@@ -961,8 +962,28 @@ pub fn cmd_key(args: [string]) -> string is
         end
         return ""
     end
-    if sub == "add" is
-        if args.len() < 2 is return "Usage: hammer key add <url>" end
+    if sub == "doctor" || sub == "check" is
+        ;; Diagnoza: dlaczego `hammer update` pokazuje "(no signature)" i skad "repo is not GPG-verified".
+        write("  " + ui::bold("GPG verification check"))
+        let lines: [string] = gpg_verify::doctor_lines()
+        let mut d: int = 0
+        while d < lines.len() is
+            let ln: string = lines[d]
+            let mark: string = str::slice(ln, 0, 1)
+            let txt: string = str::slice(ln, 2, string_len(ln))
+            if mark == "+" is
+                write("  " + ui::bright_green("✔") + " " + txt)
+            elsif mark == "!" is
+                write("  " + ui::yellow("!") + " " + txt)
+            else is
+                write("  " + ui::red_bold("✗") + " " + txt)
+            end
+            d += 1
+        end
+        return ""
+    end
+    if sub == "add" || sub == "import" is
+        if args.len() < 2 is return "Usage: hammer key " + sub + " <url|keyfile>" end
         let r: gpg::ImportKeyResult = gpg::import_key(args[1], download::client_new())
         if !r.ok is return r.err end
         write("  " + ui::bright_green("✔") + " Imported: " + ui::bold(r.key.name))
@@ -982,7 +1003,7 @@ pub fn cmd_key(args: [string]) -> string is
         end
         return ""
     end
-    return "Unknown key subcommand: '" + sub + "'. Try: list, add, remove"
+    return "Unknown key subcommand: '" + sub + "'. Try: list, add, import, remove, doctor"
 end
 
 ;; ── gc / clean ───────────────────────────────────────────────────────────
