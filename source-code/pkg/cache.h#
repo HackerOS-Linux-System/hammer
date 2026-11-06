@@ -813,6 +813,8 @@ pub fn cache_update(sources: repo::SourcesList, client: download::HttpClient) ->
     let mut rel_ir: [gpg_verify::InRelease] = []
     let mut rel_have: [bool] = []
     let mut rel_gpg_ok: [bool] = []
+    ;; powod niezweryfikowania (pusty gdy zweryfikowano) — pokazywany zamiast gołego "(no signature)"
+    let mut rel_reason: [string] = []
     let mut rr: int = 0
     while rr < rel_urls.len() is
         let res_file: string = work + "/r-" + to_string(rr) + ".res"
@@ -822,6 +824,7 @@ pub fn cache_update(sources: repo::SourcesList, client: download::HttpClient) ->
             let vs: gpg_verify::VerifyStatus = gpg_verify::verify_inrelease_status(content, gpg_verify::keyring_dir())
             let mut ok: bool = false
             let mut parse_src: string = content
+            let why: string = vs.reason
             if vs.state == "verified" is
                 ok = true
                 ;; WYLACZNIE podpisana tresc (gpg_verify.h#, G): nie surowy plik z ewentualnym prefiksem
@@ -832,11 +835,13 @@ pub fn cache_update(sources: repo::SourcesList, client: download::HttpClient) ->
                 log::warn("cache: GPG failed for " + rel_urls[rr] + ": " + vs.err)
             end
             rel_gpg_ok.push(ok)
+            rel_reason.push(if ok then "" else why)
             rel_ir.push(gpg_verify::inrelease_parse(parse_src))
             rel_have.push(true)
         else is
             log::warn("cache: cannot fetch InRelease for " + rel_urls[rr] + ": " + str::slice(res, 4, string_len(res)))
             rel_gpg_ok.push(false)
+            rel_reason.push("InRelease could not be downloaded")
             rel_ir.push(gpg_verify::inrelease_parse(""))
             rel_have.push(false)
         end
@@ -848,6 +853,7 @@ pub fn cache_update(sources: repo::SourcesList, client: download::HttpClient) ->
     let mut err_count: int = 0
     let mut total_pkgs: int = 0
     let mut gpg_failed: int = 0
+    let mut why_list: [string] = []
     let mut lines: [string] = []
 
     let mut x: int = 0
@@ -897,7 +903,9 @@ pub fn cache_update(sources: repo::SourcesList, client: download::HttpClient) ->
                     total_pkgs += count
                     let sig_icon: string = if gpg_ok then "🔒" else ui::yellow("⚠")
                     let sha_note: string = if sha256_ok then "" else " ⚠sha256"
-                    let nosig: string = if !gpg_ok then ui::yellow("(no signature)") else ""
+                    let src_why: string = if ridx >= 0 && ridx < rel_reason.len() then rel_reason[ridx] else "no InRelease"
+                    let nosig: string = if !gpg_ok then ui::yellow("(no signature" + (if src_why != "" then ": " + src_why else "") + ")") else ""
+                    if !gpg_ok && count > 0 && src_why != "" && index_of_str(why_list, src_why) < 0 is why_list.push(src_why) end
                     lines.push("  " + ui::bold(ui::pad(label, 42)) + "  " + sig_icon + "  " + ui::cyan(to_string(count)) +
                         " packages" + sha_note + "  " + nosig)
                     ;; zrodlo bez pakietow (np. forky-security: Debian nie publikuje security dla testing) nie ma co
@@ -926,7 +934,14 @@ pub fn cache_update(sources: repo::SourcesList, client: download::HttpClient) ->
     if gpg_failed > 0 is
         write("")
         write("  " + ui::yellow_bold("!") + " " + ui::yellow_bold(to_string(gpg_failed)) + " source(s) could not be verified by GPG.")
-        write("  Add trusted keys with: " + ui::cyan("hammer key add <url>"))
+        let mut w: int = 0
+        while w < why_list.len() is
+            write("  " + ui::dim("Why:") + " " + why_list[w])
+            w += 1
+        end
+        write("  Diagnose: " + ui::cyan("hammer key doctor"))
+        write("  Add trusted keys with: " + ui::cyan("hammer key add <url>") + " / " + ui::cyan("hammer key import <keyfile>"))
+        write("  " + ui::dim("Installing from such sources needs an explicit OK: --allow-unauthenticated"))
     end
 
     ;; Znacznik zaufania: tylko gdy KAZDE zrodlo zweryfikowano w tej synchronizacji.
