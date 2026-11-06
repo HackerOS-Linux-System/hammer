@@ -112,6 +112,9 @@ pub fn parse_global_flags(args: [string]) -> ParsedArgs is
             f.no_download = true
         elsif a == "--force" is
             f.force = true
+        elsif a == "--allow-unauthenticated" is
+            ;; jak apt: swiadoma zgoda na pakiety z repo NIEzweryfikowanych GPG (system/audit.h#)
+            env::set("HAMMER_ALLOW_UNAUTHENTICATED", "1")
         elsif a == "--color=always" is
             f.color = ColorMode::Always
         elsif a == "--color=never" is
