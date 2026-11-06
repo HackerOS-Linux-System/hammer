@@ -474,6 +474,72 @@ pub fn remove_package_files(pkg: string, root: string) -> string is
     return ""
 end
 
+;; ── verify_downloads ─────────────────────────────────────────────────────
+;;
+;; Weryfikacja podpisow pobranych paczek wg polityki z `audit.h#`:
+;;  - paczka z podpisem `.deb.sig`/`.deb.asc` albo z repo zweryfikowanego GPG => sprawdzana
+;;    jak dotad (blad => przerwanie);
+;;  - paczka z repo NIEzweryfikowanego: dopuszczona tylko jawnie (`--allow-unauthenticated`,
+;;    `HAMMER_ALLOW_UNAUTHENTICATED=1`, plik `/etc/hammer/allow-unauthenticated`) ALBO po
+;;    odpowiedzi "y" na pytanie (domyslnie NIE; `-y` NIE zastepuje tej zgody, jak w apt;
+;;    bez terminala pytania nie ma => odmowa).
+;; SHA-256 z indeksu pakietow sprawdzil juz `download::download_packages`.
+;; "" = Ok, inaczej tresc bledu.
+fn verify_downloads(downloads: [download::DownloadResult]) -> string is
+    let mut unverified: [string] = []
+    let mut first_path: string = ""
+    let mut v: int = 0
+    while v < downloads.len() is
+        let path: string = downloads[v].path
+        if audit::package_untrusted(path) is
+            unverified.push(downloads[v].package.name)
+            if first_path == "" is first_path = path end
+        else is
+            let verr: string = audit::verify_package_signature(path)
+            if verr != "" is
+                ui::eprint_line("  " + ui::red_bold("!") + " Signature verification failed for " + downloads[v].package.name + ": " + verr)
+                return "Aborting: signature verification failed for '" + downloads[v].package.name + "'"
+            end
+        end
+        v += 1
+    end
+    if unverified.len() == 0 is return "" end
+
+    if audit::unauthenticated_allowed() is
+        ui::eprint_line("  " + ui::yellow_bold("!") + " " + to_string(unverified.len()) +
+            " package(s) from repositories NOT verified by GPG — proceeding (--allow-unauthenticated).")
+        log::warn("transaction: installing WITHOUT GPG verification: " + joined_names(unverified))
+        return ""
+    end
+
+    ui::eprint_line("")
+    ui::eprint_line("  " + ui::yellow_bold("!") + " " + ui::yellow_bold("The following package(s) cannot be authenticated (repository is not GPG-verified):"))
+    let mut u: int = 0
+    while u < unverified.len() is
+        ui::eprint_line("      " + unverified[u])
+        u += 1
+    end
+    ui::eprint_line("  " + ui::dim("Their SHA-256 matches the package index, but the index itself was not signature-checked."))
+    ui::eprint_line("  " + ui::dim("Diagnose: hammer key doctor   ·   Fix: install the distro archive keyring, then hammer update"))
+    if ui::confirm_no("Install these packages WITHOUT GPG verification?") is
+        log::warn("transaction: user accepted installation WITHOUT GPG verification: " + joined_names(unverified))
+        return ""
+    end
+    return "Aborting: " + to_string(unverified.len()) + " package(s) are not GPG-verified.\n  " +
+        "Fix the keys (hammer key doctor) or knowingly re-run with --allow-unauthenticated."
+end
+
+fn joined_names(names: [string]) -> string is
+    let mut out: string = ""
+    let mut i: int = 0
+    while i < names.len() is
+        if i > 0 is out = out + ", " end
+        out = out + names[i]
+        i += 1
+    end
+    return out
+end
+
 ;; ── execute_transaction_normal ───────────────────────────────────────────
 
 pub fn execute_transaction_normal(ctx: TransactionContext, note: string) -> string is
@@ -508,15 +574,8 @@ pub fn execute_transaction_normal(ctx: TransactionContext, note: string) -> stri
         let downloads: [download::DownloadResult] = dr.results
 
         ;; ── Weryfikacja podpisow ─────────────────────────────────────
-        let mut v: int = 0
-        while v < downloads.len() is
-            let verr: string = audit::verify_package_signature(downloads[v].path)
-            if verr != "" is
-                ui::eprint_line("  " + ui::red_bold("!") + " Signature verification failed for " + downloads[v].package.name + ": " + verr)
-                return "Aborting: signature verification failed for '" + downloads[v].package.name + "'"
-            end
-            v += 1
-        end
+        let vderr: string = verify_downloads(downloads)
+        if vderr != "" is return vderr end
 
         ;; ── Instalacja wprost na / ───────────────────────────────────
         let staging: string = build_mode::staging_dir()
