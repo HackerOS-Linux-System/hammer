@@ -244,7 +244,7 @@ end
 
 fn run_oci(rest: [string]) -> string is
     if !build_mode::oci_mode() is
-        return "'hammer oci' is only available in builds compiled with oci-mode (bit build-oci).\n    This binary was built without it (run 'hammer features' to check)."
+        return "'hammer oci' is only available in builds compiled with oci-mode (bit build-oci = bit build --features oci-mode).\n    This binary was built without it (run 'hammer features' to check)."
     end
     return oci_cmd::run(rest)
 end
