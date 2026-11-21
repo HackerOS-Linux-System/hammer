@@ -10,16 +10,19 @@ use "bit -> colors"
 ;;
 ;; ── Odejscia od oryginalu (swiadome, udokumentowane) ────────────────────
 ;;
-;; 1. BRAK `cfg!(feature = ...)`. W Rust tryb `normal-mode` i `oci-mode`
-;;    to cechy Cargo wybierane w czasie kompilacji. H# nie ma kompilacji
-;;    warunkowej, wiec tryb jest ustalany tak:
+;; 1. `cfg!(feature = ...)` -> `feature_enabled("...")`. W Rust tryb
+;;    `normal-mode` i `oci-mode` to cechy Cargo wybierane w czasie
+;;    kompilacji; w H# to cechy z sekcji `[features]` w `Bit.hk`
+;;    (`bit build --features normal-mode`, `bit build-normal`,
+;;    `bit build-oci`). Kompilator H# zamienia `feature_enabled("x")` na
+;;    literal bool podczas parsowania — zadne zrodlo nie jest przepisywane.
+;;    Tryb ustalany jest tak:
 ;;      a) zmienna srodowiskowa `HAMMER_MODE` = `normal` | `atomic`
 ;;         (i `HAMMER_OCI` = `1`/`0`) — ma pierwszenstwo, przydatna w
 ;;         kontenerach/chroot bez przebudowy;
-;;      b) w przeciwnym razie wartosc "wkompilowana" z `compiled_mode()` /
-;;         `compiled_oci()` ponizej. Komendy `bit build-normal` i
-;;         `bit build-oci` z `Bit.hk` podmieniaja te dwie linie (sed) przed
-;;         budowa — to najblizszy odpowiednik `--features` bez cfg.
+;;      b) w przeciwnym razie wartosc wkompilowana z cech budowy
+;;         (`compiled_mode()` / `compiled_oci()` ponizej): bez cech =
+;;         atomic, `normal-mode` = normal, `oci-mode` = `hammer oci`.
 ;; 2. `NORMAL_MODE`, `MODE_LABEL`, `BINARY_DESCRIPTION` to funkcje (nie
 ;;    stale), bo zaleza od trybu ustalanego jak wyzej.
 ;; 3. `PathBuf` -> `string`, `.join()` -> `path::join`.
@@ -30,12 +33,17 @@ use "bit -> colors"
 ;;    `bright_green`) nad ANSI; `ui.rs` nie jest jeszcze przepisany.
 
 ;; ── Wkompilowane domyslne (patrz odejscie 1b) ────────────────────────────
-;; BUILD-MODE-DEFAULT: nie zmieniaj formatu tych dwoch linii recznie —
-;; `bit build-normal` / `bit build-oci` je przepisuja sedem.
+;; Wybierane cechami budowy z `[features]` w Bit.hk (`feature_enabled` jest
+;; rozstrzygane przez kompilator H# w czasie parsowania).
 
-fn compiled_mode() -> string is return "normal" end
+fn compiled_mode() -> string is
+    if feature_enabled("normal-mode") is return "normal" end
+    return "atomic"
+end
 
-fn compiled_oci() -> bool is return false end
+fn compiled_oci() -> bool is
+    return feature_enabled("oci-mode")
+end
 
 ;; ── Tryb ─────────────────────────────────────────────────────────────────
 
@@ -235,7 +243,7 @@ pub fn features_print(f: Features) is
         write("    Classic apt-style installs — works on any system, including containers.")
     else is
         write("    Generations + immutable store — intended for HackerOS installed to disk.")
-        write("    For containers/chroots use HAMMER_MODE=normal or 'bit build-normal'.")
+        write("    For containers/chroots use HAMMER_MODE=normal or build with 'bit build-normal' (--features normal-mode).")
     end
     write("")
 
