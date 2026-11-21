@@ -28,13 +28,17 @@ reimplementing the hard parts.
 
 ## Feature flags
 
-```toml
-[dependencies]
-libhammer = "0.0.1"                        # types + version + dep parser + SAT
-libhammer = { version = "0.0.1", features = ["db"] }     # + SQLite DB
-libhammer = { version = "0.0.1", features = ["fetch"] }  # + async HTTP fetch
-libhammer = { version = "0.0.1", features = ["full"] }   # everything
+Sekcja `[features]` w `Bit.hk` (kompilator H# dostaje liste przez `--features`):
+
+```bash
+bit build                          # default = db + fetch
+bit build --no-default-features    # tylko typy + wersje + parser zaleznosci + SAT
+bit build --no-default-features --features db       # + baza SQLite
+bit build --no-default-features --features fetch    # + pobieranie HTTP
+bit build --all-features           # == full
 ```
+
+Moduly `db` i `fetch` sa wylaczane przez `#[cfg(feature = "db")]` / `#[cfg(feature = "fetch")]` w `src/lib.h#`.
 
 ---
 
@@ -73,17 +77,10 @@ assert!(sat.solve().unwrap());
 ## Building
 
 ```bash
-# Default (no I/O deps)
-cargo build
-
-# With SQLite DB support
-cargo build --features db
-
-# With async HTTP fetcher
-cargo build --features fetch
-
-# Everything
-cargo build --features full
+bit build                                        # default = db + fetch
+bit build --no-default-features                  # bez wejscia/wyjscia: typy, wersje, parser, SAT
+bit build --no-default-features --features db    # + baza SQLite
+bit build --all-features                         # == full
 ```
 
 ## Publishing to crates.io
