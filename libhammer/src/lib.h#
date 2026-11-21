@@ -7,6 +7,8 @@ mod release
 mod solver_error
 mod solver
 mod lhdeb
+#[cfg(feature = "db")]
 mod lhdb
 mod lhsys
+#[cfg(feature = "fetch")]
 mod fetch
