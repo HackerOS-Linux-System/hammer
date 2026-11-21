@@ -12,6 +12,11 @@
 [build]
 -> link => static
 
+[features]
+-> default => []
+-> normal-mode => []
+-> oci-mode => []
+
 [default-build]
 -> profile => release
 
@@ -27,10 +32,10 @@
 --> run => bit check
 --> description => Sprawdz skladnie/typy wszystkich modulow
 -> build-normal
---> run => sed -i 's/return "atomic" end/return "normal" end/' source-code/internal/build_mode.h# && bit build
+--> run => bit build --features normal-mode
 --> description => Build w trybie normal-mode (bez atomowosci) — patrz internal/build_mode.h#
 -> build-oci
---> run => sed -i 's/fn compiled_oci() -> bool is return false end/fn compiled_oci() -> bool is return true end/' source-code/internal/build_mode.h# && bit build
+--> run => bit build --features oci-mode
 --> description => Build z wlaczonym `hammer oci`
 
 [hooks]
