@@ -15,6 +15,12 @@
 [build]
 -> link => static
 
+[features]
+-> default => [db, fetch]
+-> db => []
+-> fetch => []
+-> full => [db, fetch]
+
 [dependencies]
 -> satsolv.version      => newest
 -> progress-bar.version => newest
